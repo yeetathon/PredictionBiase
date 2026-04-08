@@ -260,3 +260,113 @@ class TrainingMetadata(Base):
     hyperparameters = Column(JSON)
     artifact_path = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 tables: settlement, model versioning, research cycle
+# ---------------------------------------------------------------------------
+
+class LegSettlement(Base):
+    """Tracks the outcome of every generated leg after game completion."""
+    __tablename__ = "leg_settlements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # leg_id references GeneratedLeg.id (kept as string for flexibility)
+    leg_id = Column(String(50), nullable=False, unique=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=True)
+    # Denormalised columns (populated at settlement time for fast queries)
+    market_type = Column(String(50))
+    selection = Column(String(100))
+    decimal_odds = Column(Float)
+    model_probability = Column(Float)
+    # Settlement result: 1=win, 0=loss, -1=void/push
+    actual_outcome = Column(Integer, nullable=True)
+    actual_home_score = Column(Integer, nullable=True)
+    actual_away_score = Column(Integer, nullable=True)
+    settlement_source = Column(String(30), default="auto")  # auto / manual
+    notes = Column(Text, nullable=True)
+    settled_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Convenience alias used by evaluation service
+    @property
+    def outcome(self):
+        return self.actual_outcome
+
+    __table_args__ = (Index("ix_leg_settlements_fixture", "fixture_id"),)
+
+
+class MultiSettlement(Base):
+    """Tracks the outcome of every generated multi after all legs settle."""
+    __tablename__ = "multi_settlements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    multi_id = Column(String(50), nullable=False, unique=True)
+    leg_ids = Column(JSON)             # list of GeneratedLeg ids
+    n_legs = Column(Integer)
+    n_legs_won = Column(Integer, default=0)
+    n_legs_total = Column(Integer, default=0)
+    combined_odds = Column(Float)
+    raw_probability = Column(Float)
+    adjusted_probability = Column(Float)
+    correlation_score = Column(Float)
+    all_legs_win = Column(Boolean, default=False)
+    # Settlement result: 1=won, 0=lost, -1=void (a leg was voided)
+    actual_combined_result = Column(Integer, nullable=True)
+    settlement_source = Column(String(30), default="auto")
+    settled_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Convenience alias
+    @property
+    def outcome(self):
+        return self.actual_combined_result
+
+    __table_args__ = (Index("ix_multi_settlements_settled_at", "settled_at"),)
+
+
+class ModelVersion(Base):
+    """Tracks every trained model version with its validation metrics."""
+    __tablename__ = "model_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version_id = Column(String(20), nullable=False, unique=True)
+    model_name = Column(String(100), nullable=False)   # e.g. "match_model"
+    model_type = Column(String(50))                     # e.g. "ensemble"
+    artifact_path = Column(String(255))
+    brier_score_train = Column(Float)
+    brier_score_val = Column(Float)
+    log_loss_val = Column(Float)
+    n_train_samples = Column(Integer)
+    n_val_samples = Column(Integer)
+    hyperparameters = Column(JSON)
+    feature_names = Column(JSON)
+    extra_metadata = Column(JSON)
+    status = Column(String(20), default="challenger")  # challenger / champion / retired
+    promoted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_model_versions_name_status", "model_name", "status"),
+    )
+
+
+class ResearchCycleLog(Base):
+    """Audit trail for each bootstrap research cycle execution."""
+    __tablename__ = "research_cycle_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cycle_id = Column(String(20), nullable=False, unique=True)
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime)
+    elapsed_seconds = Column(Float)
+    n_fixtures_synced = Column(Integer, default=0)
+    n_legs_settled = Column(Integer, default=0)
+    brier_score = Column(Float, nullable=True)
+    roi = Column(Float, nullable=True)
+    retrained = Column(Boolean, default=False)
+    promoted = Column(Boolean, default=False)
+    summary = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_research_cycle_log_started", "started_at"),)

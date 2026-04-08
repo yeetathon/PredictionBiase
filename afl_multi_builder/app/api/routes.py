@@ -15,6 +15,7 @@ from app.services.backtest import WalkForwardBacktester
 from app.services.reports import ReportsService
 from app.correlation.engine import Leg
 from app.optimizer.multi_builder import MultiBuilder
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -194,3 +195,124 @@ async def get_training_report():
     if _last_training_result is None:
         raise HTTPException(status_code=404, detail="No training results yet. POST /training/run first.")
     return _last_training_result
+
+
+# ---------------------------------------------------------------------------
+# Phase-2: Sync, Bootstrap, Quota endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/sync/upcoming", response_model=Dict, tags=["Sync"])
+async def sync_upcoming(lookahead_days: int = 14):
+    """Pull upcoming fixtures from Sportradar (or demo) and upsert to DB."""
+    try:
+        from app.services.sync import SyncService
+        svc = SyncService()
+        return svc.sync_upcoming(lookahead_days=lookahead_days)
+    except Exception as exc:
+        logger.exception("sync_upcoming error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/sync/settle_recent", response_model=Dict, tags=["Sync"])
+async def sync_settle_recent(lookback_days: int = 7):
+    """Fetch completed fixtures and settle open predictions."""
+    try:
+        from app.services.sync import SyncService
+        svc = SyncService()
+        return svc.sync_settle_recent(lookback_days=lookback_days)
+    except Exception as exc:
+        logger.exception("sync_settle_recent error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/sync/status", response_model=Dict, tags=["Sync"])
+async def sync_status():
+    """Return current data-source and sync status."""
+    try:
+        from app.services.sync import SyncService
+        svc = SyncService()
+        return svc.get_sync_status()
+    except Exception as exc:
+        logger.exception("sync_status error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/bootstrap/run", response_model=Dict, tags=["Bootstrap"])
+async def run_bootstrap(force_retrain: bool = False, background_tasks: BackgroundTasks = None):
+    """Run the full daily bootstrap research cycle.
+
+    Steps: sync → settle → evaluate → (retrain) → (promote) → predict.
+    Set ``force_retrain=true`` to skip criteria checks and always retrain.
+    """
+    try:
+        from app.services.bootstrap import BootstrapCycleService
+        svc = BootstrapCycleService()
+        return svc.run(force_retrain=force_retrain)
+    except Exception as exc:
+        logger.exception("bootstrap/run error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/quota/status", response_model=Dict, tags=["Quota"])
+async def quota_status():
+    """Return Sportradar API quota usage."""
+    if not settings.is_sportradar_configured:
+        return {
+            "configured": False,
+            "message": "Sportradar API key not configured. Running in demo mode.",
+            "data_mode": settings.effective_data_mode,
+        }
+    try:
+        from app.data_ingestion.quota_manager import QuotaManager
+        qm = QuotaManager()
+        return {"configured": True, **qm.get_status()}
+    except Exception as exc:
+        logger.exception("quota/status error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/bootstrap", response_model=Dict, tags=["Reports"])
+async def get_bootstrap_report(limit: int = 10):
+    """Return the last N bootstrap cycle logs."""
+    try:
+        from app.db.database import SessionLocal
+        from app.db.models import ResearchCycleLog
+        with SessionLocal() as db:
+            rows = (
+                db.query(ResearchCycleLog)
+                .order_by(ResearchCycleLog.started_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return {
+                "cycles": [
+                    {
+                        "cycle_id": r.cycle_id,
+                        "started_at": r.started_at.isoformat() if r.started_at else None,
+                        "elapsed_seconds": r.elapsed_seconds,
+                        "n_fixtures_synced": r.n_fixtures_synced,
+                        "n_legs_settled": r.n_legs_settled,
+                        "brier_score": r.brier_score,
+                        "roi": r.roi,
+                        "retrained": r.retrained,
+                        "promoted": r.promoted,
+                        "summary": r.summary,
+                    }
+                    for r in rows
+                ]
+            }
+    except Exception as exc:
+        logger.exception("reports/bootstrap error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/evaluation", response_model=Dict, tags=["Reports"])
+async def get_evaluation_report(lookback_days: int = 30):
+    """Run and return a self-evaluation report over recent settled predictions."""
+    try:
+        from app.services.evaluation import EvaluationService
+        svc = EvaluationService()
+        return svc.evaluate(lookback_days=lookback_days)
+    except Exception as exc:
+        logger.exception("reports/evaluation error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
