@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AFL Multi Builder</title>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>AFL Multi Builder</h1>
+      <span class="subtitle">Calibrated probabilities · Edge detection · Correlation-aware multis</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Control Panel -->
+    <section class="panel controls">
+      <h2>Controls</h2>
+      <div class="button-row">
+        <button id="btn-run-pipeline" class="btn btn-primary">▶ Run Pipeline</button>
+        <button id="btn-run-training" class="btn btn-secondary">⚙ Train Models</button>
+        <button id="btn-run-backtest" class="btn btn-secondary">📊 Run Backtest</button>
+        <button id="btn-summary" class="btn btn-outline">ℹ Summary</button>
+      </div>
+      <div id="status-bar" class="status-bar"></div>
+    </section>
+
+    <!-- Tabs -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="legs">Value Legs</button>
+      <button class="tab" data-tab="safe-legs">Safe Legs</button>
+      <button class="tab" data-tab="value-multis">Value Multis</button>
+      <button class="tab" data-tab="safe-multis">Safe Multis</button>
+      <button class="tab" data-tab="same-game">Same-Game</button>
+      <button class="tab" data-tab="backtest">Backtest</button>
+    </nav>
+
+    <!-- Legs Tab -->
+    <section class="tab-content active" id="tab-legs">
+      <div class="filter-row">
+        <label>Min EV: <input type="number" id="filter-ev" value="0.02" step="0.01" min="0" max="1"/></label>
+        <label>Market:
+          <select id="filter-market">
+            <option value="">All</option>
+            <option value="head_to_head">Head to Head</option>
+            <option value="player_disposals">Player Disposals</option>
+          </select>
+        </label>
+        <button class="btn btn-outline btn-sm" onclick="applyLegFilters()">Filter</button>
+      </div>
+      <div id="legs-container" class="cards-container">
+        <p class="placeholder">Run the pipeline to see value legs.</p>
+      </div>
+    </section>
+
+    <!-- Safe Legs Tab -->
+    <section class="tab-content" id="tab-safe-legs">
+      <div id="safe-legs-container" class="cards-container">
+        <p class="placeholder">Run the pipeline to see safe legs.</p>
+      </div>
+    </section>
+
+    <!-- Value Multis Tab -->
+    <section class="tab-content" id="tab-value-multis">
+      <div id="value-multis-container" class="cards-container">
+        <p class="placeholder">Run the pipeline to see value multis.</p>
+      </div>
+    </section>
+
+    <!-- Safe Multis Tab -->
+    <section class="tab-content" id="tab-safe-multis">
+      <div id="safe-multis-container" class="cards-container">
+        <p class="placeholder">Run the pipeline to see safe multis.</p>
+      </div>
+    </section>
+
+    <!-- Same Game Tab -->
+    <section class="tab-content" id="tab-same-game">
+      <div id="same-game-container" class="cards-container">
+        <p class="placeholder">Run the pipeline to see same-game multis.</p>
+      </div>
+    </section>
+
+    <!-- Backtest Tab -->
+    <section class="tab-content" id="tab-backtest">
+      <div id="backtest-container">
+        <p class="placeholder">Run backtest to see performance metrics.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>AFL Multi Builder v1.0 · <a href="/docs" target="_blank">API Docs</a> · Demo mode</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

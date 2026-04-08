@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  afl-api:
+    build: .
+    container_name: afl_multi_builder
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=sqlite:///./data/afl_multi_builder.db
+      - DEMO_DATA_DIR=./data/demo
+      - MODEL_ARTIFACTS_DIR=./data/models
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+
+  # Optional: Streamlit UI (separate service)
+  afl-ui:
+    build: .
+    container_name: afl_streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/afl_multi_builder.db
+      - DEMO_DATA_DIR=./data/demo
+    command: >
+      sh -c "python scripts/seed_demo_data.py &&
+             streamlit run streamlit_app.py --server.port=8501 --server.address=0.0.0.0"
+    depends_on:
+      - afl-api
+    restart: unless-stopped

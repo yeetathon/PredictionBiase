@@ -1,0 +1,19 @@
+team_id,name,abbreviation,home_ground,state,founded,primary_colour,secondary_colour
+1,Adelaide Crows,ADE,Adelaide Oval,SA,1991,#002B5C,#E21937
+2,Brisbane Lions,BRI,The Gabba,QLD,1996,#A30046,#0095C8
+3,Carlton,CAR,Marvel Stadium,VIC,1897,#0E1E2D,#FFFFFF
+4,Collingwood,COL,Marvel Stadium,VIC,1892,#000000,#FFFFFF
+5,Essendon,ESS,Marvel Stadium,VIC,1872,#CC2031,#000000
+6,Fremantle,FRE,Optus Stadium,WA,1994,#2A1A54,#FFFFFF
+7,Geelong Cats,GEE,GMHBA Stadium,VIC,1897,#1C3C63,#FFFFFF
+8,Gold Coast Suns,GCS,People First Stadium,QLD,2011,#E21937,#FFD200
+9,GWS Giants,GWS,Engie Stadium,NSW,2012,#F47920,#000000
+10,Hawthorn,HAW,MCG,VIC,1902,#4D2004,#FBBF15
+11,Melbourne,MEL,MCG,VIC,1925,#CC2031,#003B6F
+12,North Melbourne,NME,Marvel Stadium,VIC,1869,#003087,#FFFFFF
+13,Port Adelaide,POR,Adelaide Oval,SA,1997,#008AAB,#000000
+14,Richmond,RIC,MCG,VIC,1885,#FFD200,#000000
+15,St Kilda,STK,Marvel Stadium,VIC,1873,#ED0F05,#000000
+16,Sydney Swans,SYD,SCG,NSW,1874,#E2001A,#FFFFFF
+17,West Coast Eagles,WCE,Optus Stadium,WA,1987,#003087,#F5A800
+18,Western Bulldogs,WBD,Marvel Stadium,VIC,1877,#CC2031,#003087
