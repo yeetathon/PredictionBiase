@@ -127,12 +127,12 @@ class TeamFeatureEngineer:
             logger.warning("No fixtures found for feature engineering.")
             return pd.DataFrame()
 
-        # Compute Elo ratings
+        # Compute Elo ratings (uses all fixtures; only updates on completed ones)
         completed = fixtures[fixtures["status"] == "completed"].copy()
         all_fx = fixtures.sort_values(["season", "round", "fixture_id"]).copy()
         all_fx = self.elo.compute_ratings_history(all_fx)
 
-        # Build rolling team features from team_stats
+        # Build rolling team features (handles minimal team_stats gracefully)
         rolling_feats = self._compute_rolling_team_features(completed, team_stats)
 
         # Merge Elo onto fixtures
@@ -175,13 +175,17 @@ class TeamFeatureEngineer:
             ).astype(float)
             result = result.merge(wx, on="fixture_id", how="left")
 
-        # Compute differential features
+        # Compute differential features for all paired home_/away_ roll columns
         numeric_home = [c for c in result.columns if c.startswith("home_roll_")]
         for hc in numeric_home:
             ac = hc.replace("home_", "away_")
             if ac in result.columns:
                 diff_col = hc.replace("home_roll_", "diff_roll_")
                 result[diff_col] = result[hc].fillna(0) - result[ac].fillna(0)
+
+        # Rest-days differential
+        if "home_rest_days" in result.columns and "away_rest_days" in result.columns:
+            result["diff_rest_days"] = result["home_rest_days"].fillna(7) - result["away_rest_days"].fillna(7)
 
         result["elo_diff"] = result.get("elo_home_pre", 1500) - result.get("elo_away_pre", 1500)
 
@@ -191,15 +195,56 @@ class TeamFeatureEngineer:
         self, completed_fixtures: pd.DataFrame, team_stats: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        For each completed fixture, compute rolling team stats from PRIOR games only.
+        Compute rolling team features from prior games only (no lookahead).
+
+        Works with minimal team_stats_df (score + is_home only, as returned by
+        SportradarLoader) as well as full demo CSVs with disposals/marks/etc.
+
         Returns a DataFrame indexed by (fixture_id, team_id).
         """
-        if team_stats.empty or completed_fixtures.empty:
+        if completed_fixtures.empty:
             return pd.DataFrame()
 
-        # Join fixture metadata to team_stats
-        fx_meta = completed_fixtures[["fixture_id", "season", "round", "home_team_id", "away_team_id"]].copy()
-        ts = team_stats.merge(fx_meta, on="fixture_id", how="inner")
+        # Build a date lookup for rest-days calculation
+        # Use 'date' column from completed_fixtures if available
+        has_date = "date" in completed_fixtures.columns
+
+        # Join team_stats to fixture metadata
+        fx_meta_cols = ["fixture_id", "season", "round", "home_team_id", "away_team_id"]
+        if has_date:
+            fx_meta_cols.append("date")
+        fx_meta = completed_fixtures[fx_meta_cols].copy()
+
+        if team_stats.empty:
+            # Build minimal team_stats from fixture score columns
+            records_ts = []
+            for _, row in completed_fixtures.iterrows():
+                fid = int(row["fixture_id"])
+                if "home_score" in row and pd.notna(row.get("home_score")):
+                    records_ts.append({
+                        "fixture_id": fid,
+                        "team_id": int(row["home_team_id"]),
+                        "is_home": 1,
+                        "score": float(row["home_score"]),
+                    })
+                if "away_score" in row and pd.notna(row.get("away_score")):
+                    records_ts.append({
+                        "fixture_id": fid,
+                        "team_id": int(row["away_team_id"]),
+                        "is_home": 0,
+                        "score": float(row["away_score"]),
+                    })
+            if not records_ts:
+                return pd.DataFrame()
+            ts = pd.DataFrame(records_ts)
+            # Merge fixture metadata once
+            ts = ts.merge(fx_meta, on="fixture_id", how="left")
+        else:
+            # team_stats already has fixture_id; merge metadata columns only
+            existing_cols = set(team_stats.columns)
+            meta_new_cols = [c for c in fx_meta_cols if c not in existing_cols or c == "fixture_id"]
+            ts = team_stats.merge(fx_meta[meta_new_cols], on="fixture_id", how="inner")
+
         ts = ts.sort_values(["season", "round", "fixture_id"])
 
         stat_cols = ["score", "disposals", "marks", "tackles", "inside_50s",
@@ -207,30 +252,92 @@ class TeamFeatureEngineer:
                      "metres_gained", "turnovers"]
         stat_cols = [c for c in stat_cols if c in ts.columns]
 
+        # Build win lookup: fixture_id → home_win (for completed games)
+        win_lookup = {}
+        if "home_win" in completed_fixtures.columns:
+            for _, row in completed_fixtures.iterrows():
+                hw = row.get("home_win")
+                if pd.notna(hw):
+                    win_lookup[int(row["fixture_id"])] = int(hw)
+
         records = []
         teams = ts["team_id"].unique()
 
         for tid in teams:
-            team_games = ts[ts["team_id"] == tid].reset_index(drop=True)
-            for i, row in team_games.iterrows():
-                # Only use data from BEFORE this game
+            team_games = ts[ts["team_id"] == tid].sort_values(
+                ["season", "round", "fixture_id"]
+            ).reset_index(drop=True)
+
+            for i in range(len(team_games)):
+                row = team_games.iloc[i]
                 prior = team_games.iloc[:i]
+
                 feat = {"fixture_id": int(row["fixture_id"]), "team_id": int(tid)}
+
+                # Rolling stats (score + any other stat columns)
                 for sc in stat_cols:
+                    if sc not in prior.columns:
+                        continue
                     vals = prior[sc].dropna().values
+                    pop_mean = float(ts[sc].mean()) if sc in ts.columns else 0.0
                     if len(vals) >= 1:
                         feat[f"roll_{sc}_mean"] = float(np.mean(vals[-self.window:]))
                         feat[f"roll_{sc}_std"] = float(np.std(vals[-self.window:])) if len(vals) >= 2 else 0.0
                     else:
-                        feat[f"roll_{sc}_mean"] = float(ts[sc].mean()) if sc in ts.columns else 0.0
+                        feat[f"roll_{sc}_mean"] = pop_mean
                         feat[f"roll_{sc}_std"] = 0.0
-                # Win rate
-                prior_home_wins = prior[prior["is_home"] == True]["fixture_id"].map(
-                    lambda fid: completed_fixtures.loc[completed_fixtures["fixture_id"] == fid, "home_win"].values[0]
-                    if len(completed_fixtures.loc[completed_fixtures["fixture_id"] == fid]) > 0 else None
-                )
+
                 n_games = len(prior)
                 feat["roll_n_games"] = n_games
+
+                # Win rate (overall, home, away) from prior games
+                if n_games > 0 and win_lookup:
+                    prior_is_home = prior["is_home"].values if "is_home" in prior.columns else []
+                    total_wins = 0
+                    home_wins = 0
+                    home_games = 0
+                    away_wins = 0
+                    away_games = 0
+                    for j, prow in prior.iterrows():
+                        pfid = int(prow["fixture_id"])
+                        p_is_home = int(prow.get("is_home", 0))
+                        hw = win_lookup.get(pfid)
+                        if hw is None:
+                            continue
+                        won = (p_is_home == 1 and hw == 1) or (p_is_home == 0 and hw == 0)
+                        total_wins += int(won)
+                        if p_is_home == 1:
+                            home_games += 1
+                            home_wins += int(won)
+                        else:
+                            away_games += 1
+                            away_wins += int(won)
+                    feat["roll_win_rate"] = total_wins / n_games
+                    feat["roll_home_win_rate"] = home_wins / home_games if home_games > 0 else 0.5
+                    feat["roll_away_win_rate"] = away_wins / away_games if away_games > 0 else 0.5
+                else:
+                    feat["roll_win_rate"] = 0.5
+                    feat["roll_home_win_rate"] = 0.5
+                    feat["roll_away_win_rate"] = 0.5
+
+                # Rest days: days since last game (capped at 21)
+                if has_date and n_games > 0:
+                    try:
+                        last_date_str = str(prior.iloc[-1]["date"])
+                        cur_date_str = str(row.get("date", ""))
+                        if last_date_str and cur_date_str:
+                            from datetime import datetime as _dt
+                            last_dt = _dt.fromisoformat(last_date_str.split("T")[0])
+                            cur_dt = _dt.fromisoformat(cur_date_str.split("T")[0])
+                            rest = max(0, min(21, (cur_dt - last_dt).days))
+                            feat["rest_days"] = float(rest)
+                        else:
+                            feat["rest_days"] = 7.0
+                    except Exception:
+                        feat["rest_days"] = 7.0
+                else:
+                    feat["rest_days"] = 7.0
+
                 records.append(feat)
 
         return pd.DataFrame(records)
@@ -470,6 +577,7 @@ class FeaturePipeline:
         feature_cols = [
             c for c in completed.columns
             if c.startswith(("elo_", "home_roll_", "away_roll_", "diff_roll_",
+                             "home_rest_days", "away_rest_days", "diff_rest_days",
                              "temperature_c", "wind_speed_kmh", "is_rain", "wind_category"))
             and completed[c].dtype in [np.float64, np.int64, float, int]
         ]

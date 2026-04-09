@@ -244,22 +244,28 @@ with st.sidebar:
 
     # ── Data source status ──────────────────────────────────────
     from app.core.config import settings
+
+    if not settings.is_sportradar_configured:
+        st.error(
+            "**SPORTRADAR_API_KEY not configured.**\n\n"
+            "Add it to your `.env` file:\n```\nSPORTRADAR_API_KEY=your_key_here\n```\n"
+            "Then restart the app. Live API data is required — demo mode has been removed."
+        )
+        st.stop()
+
     mode = settings.effective_data_mode
     if mode == "live":
         ds_label = "Sportradar API (Live)"
     elif mode == "cache":
         ds_label = "Sportradar API (Cached)"
     else:
-        ds_label = "Demo Data"
+        ds_label = "Sportradar API"
 
     pr = st.session_state.get("pipeline_result")
     if pr:
         ds_label = pr.get("data_source", ds_label)
 
     st.markdown(f"**Data Source:** {data_source_badge(ds_label)}", unsafe_allow_html=True)
-
-    if mode == "demo" and not settings.is_sportradar_configured:
-        st.caption("Set SPORTRADAR_API_KEY in .env to use live data.")
     st.divider()
 
     # ── Controls ───────────────────────────────────────────────
@@ -278,7 +284,11 @@ with st.sidebar:
                 result = run_pipeline()
                 st.success(f"✓ {result['n_candidate_legs']} legs generated ({result['data_source']})")
             except Exception as e:
-                st.error(f"Pipeline error: {e}")
+                err_msg = str(e)
+                if "No upcoming AFL fixtures" in err_msg or "NoUpcomingFixtures" in err_msg:
+                    st.warning(f"No upcoming fixtures: {err_msg}")
+                else:
+                    st.error(f"Pipeline error: {err_msg}")
 
     if st.session_state["auto_mode"]:
         interval = st.slider("Refresh interval (min)", 5, 60, st.session_state["auto_interval"])

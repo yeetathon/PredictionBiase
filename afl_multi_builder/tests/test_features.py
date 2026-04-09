@@ -2,7 +2,26 @@
 import pytest
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from app.features.pipeline import EloRatingSystem, FeaturePipeline
+
+DEMO_DATA = Path(__file__).parent / "demo_data"
+
+
+def _make_loader():
+    from app.data_ingestion.demo_loader import (
+        DemoAFLDataProvider,
+        DemoOddsProvider,
+        DemoWeatherProvider,
+        DemoInjuryProvider,
+    )
+    from app.data_ingestion.loader import DataLoader
+    return DataLoader(
+        afl_provider=DemoAFLDataProvider(DEMO_DATA),
+        odds_provider=DemoOddsProvider(DEMO_DATA),
+        weather_provider=DemoWeatherProvider(DEMO_DATA),
+        injury_provider=DemoInjuryProvider(DEMO_DATA),
+    )
 
 
 class TestEloRatingSystem:
@@ -68,24 +87,24 @@ class TestEloRatingSystem:
 class TestFeaturePipeline:
     def test_pipeline_initialises(self):
         """Pipeline should initialise without errors."""
-        fp = FeaturePipeline()
+        fp = FeaturePipeline(loader=_make_loader())
         assert fp is not None
 
     def test_get_team_features_returns_dataframe(self):
         """Team features should return a DataFrame."""
-        fp = FeaturePipeline()
+        fp = FeaturePipeline(loader=_make_loader())
         features = fp.get_team_features()
         assert isinstance(features, pd.DataFrame)
 
     def test_get_player_features_returns_dataframe(self):
         """Player features should return a DataFrame."""
-        fp = FeaturePipeline()
+        fp = FeaturePipeline(loader=_make_loader())
         features = fp.get_player_features("disposals")
         assert isinstance(features, pd.DataFrame)
 
     def test_model_ready_data_has_labels(self):
         """Model-ready data should have valid binary labels."""
-        fp = FeaturePipeline()
+        fp = FeaturePipeline(loader=_make_loader())
         X, y, feature_cols = fp.get_model_ready_match_data()
         if not X.empty:
             assert set(y.unique()).issubset({0, 1})
@@ -95,16 +114,12 @@ class TestFeaturePipeline:
     def test_no_lookahead_in_features(self):
         """
         Feature engineering must not use future data.
-        Test by checking that rolling features for game N don't use game N's result.
-        This is tested indirectly: Elo pre-game ratings must equal initial rating for first game.
+        Elo pre-game ratings for the very first fixture must equal the initial rating.
         """
-        fp = FeaturePipeline()
+        fp = FeaturePipeline(loader=_make_loader())
         features = fp.get_team_features()
         if features.empty:
             pytest.skip("No features available")
-        # First fixture should have initial Elo (no history available)
         first = features[features["fixture_id"] == features["fixture_id"].min()]
         if not first.empty and "elo_home_pre" in first.columns:
-            # Rating may have been slightly modified by season carryover or order,
-            # but should be near initial (1500)
             assert abs(float(first["elo_home_pre"].iloc[0]) - 1500.0) < 100

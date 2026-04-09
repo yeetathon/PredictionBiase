@@ -1,0 +1,428 @@
+"""
+SportradarLoader — live-only AFL data provider.
+
+Fetches the full season schedule from Sportradar and exposes DataFrames
+that are compatible with the DataLoader interface (same column schema as
+DemoAFLDataProvider). Never falls back to demo/mock data.
+
+Raises RuntimeError on construction if SPORTRADAR_API_KEY is not set.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class NoUpcomingFixturesError(Exception):
+    """Raised when no future fixtures exist in the schedule."""
+
+
+class SportradarLoader:
+    """
+    Live AFL data provider backed by Sportradar v2 API.
+
+    On construction, validates API key is present. Fetches the current
+    season schedule (with scores embedded for completed games) and builds
+    DataFrames matching the internal schema expected by DataLoader.
+
+    Fixture IDs are derived by extracting the numeric suffix of the
+    Sportradar event ID (``sr:sport_event:12345678`` → ``12345678``),
+    which is stable and deterministic.
+
+    Player data is unavailable from the schedule endpoint alone (fetching
+    per-match summaries would exhaust trial quota), so ``players_df`` and
+    ``player_stats_df`` are always empty.
+    """
+
+    _UPCOMING_STATUSES = frozenset({
+        "not_started", "created", "delayed", "scheduled",
+    })
+    _COMPLETED_STATUSES = frozenset({
+        "closed", "complete", "ended", "finalised",
+    })
+
+    def __init__(self) -> None:
+        if not settings.is_sportradar_configured:
+            raise RuntimeError(
+                "SPORTRADAR_API_KEY is not configured. "
+                "Add it to your .env file: SPORTRADAR_API_KEY=your_key_here"
+            )
+
+        from app.data_ingestion.sportradar_client import SportradarClient
+        from app.data_ingestion.cache_manager import CacheManager
+        from app.data_ingestion.quota_manager import QuotaManager
+
+        self._client = SportradarClient(
+            api_key=settings.sportradar_api_key,
+            base_url=settings.sportradar_base_url,
+            rate_limit_qps=settings.api_rate_limit_qps,
+            quota_manager=QuotaManager(),
+            cache_manager=CacheManager(),
+        )
+
+        self._season_id: Optional[str] = None
+        self._season_year: int = datetime.utcnow().year
+        self._raw_events: Optional[List[Dict]] = None
+
+        # Cached DataFrames
+        self._fixtures_df: Optional[pd.DataFrame] = None
+        self._teams_df: Optional[pd.DataFrame] = None
+        self._team_stats_df: Optional[pd.DataFrame] = None
+
+    # ------------------------------------------------------------------
+    # Season discovery
+    # ------------------------------------------------------------------
+
+    def _get_season_id(self) -> str:
+        """Return the current season's Sportradar ID, auto-discovering if needed."""
+        if self._season_id:
+            return self._season_id
+
+        if settings.sportradar_afl_season_id:
+            self._season_id = settings.sportradar_afl_season_id
+            logger.info("Using configured season ID: %s", self._season_id)
+            return self._season_id
+
+        competition_id = settings.sportradar_afl_competition_id
+        endpoint = f"competitions/{competition_id}/seasons.json"
+        logger.info("Auto-discovering AFL season from %s", endpoint)
+        data = self._client.get(endpoint, cache_ttl_seconds=86400)
+
+        from app.data_ingestion.sportradar_normalizer import SportradarNormalizer
+        seasons = SportradarNormalizer().normalize_seasons(data)
+
+        current_year = str(datetime.utcnow().year)
+        for s in seasons:
+            if str(s.get("year", "")) == current_year:
+                self._season_id = s["sportradar_id"]
+                self._season_year = int(current_year)
+                logger.info("Discovered season: %s (%s)", self._season_id, current_year)
+                return self._season_id
+
+        # Fall back to most recent season
+        if seasons:
+            latest = max(seasons, key=lambda s: str(s.get("year", "0")))
+            self._season_id = latest["sportradar_id"]
+            try:
+                self._season_year = int(latest.get("year", datetime.utcnow().year))
+            except (TypeError, ValueError):
+                self._season_year = datetime.utcnow().year
+            logger.warning(
+                "No %s season found; using %s (%s)",
+                current_year, self._season_id, self._season_year,
+            )
+            return self._season_id
+
+        raise RuntimeError(
+            "Could not discover AFL season ID from Sportradar API. "
+            "Set SPORTRADAR_AFL_SEASON_ID in your .env to override."
+        )
+
+    # ------------------------------------------------------------------
+    # Raw schedule fetch
+    # ------------------------------------------------------------------
+
+    def _fetch_events(self) -> List[Dict]:
+        """Fetch and cache raw sport_events list from the season schedule."""
+        if self._raw_events is not None:
+            return self._raw_events
+
+        season_id = self._get_season_id()
+        endpoint = f"seasons/{season_id}/schedules.json"
+        ttl = int(settings.cache_ttl_upcoming_hours * 3600)
+        logger.info("Fetching AFL schedule from Sportradar (season=%s)…", season_id)
+        data = self._client.get(endpoint, cache_ttl_seconds=ttl)
+
+        events = data.get("sport_events") or []
+        src = data.get("_source", "unknown")
+        logger.info("Received %d sport_events (source=%s)", len(events), src)
+        self._raw_events = events
+        return events
+
+    # ------------------------------------------------------------------
+    # ID helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sr_to_int(sr_id: str) -> int:
+        """Extract numeric suffix: ``sr:sport_event:12345`` → 12345, 0 on failure."""
+        if not sr_id:
+            return 0
+        try:
+            return int(sr_id.split(":")[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    @classmethod
+    def _map_status(cls, sr_status: str) -> str:
+        """Map Sportradar status string to internal ``"completed"`` / ``"upcoming"``."""
+        s = (sr_status or "").lower()
+        if s in cls._COMPLETED_STATUSES:
+            return "completed"
+        return "upcoming"
+
+    # ------------------------------------------------------------------
+    # DataFrame builders
+    # ------------------------------------------------------------------
+
+    def _build_fixtures_df(self) -> pd.DataFrame:
+        """Build fixtures_df from raw schedule events."""
+        events = self._fetch_events()
+        season_year = self._season_year
+
+        records = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+
+            sr_match_id: str = event.get("id") or ""
+            fixture_id = self._sr_to_int(sr_match_id)
+            if fixture_id == 0:
+                continue
+
+            scheduled: str = event.get("scheduled") or ""
+            date_str = ""
+            time_str = ""
+            scheduled_utc = scheduled
+            if scheduled:
+                try:
+                    dt = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
+                    dt_naive = dt.replace(tzinfo=None)
+                    date_str = dt_naive.strftime("%Y-%m-%d")
+                    time_str = dt_naive.strftime("%H:%M")
+                    scheduled_utc = dt_naive.isoformat()
+                except Exception:
+                    pass
+
+            sr_status = (event.get("status") or "not_started").lower()
+            status = self._map_status(sr_status)
+
+            # Competitors
+            home_team_id = 0
+            away_team_id = 0
+            home_name = "Unknown"
+            away_name = "Unknown"
+            home_sr_id_str = ""
+            for comp in (event.get("competitors") or []):
+                if not isinstance(comp, dict):
+                    continue
+                q = (comp.get("qualifier") or "").lower()
+                tid = self._sr_to_int(comp.get("id") or "")
+                name = comp.get("name") or "Unknown"
+                if q == "home":
+                    home_team_id = tid
+                    home_name = name
+                    home_sr_id_str = comp.get("id") or ""
+                elif q == "away":
+                    away_team_id = tid
+                    away_name = name
+
+            # Round number
+            context = event.get("sport_event_context") or {}
+            round_obj = context.get("round") or {}
+            round_no = 0
+            try:
+                round_no = int(round_obj.get("number") or 0)
+            except (TypeError, ValueError):
+                pass
+
+            # Scores from embedded sport_event_status (present for completed games)
+            ses = event.get("sport_event_status") or {}
+            home_score = None
+            away_score = None
+            home_win = None
+            margin = None
+            total_score = None
+
+            if status == "completed":
+                raw_home = ses.get("home_score")
+                raw_away = ses.get("away_score")
+                if raw_home is not None and raw_away is not None:
+                    try:
+                        home_score = int(raw_home)
+                        away_score = int(raw_away)
+                        margin = home_score - away_score
+                        total_score = home_score + away_score
+                        winner_id = ses.get("winner_id") or ""
+                        if winner_id:
+                            home_win = 1 if winner_id == home_sr_id_str else 0
+                        elif home_score != away_score:
+                            home_win = 1 if home_score > away_score else 0
+                    except (TypeError, ValueError):
+                        pass
+
+            records.append({
+                "fixture_id": fixture_id,
+                "sportradar_id": sr_match_id,
+                "season": season_year,
+                "round": round_no,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "home_team_name": home_name,
+                "away_team_name": away_name,
+                "venue_id": 0,
+                "date": date_str,
+                "time": time_str,
+                "scheduled_utc": scheduled_utc,
+                "status": status,
+                "home_score": home_score,
+                "away_score": away_score,
+                "home_win": home_win,
+                "margin": margin,
+                "total_score": total_score,
+            })
+
+        if not records:
+            logger.warning("SportradarLoader: no fixture records built from schedule")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        logger.info(
+            "SportradarLoader: built %d fixtures (%d completed, %d upcoming)",
+            len(df),
+            (df["status"] == "completed").sum(),
+            (df["status"] == "upcoming").sum(),
+        )
+        return df
+
+    def _build_teams_df(self) -> pd.DataFrame:
+        """Extract unique teams from schedule competitors."""
+        events = self._fetch_events()
+        seen: Dict[int, str] = {}
+        for event in events:
+            for comp in (event.get("competitors") or []):
+                if not isinstance(comp, dict):
+                    continue
+                tid = self._sr_to_int(comp.get("id") or "")
+                name = comp.get("name") or "Unknown"
+                if tid and tid not in seen:
+                    seen[tid] = name
+
+        if not seen:
+            return pd.DataFrame()
+        records = [{"team_id": tid, "name": name} for tid, name in sorted(seen.items())]
+        return pd.DataFrame(records)
+
+    def _build_team_stats_df(self) -> pd.DataFrame:
+        """Build minimal team_stats_df (score only) from completed fixtures."""
+        fx = self.fixtures_df
+        completed = fx[fx["status"] == "completed"].copy()
+        if completed.empty:
+            return pd.DataFrame()
+
+        records = []
+        stat_id = 1
+        for _, row in completed.iterrows():
+            fid = int(row["fixture_id"])
+            hs = row.get("home_score")
+            as_ = row.get("away_score")
+            if hs is not None:
+                records.append({
+                    "stat_id": stat_id,
+                    "fixture_id": fid,
+                    "team_id": int(row["home_team_id"]),
+                    "is_home": 1,
+                    "score": int(hs),
+                })
+                stat_id += 1
+            if as_ is not None:
+                records.append({
+                    "stat_id": stat_id,
+                    "fixture_id": fid,
+                    "team_id": int(row["away_team_id"]),
+                    "is_home": 0,
+                    "score": int(as_),
+                })
+                stat_id += 1
+
+        return pd.DataFrame(records) if records else pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Provider interface (matches DemoAFLDataProvider)
+    # ------------------------------------------------------------------
+
+    @property
+    def fixtures_df(self) -> pd.DataFrame:
+        if self._fixtures_df is None:
+            self._fixtures_df = self._build_fixtures_df()
+        return self._fixtures_df
+
+    @property
+    def teams_df(self) -> pd.DataFrame:
+        if self._teams_df is None:
+            self._teams_df = self._build_teams_df()
+        return self._teams_df
+
+    @property
+    def team_stats_df(self) -> pd.DataFrame:
+        if self._team_stats_df is None:
+            self._team_stats_df = self._build_team_stats_df()
+        return self._team_stats_df
+
+    @property
+    def players_df(self) -> pd.DataFrame:
+        """Always empty — player stats unavailable from trial API schedule."""
+        return pd.DataFrame()
+
+    @property
+    def player_stats_df(self) -> pd.DataFrame:
+        """Always empty — player stats unavailable from trial API schedule."""
+        return pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Future-only fixture filtering (strict datetime comparison)
+    # ------------------------------------------------------------------
+
+    def load_upcoming_fixtures_df(self) -> pd.DataFrame:
+        """
+        Return only fixtures whose scheduled time is strictly in the future.
+
+        Uses ``scheduled_utc`` parsed as naive UTC and compared against
+        ``datetime.utcnow()``. Does NOT rely on the ``status`` field alone,
+        which can be stale in cached responses.
+
+        Raises
+        ------
+        NoUpcomingFixturesError
+            If no future fixtures are found in the current season schedule.
+        """
+        fx = self.fixtures_df
+        if fx.empty or "scheduled_utc" not in fx.columns:
+            raise NoUpcomingFixturesError(
+                "No fixture data available from Sportradar schedule."
+            )
+
+        now_utc = datetime.utcnow()
+        future_mask = []
+        for _, row in fx.iterrows():
+            try:
+                raw = row["scheduled_utc"]
+                if not raw:
+                    future_mask.append(False)
+                    continue
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                dt_naive = dt.replace(tzinfo=None)
+                future_mask.append(dt_naive > now_utc)
+            except Exception:
+                future_mask.append(False)
+
+        future_df = fx[future_mask].copy()
+        if future_df.empty:
+            raise NoUpcomingFixturesError(
+                f"No upcoming AFL fixtures found (checked {len(fx)} events). "
+                "The season may be over, or the schedule may not yet be published."
+            )
+
+        logger.info(
+            "SportradarLoader: %d upcoming fixtures (after %s UTC)",
+            len(future_df),
+            now_utc.strftime("%Y-%m-%d %H:%M"),
+        )
+        return future_df

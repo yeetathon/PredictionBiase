@@ -39,9 +39,9 @@ class Settings(BaseSettings):
     # ── Data Mode ─────────────────────────────────────────────────────────
     # live: prefer API (uses cache, fetches only when stale)
     # cache: only use cached API responses, never make live calls
-    # demo: local demo CSV files only
-    data_mode: Literal["live", "cache", "demo"] = "demo"
-    enable_demo_fallback: bool = True  # fall back to demo if live/cache unavailable
+    # demo: NOT supported in production — raises RuntimeError on use
+    data_mode: Literal["live", "cache", "demo"] = "live"
+    enable_demo_fallback: bool = False  # demo fallback disabled
 
     # ── Rate Limiting & Quota ─────────────────────────────────────────────
     api_rate_limit_qps: float = 1.0       # max requests per second
@@ -96,10 +96,13 @@ class Settings(BaseSettings):
 
     @property
     def effective_data_mode(self) -> str:
-        """Return the effective mode considering API key availability."""
-        if self.data_mode in ("live", "cache") and not self.is_sportradar_configured:
-            if self.enable_demo_fallback:
-                return "demo"
+        """
+        Return the effective data mode.
+
+        Never silently returns 'demo' — if the API key is missing the caller
+        will get 'live' or 'cache' back and SportradarLoader will raise a
+        clear RuntimeError on construction.
+        """
         return self.data_mode
 
 

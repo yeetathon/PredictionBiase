@@ -12,6 +12,7 @@ import pandas as pd
 from loguru import logger
 
 from app.data_ingestion.loader import DataLoader
+from app.data_ingestion.sportradar_loader import NoUpcomingFixturesError
 from app.features.pipeline import FeaturePipeline
 from app.pricing.models import (
     CalibratedModel, PlayerDisposalsModel, ModelRegistry, EnsembleModel
@@ -113,13 +114,13 @@ class PredictionPipeline:
         # Build name lookups first
         self._build_lookups()
 
-        # 1. Get upcoming fixtures
-        fixtures = self.loader.load_fixtures_df()
-        upcoming = fixtures[fixtures["status"] == "upcoming"]
+        # 1. Get upcoming fixtures — strict future-only, never falls back to completed
+        upcoming = self.loader.load_upcoming_fixtures_df()
         if upcoming.empty:
-            completed = fixtures[fixtures["status"] == "completed"].tail(5)
-            upcoming = completed
-            logger.info("No upcoming fixtures found, using recent completed for demo.")
+            raise NoUpcomingFixturesError(
+                "No upcoming AFL fixtures found. "
+                "The season may be over or fixtures not yet published."
+            )
 
         logger.info(f"Processing {len(upcoming)} fixtures...")
 
@@ -204,6 +205,20 @@ class PredictionPipeline:
                 self._team_names[int(row["team_id"])] = str(row["name"])
             except (ValueError, KeyError):
                 pass
+
+        # Also populate team names from fixtures_df home/away name columns
+        # (SportradarLoader embeds names directly; avoids needing a separate teams endpoint)
+        if "home_team_name" in fixtures_df.columns and "home_team_id" in fixtures_df.columns:
+            for _, row in fixtures_df.iterrows():
+                try:
+                    hid = int(row["home_team_id"])
+                    aid = int(row["away_team_id"])
+                    if hid and hid not in self._team_names:
+                        self._team_names[hid] = str(row["home_team_name"])
+                    if aid and aid not in self._team_names:
+                        self._team_names[aid] = str(row["away_team_name"])
+                except (ValueError, KeyError, TypeError):
+                    pass
 
         self._player_names = {}
         for _, row in players_df.iterrows():

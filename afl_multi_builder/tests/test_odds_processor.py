@@ -1,9 +1,26 @@
 """Tests for odds processing layer."""
 import pytest
 import pandas as pd
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from app.pricing.odds_processor import OddsProcessor, ProcessedOdds
 from app.core.metrics import implied_probability, remove_vig
+
+DEMO_DATA = Path(__file__).parent / "demo_data"
+
+
+def _make_loader():
+    from app.data_ingestion.demo_loader import (
+        DemoAFLDataProvider, DemoOddsProvider,
+        DemoWeatherProvider, DemoInjuryProvider,
+    )
+    from app.data_ingestion.loader import DataLoader
+    return DataLoader(
+        afl_provider=DemoAFLDataProvider(DEMO_DATA),
+        odds_provider=DemoOddsProvider(DEMO_DATA),
+        weather_provider=DemoWeatherProvider(DEMO_DATA),
+        injury_provider=DemoInjuryProvider(DEMO_DATA),
+    )
 
 
 class TestOddsProcessor:
@@ -21,7 +38,7 @@ class TestOddsProcessor:
         ])
 
     def test_process_fixture_returns_market_dict(self):
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         result = processor.process_fixture_odds(64)
         assert "head_to_head" in result
@@ -29,7 +46,7 @@ class TestOddsProcessor:
 
     def test_best_odds_selected(self):
         """Processor selects best (highest) odds per selection."""
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         result = processor.process_fixture_odds(64)
         h2h = {po.selection: po for po in result["head_to_head"]}
@@ -38,7 +55,7 @@ class TestOddsProcessor:
 
     def test_vig_adjusted_prob_sums_to_one(self):
         """Vig-adjusted probabilities should sum to ~1 for a binary market."""
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         result = processor.process_fixture_odds(64)
         h2h = result["head_to_head"]
@@ -47,7 +64,7 @@ class TestOddsProcessor:
 
     def test_overround_positive(self):
         """Overround should be positive (bookmaker takes margin)."""
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         result = processor.process_fixture_odds(64)
         for po in result["head_to_head"]:
@@ -55,7 +72,7 @@ class TestOddsProcessor:
 
     def test_attach_model_probabilities(self):
         """Edge and EV are computed after attaching model probabilities."""
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         result = processor.process_fixture_odds(64)
         processed = result["head_to_head"]
@@ -69,14 +86,14 @@ class TestOddsProcessor:
         assert home.ev is not None
 
     def test_empty_odds_returns_empty(self):
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=pd.DataFrame())
         result = processor.process_fixture_odds(99)
         assert result == {}
 
     def test_market_consensus(self):
         """Market consensus averages multiple bookmakers."""
-        processor = OddsProcessor()
+        processor = OddsProcessor(loader=_make_loader())
         processor.loader.load_odds_df = MagicMock(return_value=self._make_odds_df())
         consensus = processor.get_market_consensus(64, "head_to_head")
         assert consensus is not None

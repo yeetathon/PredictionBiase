@@ -114,12 +114,12 @@ class TestDataSourceManagerStatus:
 
 
 class TestEffectiveDataMode:
-    def test_fallback_to_demo_without_api_key(self, monkeypatch):
+    def test_effective_mode_returns_data_mode(self, monkeypatch):
+        """effective_data_mode returns data_mode directly (no silent demo fallback)."""
         from app.core import config
         monkeypatch.setattr(config.settings, "data_mode", "live")
         monkeypatch.setattr(config.settings, "sportradar_api_key", "")
-        monkeypatch.setattr(config.settings, "enable_demo_fallback", True)
-        assert config.settings.effective_data_mode == "demo"
+        assert config.settings.effective_data_mode == "live"
 
     def test_live_mode_with_api_key(self, monkeypatch):
         from app.core import config
@@ -131,3 +131,13 @@ class TestEffectiveDataMode:
         from app.core import config
         monkeypatch.setattr(config.settings, "data_mode", "demo")
         assert config.settings.effective_data_mode == "demo"
+
+    def test_is_sportradar_configured_false_without_key(self, monkeypatch):
+        from app.core import config
+        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
+        assert config.settings.is_sportradar_configured is False
+
+    def test_is_sportradar_configured_true_with_key(self, monkeypatch):
+        from app.core import config
+        monkeypatch.setattr(config.settings, "sportradar_api_key", "abc123")
+        assert config.settings.is_sportradar_configured is True

@@ -1,13 +1,32 @@
-"""Tests for FastAPI endpoints."""
+"""Tests for FastAPI endpoints.
+
+The pipeline/training/backtest endpoints internally call DataLoader(), which
+would try to instantiate SportradarLoader without an API key. We patch
+_make_afl_provider to return a DemoAFLDataProvider so all tests run offline.
+"""
 import pytest
+from pathlib import Path
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from app.main import app
+
+DEMO_DATA = Path(__file__).parent / "demo_data"
+
+
+def _demo_afl_provider():
+    from app.data_ingestion.demo_loader import DemoAFLDataProvider
+    return DemoAFLDataProvider(DEMO_DATA)
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
-        yield c
+    # Patch _make_afl_provider so DataLoader uses demo data in the API process
+    with patch(
+        "app.data_ingestion.loader._make_afl_provider",
+        side_effect=_demo_afl_provider,
+    ):
+        with TestClient(app) as c:
+            yield c
 
 
 class TestHealthEndpoint:
@@ -52,7 +71,6 @@ class TestPipelineEndpoint:
 
 class TestLegsEndpoint:
     def test_get_legs_value(self, client):
-        # Ensure pipeline has run
         client.post("/api/v1/pipeline/run")
         r = client.get("/api/v1/legs?mode=value")
         assert r.status_code == 200
@@ -78,30 +96,18 @@ class TestMultisEndpoint:
         r = client.post("/api/v1/multis/generate", json={
             "legs": [
                 {
-                    "leg_id": "L_test1",
-                    "fixture_id": 64,
-                    "player_id": None,
-                    "team_id": 1,
-                    "market_type": "head_to_head",
-                    "selection": "home_win",
-                    "decimal_odds": 1.90,
-                    "model_probability": 0.60,
-                    "ev": 0.14,
-                    "confidence_score": 65.0,
-                    "explanation": "Test",
+                    "leg_id": "L_test1", "fixture_id": 64, "player_id": None,
+                    "team_id": 1, "market_type": "head_to_head",
+                    "selection": "home_win", "decimal_odds": 1.90,
+                    "model_probability": 0.60, "ev": 0.14,
+                    "confidence_score": 65.0, "explanation": "Test",
                 },
                 {
-                    "leg_id": "L_test2",
-                    "fixture_id": 65,
-                    "player_id": None,
-                    "team_id": 2,
-                    "market_type": "head_to_head",
-                    "selection": "home_win",
-                    "decimal_odds": 2.10,
-                    "model_probability": 0.55,
-                    "ev": 0.16,
-                    "confidence_score": 58.0,
-                    "explanation": "Test",
+                    "leg_id": "L_test2", "fixture_id": 65, "player_id": None,
+                    "team_id": 2, "market_type": "head_to_head",
+                    "selection": "home_win", "decimal_odds": 2.10,
+                    "model_probability": 0.55, "ev": 0.16,
+                    "confidence_score": 58.0, "explanation": "Test",
                 },
             ],
             "mode": "value",
