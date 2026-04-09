@@ -30,8 +30,8 @@ class Settings(BaseSettings):
 
     # ── Sportradar API ─────────────────────────────────────────────────────
     sportradar_api_key: str = ""
-    sportradar_base_url: str = "https://api.sportradar.com/afl/trial/v3"
-    sportradar_afl_competition_id: str = "sr:competition:3394"
+    sportradar_base_url: str = "https://api.sportradar.com/australianrules/trial/v3/en"
+    sportradar_afl_competition_id: str = "sr:competition:656"
     sportradar_afl_season_id: str = ""
 
     # ── API-Sports AFL ─────────────────────────────────────────────────────

@@ -157,11 +157,39 @@ class SportradarLoader:
     def _extract_from_summaries(data: Dict) -> List[Dict]:
         """Extract sport_event dicts (with embedded scores) from summaries.json.
 
-        v3 summaries format:
-          {"summaries": [{"sport_event": {...}, "sport_event_status": {...}}]}
+        Sportradar Australian Rules v3/en uses ``sport_events_summaries`` as the
+        top-level key.  Fall back to the generic ``summaries`` key used by some
+        other Sportradar sport APIs.
+
+        Expected wrapper shape (either key)::
+
+            [
+              {
+                "sport_event": {
+                  "id": "sr:sport_event:...",
+                  "scheduled": "2025-03-20T09:35:00+00:00",
+                  "status": "not_started" | "closed" | ...,
+                  "competitors": [...],
+                  "sport_event_context": {"round": {"number": 1}}
+                },
+                "sport_event_status": {          # present for completed games
+                  "status": "closed",
+                  "home_score": 95,
+                  "away_score": 82,
+                  "winner_id": "sr:competitor:..."
+                }
+              },
+              ...
+            ]
         """
+        # Australian Rules v3/en top-level key takes priority
+        wrappers = (
+            data.get("sport_events_summaries")
+            or data.get("summaries")
+            or []
+        )
         events: List[Dict] = []
-        for wrapper in (data.get("summaries") or []):
+        for wrapper in wrappers:
             if not isinstance(wrapper, dict):
                 continue
             ev = dict(wrapper.get("sport_event") or {})
@@ -199,62 +227,90 @@ class SportradarLoader:
     # ------------------------------------------------------------------
 
     def _fetch_events(self) -> List[Dict]:
-        """Fetch all season events by calling both valid v3 endpoints:
+        """Fetch all season fixtures from ``seasons/{season_id}/summaries.json``.
 
-        * ``seasons/{season_id}/schedules.json`` — full fixture list
-          (upcoming + completed, v3 wraps each in a "schedules" array)
-        * ``seasons/{season_id}/summaries.json`` — completed games with
-          authoritative scores (``sport_event_status`` embedded)
+        This is the only supported endpoint for Australian Rules v3/en.
+        ``schedules.json`` is NOT used — it is not available for this sport.
 
-        Both are merged; summary records take precedence on duplicate IDs.
+        The response top-level key is ``sport_events_summaries`` (Australian
+        Rules v3/en standard).  The parser also accepts the generic
+        ``summaries`` key as a fallback.
+
+        Debug information logged at INFO level:
+        * full URL being called
+        * HTTP source (cache vs api_live)
+        * all top-level JSON keys in the response
+        * number of fixtures parsed
+
+        If zero fixtures are parsed the full response structure is logged at
+        ERROR level before raising.
         """
         if self._raw_events is not None:
             return self._raw_events
 
         season_id = self._get_season_id()
+        ep = f"seasons/{season_id}/summaries.json"
+        full_url = f"{settings.sportradar_base_url}/{ep}"
         ttl = int(settings.cache_ttl_upcoming_hours * 3600)
 
-        # --- schedules.json: full fixture list (upcoming games live here) ----
-        schedule_events: List[Dict] = []
-        try:
-            ep = f"seasons/{season_id}/schedules.json"
-            logger.info("Sportradar: fetching schedules from %s", ep)
-            sched_data = self._client.get(ep, cache_ttl_seconds=ttl)
-            schedule_events = self._extract_from_schedules(sched_data)
-            logger.info(
-                "Sportradar schedules: %d events (source=%s)",
-                len(schedule_events), sched_data.get("_source", "?"),
-            )
-        except Exception as exc:
-            logger.warning("Sportradar schedules.json fetch failed: %s", exc)
+        logger.info("Sportradar: calling summaries — URL: %s", full_url)
 
-        # --- summaries.json: completed games with confirmed scores -----------
-        summary_events: List[Dict] = []
         try:
-            ep = f"seasons/{season_id}/summaries.json"
-            logger.info("Sportradar: fetching summaries from %s", ep)
-            summ_data = self._client.get(ep, cache_ttl_seconds=ttl)
-            summary_events = self._extract_from_summaries(summ_data)
-            logger.info(
-                "Sportradar summaries: %d events (source=%s)",
-                len(summary_events), summ_data.get("_source", "?"),
-            )
+            data = self._client.get(ep, cache_ttl_seconds=ttl)
         except Exception as exc:
-            logger.warning("Sportradar summaries.json fetch failed: %s", exc)
-
-        if not schedule_events and not summary_events:
             raise RuntimeError(
-                f"Both schedules.json and summaries.json returned no events for "
-                f"season {season_id}. Check your API key and subscription tier."
+                f"Sportradar summaries.json request failed.\n"
+                f"  Season  : {season_id}\n"
+                f"  URL     : {full_url}\n"
+                f"  Error   : {exc}"
+            ) from exc
+
+        # ── Debug: log top-level keys so we can see exactly what came back ──
+        top_keys = sorted(k for k in data.keys() if not k.startswith("_"))
+        logger.info(
+            "Sportradar summaries response — source=%s  HTTP status=200"
+            "  top-level keys: %s",
+            data.get("_source", "?"), top_keys,
+        )
+
+        events = self._extract_from_summaries(data)
+        logger.info(
+            "Sportradar: parsed %d fixtures from summaries.json (season=%s)",
+            len(events), season_id,
+        )
+
+        if not events:
+            # Log the raw structure in detail before failing — makes diagnosis easy
+            structure = {
+                k: (
+                    f"list[{len(v)}]" if isinstance(v, list)
+                    else f"dict[{list(v.keys())[:5]}]" if isinstance(v, dict)
+                    else type(v).__name__
+                )
+                for k, v in data.items()
+                if not k.startswith("_")
+            }
+            logger.error(
+                "Sportradar summaries.json returned ZERO fixtures.\n"
+                "  Season    : %s\n"
+                "  Full URL  : %s\n"
+                "  Top-level keys   : %s\n"
+                "  Response structure: %s\n"
+                "Possible causes:\n"
+                "  • Wrong top-level key — expected 'sport_events_summaries'\n"
+                "  • Season has no matches yet (pre-season)\n"
+                "  • Season ID is incorrect — set SPORTRADAR_AFL_SEASON_ID in .env to override",
+                season_id, full_url, top_keys, structure,
+            )
+            raise RuntimeError(
+                f"Sportradar summaries.json returned zero fixtures for season {season_id}.\n"
+                f"  URL: {full_url}\n"
+                f"  Response top-level keys: {top_keys}\n"
+                "See logs for full response structure."
             )
 
-        merged = self._merge_events(schedule_events, summary_events)
-        logger.info(
-            "Sportradar: merged %d total events (%d from schedules, %d from summaries)",
-            len(merged), len(schedule_events), len(summary_events),
-        )
-        self._raw_events = merged
-        return merged
+        self._raw_events = events
+        return events
 
     # ------------------------------------------------------------------
     # ID helpers
