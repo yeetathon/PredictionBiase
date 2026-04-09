@@ -126,25 +126,135 @@ class SportradarLoader:
         )
 
     # ------------------------------------------------------------------
-    # Raw schedule fetch
+    # Raw event extraction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_from_schedules(data: Dict) -> List[Dict]:
+        """Extract sport_event dicts from a schedules.json response.
+
+        Handles both v3 (``schedules`` array of wrappers) and v2
+        (``sport_events`` flat array) response shapes.
+        """
+        # v3: {"schedules": [{"sport_event": {...}, "sport_event_status": {...}}]}
+        if "schedules" in data:
+            events: List[Dict] = []
+            for wrapper in (data.get("schedules") or []):
+                if not isinstance(wrapper, dict):
+                    continue
+                ev = dict(wrapper.get("sport_event") or {})
+                if not ev:
+                    continue
+                ses = wrapper.get("sport_event_status")
+                if ses:
+                    ev["sport_event_status"] = ses
+                events.append(ev)
+            return events
+        # v2 / fallback: {"sport_events": [...]}
+        return list(data.get("sport_events") or [])
+
+    @staticmethod
+    def _extract_from_summaries(data: Dict) -> List[Dict]:
+        """Extract sport_event dicts (with embedded scores) from summaries.json.
+
+        v3 summaries format:
+          {"summaries": [{"sport_event": {...}, "sport_event_status": {...}}]}
+        """
+        events: List[Dict] = []
+        for wrapper in (data.get("summaries") or []):
+            if not isinstance(wrapper, dict):
+                continue
+            ev = dict(wrapper.get("sport_event") or {})
+            if not ev:
+                continue
+            ses = wrapper.get("sport_event_status")
+            if ses:
+                ev["sport_event_status"] = ses
+            events.append(ev)
+        return events
+
+    @staticmethod
+    def _merge_events(
+        schedule_events: List[Dict], summary_events: List[Dict]
+    ) -> List[Dict]:
+        """Merge schedule (upcoming) and summary (completed+scores) events.
+
+        Summary events take precedence on duplicate IDs because they carry
+        confirmed scores from ``sport_event_status``.
+        """
+        merged: Dict[str, Dict] = {}
+        for ev in schedule_events:
+            eid = ev.get("id") or ""
+            if eid:
+                merged[eid] = ev
+        # Summaries win — they have the authoritative scores
+        for ev in summary_events:
+            eid = ev.get("id") or ""
+            if eid:
+                merged[eid] = ev
+        return list(merged.values())
+
+    # ------------------------------------------------------------------
+    # Raw event fetch
     # ------------------------------------------------------------------
 
     def _fetch_events(self) -> List[Dict]:
-        """Fetch and cache raw sport_events list from the season schedule."""
+        """Fetch all season events by calling both valid v3 endpoints:
+
+        * ``seasons/{season_id}/schedules.json`` — full fixture list
+          (upcoming + completed, v3 wraps each in a "schedules" array)
+        * ``seasons/{season_id}/summaries.json`` — completed games with
+          authoritative scores (``sport_event_status`` embedded)
+
+        Both are merged; summary records take precedence on duplicate IDs.
+        """
         if self._raw_events is not None:
             return self._raw_events
 
         season_id = self._get_season_id()
-        endpoint = f"seasons/{season_id}/schedules.json"
         ttl = int(settings.cache_ttl_upcoming_hours * 3600)
-        logger.info("Fetching AFL schedule from Sportradar (season=%s)…", season_id)
-        data = self._client.get(endpoint, cache_ttl_seconds=ttl)
 
-        events = data.get("sport_events") or []
-        src = data.get("_source", "unknown")
-        logger.info("Received %d sport_events (source=%s)", len(events), src)
-        self._raw_events = events
-        return events
+        # --- schedules.json: full fixture list (upcoming games live here) ----
+        schedule_events: List[Dict] = []
+        try:
+            ep = f"seasons/{season_id}/schedules.json"
+            logger.info("Sportradar: fetching schedules from %s", ep)
+            sched_data = self._client.get(ep, cache_ttl_seconds=ttl)
+            schedule_events = self._extract_from_schedules(sched_data)
+            logger.info(
+                "Sportradar schedules: %d events (source=%s)",
+                len(schedule_events), sched_data.get("_source", "?"),
+            )
+        except Exception as exc:
+            logger.warning("Sportradar schedules.json fetch failed: %s", exc)
+
+        # --- summaries.json: completed games with confirmed scores -----------
+        summary_events: List[Dict] = []
+        try:
+            ep = f"seasons/{season_id}/summaries.json"
+            logger.info("Sportradar: fetching summaries from %s", ep)
+            summ_data = self._client.get(ep, cache_ttl_seconds=ttl)
+            summary_events = self._extract_from_summaries(summ_data)
+            logger.info(
+                "Sportradar summaries: %d events (source=%s)",
+                len(summary_events), summ_data.get("_source", "?"),
+            )
+        except Exception as exc:
+            logger.warning("Sportradar summaries.json fetch failed: %s", exc)
+
+        if not schedule_events and not summary_events:
+            raise RuntimeError(
+                f"Both schedules.json and summaries.json returned no events for "
+                f"season {season_id}. Check your API key and subscription tier."
+            )
+
+        merged = self._merge_events(schedule_events, summary_events)
+        logger.info(
+            "Sportradar: merged %d total events (%d from schedules, %d from summaries)",
+            len(merged), len(schedule_events), len(summary_events),
+        )
+        self._raw_events = merged
+        return merged
 
     # ------------------------------------------------------------------
     # ID helpers

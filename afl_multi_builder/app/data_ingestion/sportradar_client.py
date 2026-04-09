@@ -148,6 +148,8 @@ class SportradarClient:
         self._session.headers.update({
             "Accept": "application/json",
             "User-Agent": "AFL-PredictionBiase/1.0",
+            # Sportradar v3 uses x-api-key header auth (NOT a query param)
+            "x-api-key": api_key,
         })
 
     # ------------------------------------------------------------------
@@ -250,9 +252,10 @@ class SportradarClient:
         self._bucket.consume()
 
         # ---- 4. HTTP request with retry -------------------------------------
+        # v3 uses x-api-key header (set in __init__); do NOT inject api_key as
+        # a query param — it is not recognised and causes 403 on v3 endpoints.
         url = f"{self._base_url}/{endpoint}"
-        request_params = dict(params)
-        request_params["api_key"] = self._api_key
+        request_params = dict(params)  # no api_key in params for v3
 
         last_exc: Optional[Exception] = None
         last_status: Optional[int] = None
@@ -343,6 +346,32 @@ class SportradarClient:
                             response_code=response.status_code,
                             latency_ms=latency_ms,
                         )
+
+                    if response.status_code == 403:
+                        # Log everything so the cause is obvious in the terminal
+                        logger.error(
+                            "Sportradar 403 Forbidden — endpoint=%s full_url=%s",
+                            endpoint, response.url,
+                        )
+                        logger.error(
+                            "Sportradar 403 response body: %s", response.text[:500]
+                        )
+                        raise SportradarAPIError(
+                            message=(
+                                "Sportradar returned 403 Forbidden.\n"
+                                f"  Endpoint called : {endpoint}\n"
+                                f"  Full URL        : {response.url}\n"
+                                "Likely causes:\n"
+                                "  1. API key is invalid or expired — check SPORTRADAR_API_KEY in .env\n"
+                                "  2. Endpoint not available on your subscription tier\n"
+                                "  3. Wrong base URL — trial keys require "
+                                "https://api.sportradar.com/afl/trial/v3\n"
+                                f"  Response: {response.text[:200]}"
+                            ),
+                            endpoint=endpoint,
+                            status_code=403,
+                        )
+
                     raise SportradarAPIError(
                         message=(
                             f"HTTP {response.status_code} (non-retryable): "
