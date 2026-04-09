@@ -1,16 +1,55 @@
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
 *.egg-info/
 dist/
 build/
+.Python
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets — NEVER commit these
 .env
+.env.*
+!.env.example
+
+# Database files
 *.db
 *.sqlite
+*.sqlite3
+
+# Model artifacts
 data/models/
-data/logs/
-data/*.json
 *.joblib
+*.pkl
+*.pickle
+
+# Logs
+data/logs/
+*.log
+
+# Cache / temp data
+data/cache/
+data/latest_predictions.json
+*.json.tmp
+
+# IDE
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
