@@ -403,11 +403,12 @@ if not pr:
 
 pr = st.session_state.get("pipeline_result")
 
-tab_value, tab_safe, tab_multis, tab_sgm, tab_insights, tab_system = st.tabs([
+tab_value, tab_safe, tab_multis, tab_sgm, tab_edge, tab_insights, tab_system = st.tabs([
     "🔥 Value Picks",
     "🛡 Safe Picks",
     "📦 Multi Builder",
     "🎲 Same-Game",
+    "📡 Edge Intelligence",
     "📊 Model Insights",
     "⚙ System",
 ])
@@ -525,7 +526,137 @@ with tab_sgm:
         st.markdown('<div class="empty-state">Run the pipeline first.</div>', unsafe_allow_html=True)
 
 
-# ── Tab 5: Model Insights ─────────────────────────────────────────────────
+# ── Tab 5: Edge Intelligence ─────────────────────────────────────────────
+with tab_edge:
+    st.markdown('<div class="section-header">📡 Edge Intelligence</div>', unsafe_allow_html=True)
+    st.caption(
+        "Scraped signals from AFL news, RSS feeds, and official announcements. "
+        "Updates every 30 minutes. Injuries, late outs, suspensions, and team news."
+    )
+
+    _SEV_COLOR = {
+        "critical": ("#ff4b4b", "#2d0000"),
+        "high":     ("#ff8c42", "#2d1500"),
+        "medium":   ("#f5c518", "#2a1f00"),
+        "low":      ("#5dba8c", "#0f2a1e"),
+    }
+    _TYPE_EMOJI = {
+        "injury":       "🤕",
+        "late_out":     "⚠️",
+        "suspension":   "🚫",
+        "selection":    "📋",
+        "team_news":    "📰",
+        "weather_alert":"🌧️",
+        "breaking":     "🔴",
+    }
+
+    def render_signal_card(sig):
+        sev = getattr(sig, "severity", "low")
+        fg, bg = _SEV_COLOR.get(sev, ("#9aa0b4", "#1a1d2b"))
+        stype = getattr(sig, "signal_type", "team_news")
+        emoji = _TYPE_EMOJI.get(stype, "📰")
+        team = getattr(sig, "team_name", "") or "—"
+        player = getattr(sig, "player_name", "")
+        headline = getattr(sig, "headline", "")
+        summary = getattr(sig, "summary", "")
+        source = getattr(sig, "source_name", "")
+        pub = getattr(sig, "published_at", None)
+        pub_str = pub.strftime("%d %b %H:%M") if pub else ""
+        stale = getattr(sig, "is_stale", False)
+        stale_str = " · ⏰ STALE" if stale else ""
+
+        st.markdown(f"""
+        <div style="background:{bg};border:1px solid {fg}33;border-left:4px solid {fg};
+                    border-radius:10px;padding:14px 16px;margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span style="font-size:15px;font-weight:700;color:#e0e4f0;">{emoji} {headline}</span>
+                <span style="background:{fg}22;color:{fg};padding:3px 10px;border-radius:20px;
+                             font-size:11px;font-weight:700;text-transform:uppercase;">{sev}{stale_str}</span>
+            </div>
+            <div style="font-size:12px;color:#9aa0b4;margin-bottom:6px;">
+                <strong style="color:#d0d5e5;">{team}</strong>
+                {"· " + player if player else ""}
+                · <em>{stype.replace("_"," ").title()}</em>
+                · {source} · {pub_str}
+            </div>
+            <div style="font-size:13px;color:#b0b8cc;line-height:1.5;">{summary}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    loader = get_loader()
+    if loader.edge is None:
+        st.info(
+            "Edge intelligence scraping is **disabled**. "
+            "Set `ENABLE_SCRAPING=true` in your `.env` file to activate it."
+        )
+    else:
+        col_refresh, col_filter_sev, col_filter_type, col_filter_team = st.columns([1, 1, 1, 2])
+        with col_refresh:
+            refresh_edge = st.button("🔄 Refresh Signals", use_container_width=True)
+
+        if refresh_edge or "edge_signals" not in st.session_state:
+            with st.spinner("Fetching edge signals..."):
+                try:
+                    signals = loader.load_all_edge_signals()
+                    st.session_state["edge_signals"] = signals
+                    st.session_state["edge_signals_ts"] = datetime.now().strftime("%H:%M:%S")
+                except Exception as e:
+                    st.warning(f"Edge intelligence fetch failed: {e}")
+                    st.session_state["edge_signals"] = []
+
+        signals = st.session_state.get("edge_signals", [])
+        edge_ts = st.session_state.get("edge_signals_ts", "")
+
+        if edge_ts:
+            st.caption(f"Last fetched: {edge_ts} · {len(signals)} signals")
+
+        with col_filter_sev:
+            sev_filter = st.selectbox("Severity", ["All", "Critical", "High", "Medium", "Low"],
+                                      key="edge_sev")
+        with col_filter_type:
+            type_opts = ["All", "Injury", "Late Out", "Suspension", "Selection", "Team News", "Breaking"]
+            type_filter = st.selectbox("Type", type_opts, key="edge_type")
+        with col_filter_team:
+            all_teams_edge = sorted({getattr(s, "team_name", "") for s in signals} - {""})
+            team_filter_edge = st.selectbox("Team", ["All"] + all_teams_edge, key="edge_team")
+
+        # Apply filters
+        filtered_signals = []
+        for s in signals:
+            if sev_filter != "All" and getattr(s, "severity", "").title() != sev_filter:
+                continue
+            if type_filter != "All":
+                stype_display = getattr(s, "signal_type", "").replace("_", " ").title()
+                if stype_display != type_filter:
+                    continue
+            if team_filter_edge != "All" and getattr(s, "team_name", "") != team_filter_edge:
+                continue
+            filtered_signals.append(s)
+
+        # Sort: critical first, then by published_at desc
+        _sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        filtered_signals.sort(
+            key=lambda s: (
+                _sev_rank.get(getattr(s, "severity", "low"), 3),
+                -(getattr(s, "published_at", datetime.min).timestamp()
+                  if hasattr(getattr(s, "published_at", None), "timestamp") else 0)
+            )
+        )
+
+        if filtered_signals:
+            st.caption(f"Showing {len(filtered_signals)} signals")
+            for sig in filtered_signals:
+                render_signal_card(sig)
+        elif signals:
+            st.markdown('<div class="empty-state">No signals match current filters.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div class="empty-state">No signals found. Click Refresh Signals to fetch latest AFL news.</div>',
+                unsafe_allow_html=True,
+            )
+
+
+# ── Tab 6: Model Insights ─────────────────────────────────────────────────
 with tab_insights:
     st.markdown('<div class="section-header">📊 Model Insights</div>', unsafe_allow_html=True)
 
@@ -605,48 +736,107 @@ with tab_insights:
                         st.caption(f"Trained on {result['n_train_samples']} samples · Validated on {result.get('n_val_samples', 0)}")
 
 
-# ── Tab 6: System ─────────────────────────────────────────────────────────
+# ── Tab 7: System ─────────────────────────────────────────────────────────
 with tab_system:
-    st.markdown('<div class="section-header">⚙ System Status</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">⚙ System Status & Data Sources</div>', unsafe_allow_html=True)
 
-    # Data source details
-    st.subheader("Data Source")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Configured Mode", settings.data_mode.title())
-    col2.metric("Effective Mode", settings.effective_data_mode.title())
-    col3.metric("API Configured", "Yes" if settings.is_sportradar_configured else "No")
+    # ── Data source transparency ──────────────────────────────────────────
+    st.subheader("API Data Sources")
 
-    if settings.is_sportradar_configured:
-        try:
-            from app.data_ingestion.quota_manager import QuotaManager
-            qm = QuotaManager()
-            q = qm.get_status()
-            st.divider()
-            st.subheader("API Quota")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Used", q.get("used", 0))
-            c2.metric("Remaining", q.get("remaining", 0))
-            c3.metric("Total Quota", q.get("total_quota", 1000))
-            pct = q.get("used", 0) / max(q.get("total_quota", 1000), 1)
-            c4.metric("% Used", f"{pct:.1%}")
-            if q.get("warn_triggered"):
-                st.warning("⚠ API quota above 80%. Use cache mode to conserve calls.")
-        except Exception as e:
-            st.caption(f"Quota info unavailable: {e}")
-    else:
-        st.info("Running in **Demo Mode** using local CSV data. Add SPORTRADAR_API_KEY to .env to enable live data.")
+    def _status_dot(ok: bool) -> str:
+        return "🟢" if ok else "🔴"
+
+    # Sportradar
+    with st.expander(f"{_status_dot(settings.is_sportradar_configured)} Sportradar AFL API (Primary)", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Status", "Configured" if settings.is_sportradar_configured else "Not configured")
+        col2.metric("Mode", settings.effective_data_mode.title())
+        col3.metric("Sport", "AFL")
+        if settings.is_sportradar_configured:
+            try:
+                from app.data_ingestion.quota_manager import QuotaManager
+                qm = QuotaManager()
+                q = qm.get_status()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Calls Used", q.get("used", 0))
+                c2.metric("Remaining", q.get("remaining", 0))
+                c3.metric("Total Quota", q.get("total_quota", 1000))
+                pct = q.get("used", 0) / max(q.get("total_quota", 1000), 1)
+                c4.metric("% Used", f"{pct:.1%}")
+                if q.get("warn_triggered"):
+                    st.warning("⚠ Sportradar quota above 80%. Use cache mode to conserve calls.")
+            except Exception as e:
+                st.caption(f"Quota info unavailable: {e}")
+        else:
+            st.error("SPORTRADAR_API_KEY not set in .env")
+
+    # Odds API
+    with st.expander(f"{_status_dot(settings.is_odds_api_configured)} The Odds API (Real bookmaker odds)"):
+        col1, col2 = st.columns(2)
+        col1.metric("Status", "Configured" if settings.is_odds_api_configured else "Not configured")
+        col2.metric("Sport", settings.odds_api_sport)
+        if settings.is_odds_api_configured:
+            col3, col4 = st.columns(2)
+            col3.metric("Cache TTL", "15 min")
+            col4.metric("Region", "AU")
+            # Try to get quota from loader's odds provider
+            try:
+                ldr = get_loader()
+                if hasattr(ldr.odds, "quota_status"):
+                    qs = ldr.odds.quota_status
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Requests Remaining", qs.get("requests_remaining", "—"))
+                    c2.metric("Requests Used", qs.get("requests_used", "—"))
+                    age = qs.get("cache_age_seconds")
+                    c3.metric("Cache Age", f"{age}s" if age is not None else "Not fetched")
+            except Exception:
+                pass
+            bm = settings.odds_api_bookmakers
+            st.caption(f"Bookmakers: {bm}")
+        else:
+            st.warning("ODDS_API_KEY not set — using synthetic odds estimates only")
+
+    # Edge Intelligence
+    with st.expander(f"{_status_dot(settings.enable_scraping)} Edge Intelligence (Web scraping)"):
+        col1, col2 = st.columns(2)
+        col1.metric("Status", "Enabled" if settings.enable_scraping else "Disabled")
+        col2.metric("Cache TTL", f"{settings.scrape_cache_ttl_minutes} min")
+        if settings.enable_scraping:
+            n_signals = len(st.session_state.get("edge_signals", []))
+            edge_ts = st.session_state.get("edge_signals_ts", "Not fetched")
+            c1, c2 = st.columns(2)
+            c1.metric("Cached Signals", n_signals)
+            c2.metric("Last Fetched", edge_ts)
+            st.caption("Sources: AFL.com.au RSS, Fox Sports RSS, club news pages")
+        else:
+            st.info("Set ENABLE_SCRAPING=true in .env to activate edge intelligence.")
+
+    # API-Sports (supplementary)
+    with st.expander(f"{_status_dot(settings.is_api_sports_configured)} API-Sports AFL (Supplementary)"):
+        col1, col2 = st.columns(2)
+        col1.metric("Status", "Configured" if settings.is_api_sports_configured else "Not configured")
+        col2.metric("Limit", "100 req/day (free tier)")
+        if settings.is_api_sports_configured:
+            st.caption(f"Base URL: {settings.api_sports_base_url} · League ID: {settings.api_sports_afl_league_id}")
+        else:
+            st.caption("API_SPORTS_KEY not set — Sportradar is primary, API-Sports is optional.")
 
     st.divider()
+
+    # ── Environment ───────────────────────────────────────────────────────
     st.subheader("Environment")
     st.code(f"""
 DATA_MODE={settings.data_mode}
 EFFECTIVE_MODE={settings.effective_data_mode}
-DEMO_DATA_DIR={settings.demo_data_dir}
+SPORTRADAR_CONFIGURED={settings.is_sportradar_configured}
+ODDS_API_CONFIGURED={settings.is_odds_api_configured}
+API_SPORTS_CONFIGURED={settings.is_api_sports_configured}
+EDGE_SCRAPING_ENABLED={settings.enable_scraping}
 ARTIFACTS_DIR={settings.artifacts_dir}
     """, language="ini")
 
     st.divider()
-    st.subheader("Run History")
+    st.subheader("Last Pipeline Run")
     if pr:
         st.json({
             "run_id": pr.get("run_id"),
@@ -656,6 +846,8 @@ ARTIFACTS_DIR={settings.artifacts_dir}
             "n_candidate_legs": pr.get("n_candidate_legs"),
             "elapsed_seconds": pr.get("elapsed_seconds"),
         })
+    else:
+        st.caption("No pipeline run yet — click Run Pipeline in the sidebar.")
 
     st.divider()
     st.subheader("Continuous Mode")

@@ -1,14 +1,14 @@
 """
 Main data loader: aggregates provider data into DataFrames for modelling.
 
-In live/cache mode the AFL provider is SportradarLoader (requires API key).
-Demo mode is not supported in production — constructing DataLoader without
-an explicit afl_provider when no API key is configured raises RuntimeError.
+Data source hierarchy (all configured sources used, not just first):
+  1. Sportradar AFL API     → fixtures, schedule, historical scores (primary)
+  2. API-Sports AFL         → supplementary fixtures/teams/injuries (when configured)
+  3. The Odds API           → real bookmaker odds for edge calculation (when configured)
+  4. Edge Intelligence      → scraped news/injury signals (when scraping enabled)
 
-Tests that need deterministic data should inject DemoAFLDataProvider
-explicitly:
-    from app.data_ingestion.demo_loader import DemoAFLDataProvider
-    loader = DataLoader(afl_provider=DemoAFLDataProvider(demo_data_path))
+Tests inject providers explicitly:
+    DataLoader(afl_provider=DemoAFLDataProvider(demo_data_path))
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from app.core.config import settings
 
 
 # ---------------------------------------------------------------------------
-# Null providers (returned when API has no odds/weather/injuries)
+# Null providers (used when an optional source is not configured)
 # ---------------------------------------------------------------------------
 
 class _NullOddsProvider:
@@ -54,26 +54,56 @@ class _NullInjuryProvider:
 
 
 # ---------------------------------------------------------------------------
-# Provider factory
+# Provider factories
 # ---------------------------------------------------------------------------
 
 def _make_afl_provider():
     """
-    Return the appropriate AFL data provider based on effective_data_mode.
-
-    live / cache → SportradarLoader (raises if no API key)
-    demo         → RuntimeError (demo mode is not supported in production)
+    Build the primary AFL data provider.
+    Sportradar is required; raises RuntimeError if not configured.
     """
     mode = settings.effective_data_mode
     if mode in ("live", "cache"):
         from app.data_ingestion.sportradar_loader import SportradarLoader
-        return SportradarLoader()
+        provider = SportradarLoader()
+        logger.info("DataLoader: using SportradarLoader (mode=%s)", mode)
+        return provider
 
     raise RuntimeError(
         f"Data mode is '{mode}' but SPORTRADAR_API_KEY is not configured. "
-        "Set SPORTRADAR_API_KEY in your .env file. "
-        "Demo mode has been removed from production — live API data is required."
+        "Set SPORTRADAR_API_KEY in your .env file."
     )
+
+
+def _make_odds_provider(fixtures_df: Optional[pd.DataFrame] = None):
+    """
+    Build the odds provider.
+    Uses The Odds API when configured; falls back to null provider.
+    """
+    if settings.is_odds_api_configured:
+        try:
+            from app.data_ingestion.odds_provider import OddsAPIProvider
+            provider = OddsAPIProvider(fixtures_df=fixtures_df)
+            logger.info("DataLoader: using OddsAPIProvider (live bookmaker odds)")
+            return provider
+        except Exception as e:
+            logger.warning("DataLoader: OddsAPIProvider init failed: %s — using null odds", e)
+    else:
+        logger.info("DataLoader: ODDS_API_KEY not configured — running without market odds")
+    return _NullOddsProvider()
+
+
+def _make_edge_provider():
+    """Build the edge intelligence provider if scraping is enabled."""
+    if settings.enable_scraping:
+        try:
+            from app.data_ingestion.edge_intelligence import EdgeIntelligenceService
+            svc = EdgeIntelligenceService()
+            logger.info("DataLoader: EdgeIntelligenceService enabled")
+            return svc
+        except Exception as e:
+            logger.warning("DataLoader: EdgeIntelligenceService init failed: %s", e)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +114,8 @@ class DataLoader:
     """
     Aggregates data from all providers into analysis-ready DataFrames.
 
-    Inject providers to override the default (used by tests):
-        DataLoader(afl_provider=DemoAFLDataProvider(path))
+    In production: uses SportradarLoader (primary) + OddsAPIProvider + EdgeIntelligence.
+    In tests: inject providers explicitly.
     """
 
     def __init__(
@@ -94,11 +124,25 @@ class DataLoader:
         odds_provider=None,
         weather_provider=None,
         injury_provider=None,
+        edge_provider=None,
     ):
         self.afl = afl_provider or _make_afl_provider()
-        self.odds = odds_provider or _NullOddsProvider()
         self.weather = weather_provider or _NullWeatherProvider()
         self.injuries = injury_provider or _NullInjuryProvider()
+
+        # Odds provider needs fixture data to map team names → fixture IDs
+        if odds_provider is not None:
+            self.odds = odds_provider
+        else:
+            # Pass fixtures_df so OddsAPIProvider can match games to fixture IDs
+            try:
+                fx = self.afl.fixtures_df if hasattr(self.afl, "fixtures_df") else pd.DataFrame()
+            except Exception:
+                fx = pd.DataFrame()
+            self.odds = _make_odds_provider(fixtures_df=fx)
+
+        # Edge intelligence (optional scraped signals)
+        self.edge = edge_provider if edge_provider is not None else _make_edge_provider()
 
     # ------------------------------------------------------------------
     # Core load methods
@@ -110,20 +154,16 @@ class DataLoader:
 
     def load_upcoming_fixtures_df(self) -> pd.DataFrame:
         """
-        Future fixtures only. Delegates to provider's strict datetime filter
-        if available; otherwise filters by status == 'upcoming'.
-
-        Raises NoUpcomingFixturesError (from sportradar_loader) if the live
-        provider finds no future games.
+        Future fixtures only (scheduled_utc > now).
+        Delegates to provider's strict datetime filter when available.
         """
         if hasattr(self.afl, "load_upcoming_fixtures_df"):
             return self.afl.load_upcoming_fixtures_df()
 
-        # Fallback for test-injected demo providers (status field is reliable)
+        # Fallback for test-injected demo providers
         fx = self.afl.fixtures_df.copy()
         fx["status"] = fx["status"].str.strip()
-        upcoming = fx[fx["status"] == "upcoming"]
-        return upcoming
+        return fx[fx["status"] == "upcoming"]
 
     def load_team_stats_df(self) -> pd.DataFrame:
         return self.afl.team_stats_df.copy()
@@ -132,7 +172,19 @@ class DataLoader:
         return self.afl.player_stats_df.copy()
 
     def load_odds_df(self) -> pd.DataFrame:
-        return self.odds.odds_df.copy()
+        """
+        Load bookmaker odds. Returns real Odds API data when configured,
+        empty DataFrame otherwise. Logs source clearly.
+        """
+        df = self.odds.odds_df.copy()
+        if not df.empty:
+            logger.info(
+                "DataLoader.load_odds_df: %d rows from %s",
+                len(df), type(self.odds).__name__,
+            )
+        else:
+            logger.debug("DataLoader.load_odds_df: no odds available")
+        return df
 
     def load_weather_df(self) -> pd.DataFrame:
         return self.weather.weather_df.copy()
@@ -146,15 +198,63 @@ class DataLoader:
     def load_players_df(self) -> pd.DataFrame:
         return self.afl.players_df.copy()
 
+    def load_edge_signals(self, home_team: str = "", away_team: str = "") -> list:
+        """
+        Load scraped edge intelligence signals for a fixture.
+        Returns list of EdgeSignal objects (or empty list if scraping disabled).
+        """
+        if self.edge is None:
+            return []
+        try:
+            if home_team or away_team:
+                return self.edge.get_fixture_signals(home_team, away_team)
+            return self.edge.fetch_signals()
+        except Exception as e:
+            logger.warning("DataLoader.load_edge_signals failed: %s", e)
+            return []
+
+    def load_all_edge_signals(self) -> list:
+        """Load all current edge signals."""
+        if self.edge is None:
+            return []
+        try:
+            return self.edge.fetch_signals()
+        except Exception as e:
+            logger.warning("DataLoader.load_all_edge_signals failed: %s", e)
+            return []
+
     # ------------------------------------------------------------------
-    # Combined / joined helpers
+    # Data source status
+    # ------------------------------------------------------------------
+
+    def get_source_status(self) -> dict:
+        """Return a dict summarising which data sources are active."""
+        status = {
+            "sportradar": {
+                "active": isinstance(self.afl, object) and hasattr(self.afl, "_client"),
+                "type": type(self.afl).__name__,
+            },
+            "odds_api": {
+                "active": settings.is_odds_api_configured,
+                "type": type(self.odds).__name__,
+                "has_data": not self.odds.odds_df.empty if hasattr(self.odds, "odds_df") else False,
+            },
+            "edge_intelligence": {
+                "active": self.edge is not None,
+                "type": type(self.edge).__name__ if self.edge else "disabled",
+            },
+        }
+        # Quota info from Odds API if available
+        if hasattr(self.odds, "quota_status"):
+            status["odds_api"]["quota"] = self.odds.quota_status
+        return status
+
+    # ------------------------------------------------------------------
+    # Combined helpers
     # ------------------------------------------------------------------
 
     def load_combined_match_data(self) -> pd.DataFrame:
-        """
-        Wide fixture-level DataFrame with home_/away_ team stats joined in.
-        Used by feature engineering.
-        """
+        """Wide fixture-level DataFrame with team stats joined in."""
         fixtures = self.load_fixtures_df()
         team_stats = self.load_team_stats_df()
         weather = self.load_weather_df()
@@ -162,55 +262,43 @@ class DataLoader:
         if fixtures.empty:
             return pd.DataFrame()
 
-        # Pivot team stats to wide format (home_ and away_ prefixes)
         if not team_stats.empty:
             home_stats = team_stats[team_stats["is_home"] == 1].copy()
             away_stats = team_stats[team_stats["is_home"] == 0].copy()
-
             stat_cols = [
                 c for c in team_stats.columns
                 if c not in ["stat_id", "fixture_id", "team_id", "is_home"]
             ]
-
             home_stats = home_stats.rename(
                 columns={c: f"home_{c}" for c in stat_cols}
             )[["fixture_id"] + [f"home_{c}" for c in stat_cols]]
-
             away_stats = away_stats.rename(
                 columns={c: f"away_{c}" for c in stat_cols}
             )[["fixture_id"] + [f"away_{c}" for c in stat_cols]]
-
             fixtures = fixtures.merge(home_stats, on="fixture_id", how="left")
             fixtures = fixtures.merge(away_stats, on="fixture_id", how="left")
 
         if not weather.empty:
-            weather_cols = [
-                "fixture_id", "temperature_c", "humidity_pct",
-                "wind_speed_kmh", "conditions",
-            ]
-            wx_sub = weather[[c for c in weather_cols if c in weather.columns]]
+            wx_cols = ["fixture_id", "temperature_c", "humidity_pct", "wind_speed_kmh", "conditions"]
+            wx_sub = weather[[c for c in wx_cols if c in weather.columns]]
             fixtures = fixtures.merge(wx_sub, on="fixture_id", how="left")
 
         return fixtures
 
     def get_team_history(self, team_id: int) -> pd.DataFrame:
-        """Sorted historical team stats for a team."""
         ts = self.load_team_stats_df()
         fixtures = self.load_fixtures_df()
         if ts.empty:
             return pd.DataFrame()
         ts = ts[ts["team_id"] == team_id].copy()
         ts = ts.merge(
-            fixtures[["fixture_id", "season", "round", "date",
-                       "home_team_id", "away_team_id"]],
+            fixtures[["fixture_id", "season", "round", "date", "home_team_id", "away_team_id"]],
             on="fixture_id", how="left",
         )
         ts["is_home_game"] = (ts["team_id"] == ts["home_team_id"]).astype(int)
-        ts = ts.sort_values(["season", "round"]).reset_index(drop=True)
-        return ts
+        return ts.sort_values(["season", "round"]).reset_index(drop=True)
 
     def get_player_history(self, player_id: int) -> pd.DataFrame:
-        """Sorted historical stats for a player (empty when no player data)."""
         ps = self.load_player_stats_df()
         if ps.empty:
             return pd.DataFrame()
@@ -219,8 +307,7 @@ class DataLoader:
         if ps.empty:
             return ps
         ps = ps.merge(
-            fixtures[["fixture_id", "season", "round", "date"]],
-            on="fixture_id", how="left",
+            fixtures[["fixture_id", "season", "round", "date"]], on="fixture_id", how="left",
         )
-        ps = ps.sort_values(["season", "round"]).reset_index(drop=True)
-        return ps
+        return ps.sort_values(["season", "round"]).reset_index(drop=True)
+

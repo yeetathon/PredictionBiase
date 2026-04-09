@@ -3,7 +3,7 @@ Extended application configuration.
 All secrets read from environment variables / .env file only.
 """
 from pathlib import Path
-from typing import Literal
+from typing import List, Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,30 +29,41 @@ class Settings(BaseSettings):
     raw_cache_dir: Path = Path("./data/cache")
 
     # ── Sportradar API ─────────────────────────────────────────────────────
-    # Read from environment - NEVER hardcode
     sportradar_api_key: str = ""
     sportradar_base_url: str = "https://api.sportradar.com/afl/trial/v2/en"
-    # AFL 2025 season ID (verify against your plan's competition/season IDs)
     sportradar_afl_competition_id: str = "sr:competition:3394"
-    sportradar_afl_season_id: str = ""  # populated at runtime from API or set manually
+    sportradar_afl_season_id: str = ""
+
+    # ── API-Sports AFL ─────────────────────────────────────────────────────
+    api_sports_key: str = ""
+    api_sports_base_url: str = "https://v1.afl.api-sports.io"
+    api_sports_afl_league_id: int = 1
+
+    # ── The Odds API ───────────────────────────────────────────────────────
+    odds_api_key: str = ""
+    odds_api_base_url: str = "https://api.the-odds-api.com/v4"
+    odds_api_sport: str = "aussierules_afl"
+    odds_api_bookmakers: str = "tab,sportsbet,bet365,unibet,pointsbet,betfair,williamhill,neds"
 
     # ── Data Mode ─────────────────────────────────────────────────────────
-    # live: prefer API (uses cache, fetches only when stale)
-    # cache: only use cached API responses, never make live calls
-    # demo: NOT supported in production — raises RuntimeError on use
     data_mode: Literal["live", "cache", "demo"] = "live"
-    enable_demo_fallback: bool = False  # demo fallback disabled
+    enable_demo_fallback: bool = False
 
     # ── Rate Limiting & Quota ─────────────────────────────────────────────
-    api_rate_limit_qps: float = 1.0       # max requests per second
-    api_quota_total: int = 1000            # lifetime quota
-    api_quota_warn_pct: float = 0.80       # warn when this fraction used
-    api_quota_refuse_pct: float = 0.95     # refuse requests when this fraction used
+    api_rate_limit_qps: float = 1.0
+    api_quota_total: int = 1000
+    api_quota_warn_pct: float = 0.80
+    api_quota_refuse_pct: float = 0.95
 
     # ── Cache TTL ─────────────────────────────────────────────────────────
-    cache_ttl_hours: int = 6               # default TTL for API responses
-    cache_ttl_upcoming_hours: int = 2      # shorter TTL for upcoming fixtures
-    cache_ttl_results_hours: int = 24      # longer TTL for completed results
+    cache_ttl_hours: int = 6
+    cache_ttl_upcoming_hours: int = 2
+    cache_ttl_results_hours: int = 24
+
+    # ── Scraping / Edge Intelligence ───────────────────────────────────────
+    enable_scraping: bool = True
+    scrape_cache_ttl_minutes: int = 30
+    scrape_max_age_hours: int = 6
 
     # ── Sync Windows ──────────────────────────────────────────────────────
     upcoming_lookahead_days: int = 14
@@ -68,9 +79,9 @@ class Settings(BaseSettings):
     min_multi_legs: int = 2
 
     # ── Training / Retraining ─────────────────────────────────────────────
-    retrain_min_new_games: int = 10        # min new settled games to trigger retraining
-    retrain_brier_degradation_threshold: float = 0.02  # retrain if Brier worsens by this
-    model_promotion_brier_improvement: float = 0.002   # min improvement to promote new model
+    retrain_min_new_games: int = 10
+    retrain_brier_degradation_threshold: float = 0.02
+    model_promotion_brier_improvement: float = 0.002
 
     # ── Bootstrap ─────────────────────────────────────────────────────────
     enable_bootstrap_mode: bool = True
@@ -86,6 +97,8 @@ class Settings(BaseSettings):
     elo_initial_rating: float = 1500.0
     elo_home_advantage: float = 70.0
 
+    # ── Computed helpers ──────────────────────────────────────────────────
+
     @property
     def model_artifacts_dir(self) -> Path:
         return self.artifacts_dir
@@ -95,15 +108,25 @@ class Settings(BaseSettings):
         return bool(self.sportradar_api_key and self.sportradar_api_key.strip())
 
     @property
-    def effective_data_mode(self) -> str:
-        """
-        Return the effective data mode.
+    def is_api_sports_configured(self) -> bool:
+        return bool(self.api_sports_key and self.api_sports_key.strip())
 
-        Never silently returns 'demo' — if the API key is missing the caller
-        will get 'live' or 'cache' back and SportradarLoader will raise a
-        clear RuntimeError on construction.
-        """
+    @property
+    def is_odds_api_configured(self) -> bool:
+        return bool(self.odds_api_key and self.odds_api_key.strip())
+
+    @property
+    def odds_api_bookmakers_list(self) -> List[str]:
+        return [b.strip() for b in self.odds_api_bookmakers.split(",") if b.strip()]
+
+    @property
+    def effective_data_mode(self) -> str:
+        """Return the effective data mode. Never silently falls back to demo."""
         return self.data_mode
+
+    @property
+    def any_api_configured(self) -> bool:
+        return self.is_sportradar_configured or self.is_api_sports_configured
 
 
 settings = Settings()
