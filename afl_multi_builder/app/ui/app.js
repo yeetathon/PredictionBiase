@@ -1,373 +1,511 @@
-/* AFL Multi Builder - Frontend Application */
+/**
+ * AFL Multi Builder — Dashboard Application
+ *
+ * Workflow:
+ *   1. Load weekend AFL fixtures from /api/v1/fixtures/weekend
+ *   2. User ticks games, picks style, picks quantity
+ *   3. POST /api/v1/generate → get job_id
+ *   4. Poll /api/v1/generate/{job_id}/status every 1s
+ *   5. Show stage-by-stage progress
+ *   6. Render final multis as rich cards
+ */
 
-const API_BASE = '/api/v1';
-let pipelineResults = null;
-let backtestResults = null;
+'use strict';
 
-// ── Tabs ──────────────────────────────────────────────────────────────────
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    tab.classList.add('active');
-    const target = `tab-${tab.dataset.tab}`;
-    document.getElementById(target).classList.add('active');
-  });
+const API = '/api/v1';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let selectedFixtureIds = new Set();
+let selectedStyle = 'balanced';
+let selectedQty = 1;
+let pollTimer = null;
+let currentJobId = null;
+let fixtureData = [];       // array of fixture objects from API
+let styleData = {};         // style profiles from API
+let jobStartTime = null;
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  checkApiStatus();
+  loadWeekendFixtures();
+  wireQuantityButtons();
 });
 
-// ── Button handlers ───────────────────────────────────────────────────────
-document.getElementById('btn-run-pipeline').addEventListener('click', runPipeline);
-document.getElementById('btn-run-training').addEventListener('click', runTraining);
-document.getElementById('btn-run-backtest').addEventListener('click', runBacktest);
-document.getElementById('btn-summary').addEventListener('click', loadSummary);
-
-// ── Status helpers ────────────────────────────────────────────────────────
-function setStatus(msg, type = 'default') {
-  const bar = document.getElementById('status-bar');
-  bar.className = `status-bar ${type}`;
-  bar.innerHTML = type === 'loading'
-    ? `<span class="spinner"></span>${msg}`
-    : msg;
-}
-
-function setButtons(disabled) {
-  document.querySelectorAll('.btn').forEach(b => b.disabled = disabled);
-}
-
-// ── API calls ─────────────────────────────────────────────────────────────
-async function apiPost(path, body = null) {
-  const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(`${API_BASE}${path}`, opts);
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(err.detail || r.statusText);
-  }
-  return r.json();
-}
-
+// ── API helpers ───────────────────────────────────────────────────────────────
 async function apiGet(path) {
-  const r = await fetch(`${API_BASE}${path}`);
-  if (!r.ok) throw new Error(r.statusText);
+  const r = await fetch(`${API}${path}`);
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(body.detail || r.statusText);
+  }
   return r.json();
 }
 
-// ── Pipeline ──────────────────────────────────────────────────────────────
-async function runPipeline() {
-  setButtons(true);
-  setStatus('Running prediction pipeline...', 'loading');
+async function apiPost(path, body) {
+  const r = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const b = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(b.detail || r.statusText);
+  }
+  return r.json();
+}
+
+// ── API status indicator ──────────────────────────────────────────────────────
+async function checkApiStatus() {
   try {
-    const result = await apiPost('/pipeline/run');
-    pipelineResults = result;
-    renderLegs(result.value_legs, 'legs-container');
-    renderLegs(result.safe_legs, 'safe-legs-container');
-    renderMultis(result.value_multis, 'value-multis-container');
-    renderMultis(result.safe_multis, 'safe-multis-container');
-    renderMultis(result.same_game_multis, 'same-game-container');
-    setStatus(
-      `✓ Pipeline complete in ${result.elapsed_seconds.toFixed(1)}s · ` +
-      `${result.n_candidate_legs} candidate legs · ` +
-      `${result.value_multis.length} value multis`,
-      'success'
-    );
-  } catch (e) {
-    setStatus(`✗ Pipeline error: ${e.message}`, 'error');
-  } finally {
-    setButtons(false);
+    await apiGet('/health');
+    document.getElementById('api-status-dot').className = 'status-dot dot-ok';
+    document.getElementById('api-status-text').textContent = 'API Connected';
+  } catch {
+    document.getElementById('api-status-dot').className = 'status-dot dot-err';
+    document.getElementById('api-status-text').textContent = 'API Offline';
   }
 }
 
-async function runTraining() {
-  setButtons(true);
-  setStatus('Training models (this may take a moment)...', 'loading');
+// ── Load weekend fixtures ─────────────────────────────────────────────────────
+async function loadWeekendFixtures() {
+  showLoadingScreen('Fetching upcoming AFL fixtures...');
   try {
-    const result = await apiPost('/training/run');
-    const mm = result.match_model || {};
-    const pm = result.player_disposals_model || {};
-    const mmBrier = mm.test_metrics?.calibrated_brier ?? 'N/A';
-    setStatus(
-      `✓ Training complete · Match model Brier: ${mmBrier} · ` +
-      `Run ID: ${result.run_id}`,
-      'success'
-    );
-  } catch (e) {
-    setStatus(`✗ Training error: ${e.message}`, 'error');
-  } finally {
-    setButtons(false);
+    const data = await apiGet('/fixtures/weekend');
+    fixtureData = data.fixtures || [];
+    styleData = data.styles || {};
+
+    if (fixtureData.length === 0) {
+      showErrorScreen('No upcoming AFL fixtures found. The season may be between rounds.');
+      return;
+    }
+
+    // Round label
+    const roundLabel = `Season ${data.season} · Round ${data.round} · ${data.n_fixtures} Game${data.n_fixtures !== 1 ? 's' : ''}`;
+    document.getElementById('round-label').textContent = roundLabel;
+
+    // Default: select all fixtures
+    selectedFixtureIds = new Set(fixtureData.map(f => f.fixture_id));
+
+    renderFixtures(fixtureData);
+    renderStylePicker(styleData);
+    updateSelectionCount();
+    updateGenerateButton();
+
+    document.getElementById('footer-data-mode').textContent =
+      data.fixtures[0]?.status === 'upcoming' ? 'live · sportradar' : 'demo';
+
+    hideLoadingScreen();
+  } catch (err) {
+    showErrorScreen(`Failed to load fixtures: ${err.message}`);
   }
 }
 
-async function runBacktest() {
-  setButtons(true);
-  setStatus('Running walk-forward backtest...', 'loading');
-  try {
-    const result = await apiPost('/backtest/run');
-    backtestResults = result;
-    renderBacktest(result);
-    // Switch to backtest tab
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    document.querySelector('[data-tab="backtest"]').classList.add('active');
-    document.getElementById('tab-backtest').classList.add('active');
-    const m = result.overall_metrics || {};
-    setStatus(
-      `✓ Backtest complete · Brier: ${m.brier_score?.toFixed(4)} · ` +
-      `Accuracy: ${(m.accuracy * 100).toFixed(1)}%`,
-      'success'
-    );
-  } catch (e) {
-    setStatus(`✗ Backtest error: ${e.message}`, 'error');
-  } finally {
-    setButtons(false);
-  }
+// ── Fixture rendering ─────────────────────────────────────────────────────────
+function renderFixtures(fixtures) {
+  const grid = document.getElementById('fixture-grid');
+  grid.innerHTML = fixtures.map(f => fixtureCard(f)).join('');
+
+  // Wire checkbox events
+  grid.querySelectorAll('.fixture-checkbox').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const id = parseInt(cb.dataset.id);
+      if (cb.checked) {
+        selectedFixtureIds.add(id);
+      } else {
+        selectedFixtureIds.delete(id);
+      }
+      // Update card visual
+      cb.closest('.fixture-card').classList.toggle('fixture-selected', cb.checked);
+      updateSelectionCount();
+      updateGenerateButton();
+    });
+  });
 }
 
-async function loadSummary() {
-  setButtons(true);
-  setStatus('Loading summary...', 'loading');
-  try {
-    const r = await apiGet('/reports/summary');
-    const ds = r.data_summary;
-    setStatus(
-      `Fixtures: ${ds.completed_fixtures} completed, ${ds.upcoming_fixtures} upcoming · ` +
-      `Players: ${ds.total_players} · Models: ${r.models_available.join(', ') || 'none trained'}`,
-      'success'
-    );
-  } catch (e) {
-    setStatus(`✗ ${e.message}`, 'error');
-  } finally {
-    setButtons(false);
-  }
-}
-
-// ── Leg filters ───────────────────────────────────────────────────────────
-function applyLegFilters() {
-  if (!pipelineResults) return;
-  const minEv = parseFloat(document.getElementById('filter-ev').value) || 0;
-  const market = document.getElementById('filter-market').value;
-  let legs = pipelineResults.value_legs.filter(l => l.ev >= minEv);
-  if (market) legs = legs.filter(l => l.market_type === market);
-  renderLegs(legs, 'legs-container');
-}
-
-// ── Renderers ─────────────────────────────────────────────────────────────
-function renderLegs(legs, containerId) {
-  const c = document.getElementById(containerId);
-  if (!legs || legs.length === 0) {
-    c.innerHTML = '<p class="placeholder">No legs match current criteria.</p>';
-    return;
-  }
-  c.innerHTML = legs.map(leg => legCard(leg)).join('');
-}
-
-function legCard(leg) {
-  const ev = leg.ev;
-  const evClass = ev >= 0.05 ? 'positive' : ev >= 0 ? 'neutral' : 'negative';
-  const evStr = (ev >= 0 ? '+' : '') + (ev * 100).toFixed(1) + '%';
-  const prob = leg.model_probability;
-  const conf = leg.confidence_score;
-  const confLabel = conf >= 65 ? 'high' : conf >= 40 ? 'medium' : 'low';
-  const cardClass = ev >= 0.05 ? 'positive-ev' : conf >= 65 ? 'high-confidence' : '';
-
+function fixtureCard(f) {
+  const checked = selectedFixtureIds.has(f.fixture_id) ? 'checked' : '';
+  const selClass = checked ? 'fixture-selected' : '';
+  const time = f.display_time || `${f.date} ${f.time}`.trim() || 'TBC';
   return `
-    <div class="leg-card ${cardClass}">
-      <div class="leg-header">
-        <div>
-          <div class="leg-selection">${formatSelection(leg.selection)}</div>
-          <div class="leg-market">${formatMarket(leg.market_type)} · Fixture ${leg.fixture_id}</div>
-        </div>
-        <div class="leg-odds">$${leg.decimal_odds.toFixed(2)}</div>
+    <label class="fixture-card ${selClass}" for="fx-${f.fixture_id}">
+      <input
+        type="checkbox"
+        class="fixture-checkbox visually-hidden"
+        id="fx-${f.fixture_id}"
+        data-id="${f.fixture_id}"
+        ${checked}
+      />
+      <div class="fixture-check-indicator">
+        <div class="check-icon">✓</div>
       </div>
-      <div class="prob-bar-container">
-        <div class="prob-bar-label">
-          <span>Model ${(prob * 100).toFixed(1)}%</span>
-        </div>
-        <div class="prob-bar"><div class="prob-bar-fill" style="width:${prob*100}%"></div></div>
+      <div class="fixture-teams">
+        <div class="fixture-home">${escHtml(f.home_team)}</div>
+        <div class="fixture-vs">vs</div>
+        <div class="fixture-away">${escHtml(f.away_team)}</div>
       </div>
-      <div class="leg-metrics">
-        <div class="metric">
-          <div class="metric-label">EV</div>
-          <div class="metric-value ${evClass}">${evStr}</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Prob</div>
-          <div class="metric-value neutral">${(prob*100).toFixed(1)}%</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Confidence</div>
-          <div class="metric-value neutral">
-            <span class="confidence-badge ${confLabel}">${conf.toFixed(0)}</span>
-          </div>
-        </div>
+      <div class="fixture-meta">
+        <div class="fixture-time">${escHtml(time)}</div>
+        <div class="fixture-venue">${escHtml(f.venue)}</div>
       </div>
-      <div class="leg-explanation">${leg.explanation}</div>
-    </div>
+    </label>
   `;
 }
 
-function renderMultis(multis, containerId) {
-  const c = document.getElementById(containerId);
-  if (!multis || multis.length === 0) {
-    c.innerHTML = '<p class="placeholder">No multis available.</p>';
-    return;
-  }
-  c.innerHTML = multis.map(m => multiCard(m)).join('');
+function selectAllFixtures() {
+  selectedFixtureIds = new Set(fixtureData.map(f => f.fixture_id));
+  document.querySelectorAll('.fixture-checkbox').forEach(cb => {
+    cb.checked = true;
+    cb.closest('.fixture-card').classList.add('fixture-selected');
+  });
+  updateSelectionCount();
+  updateGenerateButton();
 }
 
-function multiCard(m) {
-  const evStr = (m.ev >= 0 ? '+' : '') + (m.ev * 100).toFixed(1) + '%';
-  const evClass = m.ev >= 0.05 ? 'positive' : m.ev >= 0 ? 'neutral' : 'negative';
-  const corrClass = m.correlation_label;
-  const cardCorrClass = `${corrClass}-corr`;
-
-  return `
-    <div class="multi-card ${cardCorrClass}">
-      <div class="multi-header">
-        <div>
-          <div class="multi-title">${m.n_legs}-Leg ${capitalize(m.multi_type)} Multi</div>
-          <div class="multi-subtitle">ID: ${m.multi_id}</div>
-        </div>
-        <div class="multi-combined-odds">$${m.combined_odds.toFixed(2)}</div>
-      </div>
-      <div class="multi-metrics">
-        <div class="metric">
-          <div class="metric-label">EV</div>
-          <div class="metric-value ${evClass}">${evStr}</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Hit Prob</div>
-          <div class="metric-value neutral">${(m.adjusted_probability * 100).toFixed(1)}%</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Correlation</div>
-          <div class="metric-value neutral"><span class="corr-badge ${corrClass}">${corrClass}</span></div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Risk</div>
-          <div class="metric-value neutral">${m.risk_score.toFixed(0)}/100</div>
-        </div>
-      </div>
-      <div class="multi-explanation">${m.explanation}</div>
-    </div>
-  `;
+function deselectAllFixtures() {
+  selectedFixtureIds.clear();
+  document.querySelectorAll('.fixture-checkbox').forEach(cb => {
+    cb.checked = false;
+    cb.closest('.fixture-card').classList.remove('fixture-selected');
+  });
+  updateSelectionCount();
+  updateGenerateButton();
 }
 
-function renderBacktest(result) {
-  const c = document.getElementById('backtest-container');
-  if (result.status !== 'success') {
-    c.innerHTML = `<p class="placeholder">Backtest status: ${result.status}</p>`;
-    return;
-  }
-  const m = result.overall_metrics || {};
-  const cal = result.calibration_report || {};
-  const clv = result.clv_analysis || {};
-  const roi = result.roi_by_edge_threshold || [];
+function updateSelectionCount() {
+  const n = selectedFixtureIds.size;
+  document.getElementById('selection-count').textContent =
+    n === 0 ? 'No games selected'
+    : n === 1 ? '1 game selected'
+    : `${n} games selected`;
+}
 
-  let roiRows = '';
-  roi.forEach(r => {
-    const roiStr = (r.roi >= 0 ? '+' : '') + (r.roi * 100).toFixed(1) + '%';
-    roiRows += `
-      <tr>
-        <td>${(r.edge_threshold * 100).toFixed(0)}%+</td>
-        <td>${r.n_bets}</td>
-        <td>${(r.hit_rate * 100).toFixed(1)}%</td>
-        <td style="color:${r.roi >= 0 ? '#22c55e' : '#ef4444'}">${roiStr}</td>
-        <td>${r.avg_odds.toFixed(2)}</td>
-        <td>$${r.total_staked.toFixed(0)}</td>
-      </tr>
+// ── Style picker ──────────────────────────────────────────────────────────────
+function renderStylePicker(styles) {
+  const grid = document.getElementById('style-grid');
+  const order = ['safest', 'balanced', 'value', 'aggressive', 'longshot'];
+  grid.innerHTML = order.map(key => {
+    const s = styles[key] || {};
+    const active = key === selectedStyle ? 'style-active' : '';
+    return `
+      <button class="style-card ${active}" data-style="${key}" onclick="selectStyle('${key}')">
+        <div class="style-icon">${escHtml(s.icon || '')}</div>
+        <div class="style-label">${escHtml(s.label || key)}</div>
+        <div class="style-risk">${escHtml(s.risk_label || '')}</div>
+        <div class="style-desc">${escHtml(s.description || '')}</div>
+      </button>
     `;
+  }).join('');
+}
+
+function selectStyle(key) {
+  selectedStyle = key;
+  document.querySelectorAll('.style-card').forEach(el => {
+    el.classList.toggle('style-active', el.dataset.style === key);
+  });
+}
+
+// ── Quantity picker ───────────────────────────────────────────────────────────
+function wireQuantityButtons() {
+  document.querySelectorAll('.qty-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const qty = parseInt(btn.dataset.qty);
+      selectedQty = qty;
+      document.querySelectorAll('.qty-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('qty-custom').value = '';
+    });
   });
 
-  c.innerHTML = `
-    <div class="backtest-report">
-      <h3 style="margin-bottom:16px;font-size:16px;">Walk-Forward Backtest Results</h3>
-      <div style="font-size:12px;color:var(--c-text-muted);margin-bottom:14px;">
-        Run ID: ${result.run_id} · ${result.n_total_predictions} predictions · ${result.n_folds} folds
+  document.getElementById('qty-custom').addEventListener('input', e => {
+    const v = parseInt(e.target.value);
+    if (v >= 1 && v <= 20) {
+      selectedQty = v;
+      document.querySelectorAll('.qty-btn').forEach(b => b.classList.remove('active'));
+    }
+  });
+}
+
+// ── Generate button state ─────────────────────────────────────────────────────
+function updateGenerateButton() {
+  const btn = document.getElementById('btn-generate');
+  const hint = document.getElementById('generate-hint');
+  const hasSelection = selectedFixtureIds.size > 0;
+  btn.disabled = !hasSelection;
+  hint.textContent = hasSelection
+    ? `${selectedFixtureIds.size} game${selectedFixtureIds.size !== 1 ? 's' : ''} selected · ${selectedStyle} style · ${selectedQty} multi${selectedQty !== 1 ? 's' : ''}`
+    : 'Select at least 1 game to continue';
+  hint.classList.toggle('hint-ready', hasSelection);
+}
+
+// ── Generate workflow ─────────────────────────────────────────────────────────
+async function startGenerate() {
+  if (selectedFixtureIds.size === 0) return;
+
+  // Lock UI
+  document.getElementById('btn-generate').disabled = true;
+  document.getElementById('section-results').classList.add('hidden');
+
+  // Show progress section
+  const progressSection = document.getElementById('section-progress');
+  progressSection.classList.remove('hidden');
+  progressSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  document.getElementById('progress-summary').textContent = 'Submitting analysis request...';
+  document.getElementById('progress-elapsed').textContent = '';
+
+  jobStartTime = Date.now();
+
+  try {
+    const { job_id } = await apiPost('/generate', {
+      fixture_ids: Array.from(selectedFixtureIds),
+      multi_style: selectedStyle,
+      n_multis: selectedQty,
+    });
+    currentJobId = job_id;
+    startPolling(job_id);
+  } catch (err) {
+    document.getElementById('progress-summary').textContent = `Error: ${err.message}`;
+    document.getElementById('btn-generate').disabled = false;
+  }
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────────
+function startPolling(jobId) {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(() => pollJobStatus(jobId), 1000);
+}
+
+async function pollJobStatus(jobId) {
+  try {
+    const data = await apiGet(`/generate/${jobId}/status`);
+    renderProgress(data);
+
+    if (data.status === 'complete') {
+      clearInterval(pollTimer);
+      renderResults(data.result);
+      document.getElementById('btn-generate').disabled = false;
+    } else if (data.status === 'error') {
+      clearInterval(pollTimer);
+      document.getElementById('progress-summary').textContent =
+        `Analysis failed: ${data.error || 'Unknown error'}`;
+      document.getElementById('btn-generate').disabled = false;
+    }
+  } catch (err) {
+    // Network blip — keep polling
+    console.warn('Poll error:', err.message);
+  }
+}
+
+// ── Progress rendering ────────────────────────────────────────────────────────
+function renderProgress(data) {
+  const elapsed = ((Date.now() - jobStartTime) / 1000).toFixed(1);
+  document.getElementById('progress-elapsed').textContent = `${elapsed}s`;
+
+  // Summary line
+  if (data.status === 'running' || data.status === 'pending') {
+    const runningStage = (data.stages || []).find(s => s.status === 'running');
+    document.getElementById('progress-summary').textContent =
+      runningStage ? runningStage.label : 'Initialising...';
+  } else if (data.status === 'complete') {
+    document.getElementById('progress-summary').textContent =
+      `Complete · ${data.n_candidate_legs} legs analysed · ${data.n_multis_generated} multi${data.n_multis_generated !== 1 ? 's' : ''} generated`;
+  }
+
+  // Stage list
+  const stagesEl = document.getElementById('progress-stages');
+  stagesEl.innerHTML = (data.stages || []).map(s => stageRow(s)).join('');
+}
+
+function stageRow(s) {
+  let icon, cls;
+  switch (s.status) {
+    case 'done':    icon = '✓'; cls = 'stage-done';    break;
+    case 'running': icon = '';  cls = 'stage-running';  break;
+    case 'error':   icon = '✗'; cls = 'stage-error';    break;
+    default:        icon = '';  cls = 'stage-pending';  break;
+  }
+  const spinner = s.status === 'running'
+    ? '<span class="stage-spinner"></span>'
+    : `<span class="stage-icon-text">${icon}</span>`;
+
+  return `
+    <div class="stage-row ${cls}">
+      <div class="stage-status-col">${spinner}</div>
+      <div class="stage-label-col">
+        <span class="stage-label">${escHtml(s.label)}</span>
+        ${s.detail ? `<span class="stage-detail">${escHtml(s.detail)}</span>` : ''}
       </div>
-      <div class="backtest-grid">
-        <div class="stat-box">
-          <div class="stat-box-label">Brier Score</div>
-          <div class="stat-box-value">${(m.brier_score || 0).toFixed(4)}</div>
-          <div class="stat-box-desc">0=perfect · 0.25=baseline</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-box-label">Log Loss</div>
-          <div class="stat-box-value">${(m.log_loss || 0).toFixed(4)}</div>
-          <div class="stat-box-desc">Lower is better</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-box-label">Accuracy</div>
-          <div class="stat-box-value">${((m.accuracy || 0) * 100).toFixed(1)}%</div>
-          <div class="stat-box-desc">Win/loss prediction</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-box-label">Cal. Improvement</div>
-          <div class="stat-box-value">${((cal.brier_improvement || 0) * 10000).toFixed(0)}</div>
-          <div class="stat-box-desc">Brier pts (×10000)</div>
-        </div>
-        ${clv.avg_model_vs_market !== undefined ? `
-        <div class="stat-box">
-          <div class="stat-box-label">Avg CLV</div>
-          <div class="stat-box-value" style="color:${(clv.avg_model_vs_market||0) >= 0 ? '#22c55e' : '#ef4444'}">
-            ${((clv.avg_model_vs_market || 0) >= 0 ? '+' : '')}${((clv.avg_model_vs_market || 0) * 100).toFixed(1)}%
-          </div>
-          <div class="stat-box-desc">Model vs market</div>
-        </div>` : ''}
-      </div>
-      ${roiRows ? `
-        <h4 style="margin:20px 0 8px;font-size:13px;color:var(--c-text-muted);">Simulated ROI by Edge Threshold</h4>
-        <table class="roi-table">
-          <thead><tr><th>Min Edge</th><th>Bets</th><th>Hit Rate</th><th>ROI</th><th>Avg Odds</th><th>Staked</th></tr></thead>
-          <tbody>${roiRows}</tbody>
-        </table>
-      ` : ''}
     </div>
   `;
 }
 
-// ── Formatters ────────────────────────────────────────────────────────────
-function formatSelection(sel) {
-  const map = {
-    'home_win': '🏠 Home Win',
-    'away_win': '✈ Away Win',
-  };
-  if (map[sel]) return map[sel];
-  if (sel.includes('over_')) return `⬆ Over ${sel.split('over_')[1]}`;
-  if (sel.includes('under_')) return `⬇ Under ${sel.split('under_')[1]}`;
-  if (sel.includes('_over_')) {
-    const parts = sel.split('_over_');
-    return `Player ${parts[0].replace('player_','')} Over ${parts[1]}`;
+// ── Results rendering ─────────────────────────────────────────────────────────
+function renderResults(result) {
+  if (!result) return;
+
+  const section = document.getElementById('section-results');
+  section.classList.remove('hidden');
+
+  const n = result.n_generated;
+  const requested = result.n_requested;
+  const styleLabel = result.style_label || result.multi_style;
+  const elapsed = result.elapsed_seconds;
+
+  let summaryText = `${n} ${styleLabel} multi${n !== 1 ? 's' : ''} generated`;
+  if (n < requested) summaryText += ` (${requested} requested — ${result.n_qualifying_legs} qualifying legs found)`;
+  summaryText += ` · ${result.n_candidate_legs} candidates analysed · ${elapsed}s`;
+  document.getElementById('results-summary').textContent = summaryText;
+
+  const grid = document.getElementById('results-grid');
+  if (!result.multis || result.multis.length === 0) {
+    grid.innerHTML = `
+      <div class="no-results">
+        <div class="no-results-icon">📊</div>
+        <div class="no-results-title">No multis could be constructed</div>
+        <div class="no-results-sub">
+          Try selecting more games, choosing a less restrictive style,
+          or reducing the requested number of multis.
+        </div>
+      </div>`;
+    return;
   }
-  if (sel.includes('_under_')) {
-    const parts = sel.split('_under_');
-    return `Player ${parts[0].replace('player_','')} Under ${parts[1]}`;
-  }
-  return sel.replace(/_/g, ' ');
+
+  grid.innerHTML = result.multis.map((m, i) => multiCard(m, i + 1)).join('');
+
+  // Smooth scroll to results
+  setTimeout(() => {
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 100);
 }
 
-function formatMarket(mt) {
-  const map = {
-    'head_to_head': 'Head to Head',
-    'line': 'Line',
-    'total': 'Total',
-    'player_disposals': 'Player Disposals',
-  };
-  return map[mt] || mt;
+function multiCard(m, idx) {
+  const ev = m.ev;
+  const evStr = (ev >= 0 ? '+' : '') + (ev * 100).toFixed(1) + '%';
+  const evClass = ev >= 0.05 ? 'ev-pos' : ev >= 0 ? 'ev-neu' : 'ev-neg';
+  const corrClass = `corr-${m.correlation_label}`;
+  const prob = m.adjusted_probability;
+  const probPct = (prob * 100).toFixed(1);
+
+  const legsHtml = (m.legs || []).map(leg => legRow(leg)).join('');
+
+  return `
+    <div class="multi-card ${corrClass}">
+      <div class="multi-card-header">
+        <div class="multi-card-title-row">
+          <div class="multi-index">#${idx}</div>
+          <div class="multi-title">
+            <span class="multi-n-legs">${m.n_legs}-Leg</span>
+            <span class="multi-style-badge style-badge-${m.style}">${escHtml(m.style_label)}</span>
+            <span class="multi-type-badge">${capitalize(m.multi_type)}</span>
+          </div>
+        </div>
+        <div class="multi-odds-display">
+          <div class="multi-odds-value">$${m.combined_odds.toFixed(2)}</div>
+          <div class="multi-odds-label">Combined Odds</div>
+        </div>
+      </div>
+
+      <div class="multi-metrics-row">
+        <div class="metric-pill">
+          <div class="metric-pill-label">EV</div>
+          <div class="metric-pill-value ${evClass}">${evStr}</div>
+        </div>
+        <div class="metric-pill">
+          <div class="metric-pill-label">Hit Prob</div>
+          <div class="metric-pill-value">${probPct}%</div>
+        </div>
+        <div class="metric-pill">
+          <div class="metric-pill-label">Correlation</div>
+          <div class="metric-pill-value">
+            <span class="corr-badge corr-badge-${m.correlation_label}">${capitalize(m.correlation_label)}</span>
+          </div>
+        </div>
+        <div class="metric-pill">
+          <div class="metric-pill-label">Risk</div>
+          <div class="metric-pill-value risk-val">${escHtml(m.risk_label)}</div>
+        </div>
+      </div>
+
+      <div class="multi-legs-list">
+        ${legsHtml}
+      </div>
+
+      <div class="multi-explanation">${escHtml(m.explanation)}</div>
+    </div>
+  `;
+}
+
+function legRow(leg) {
+  const ev = leg.ev || 0;
+  const evStr = (ev >= 0 ? '+' : '') + (ev * 100).toFixed(1) + '%';
+  const evClass = ev >= 0.04 ? 'ev-pos' : ev >= 0 ? 'ev-neu' : 'ev-neg';
+  const prob = leg.model_probability || 0;
+  const conf = leg.confidence_score || 0;
+  const confCls = conf >= 65 ? 'conf-high' : conf >= 45 ? 'conf-med' : 'conf-low';
+
+  return `
+    <div class="leg-row">
+      <div class="leg-row-left">
+        <div class="leg-row-match">${escHtml(leg.match_label || '')}</div>
+        <div class="leg-row-selection">${escHtml(leg.selection_label || '')}</div>
+        <div class="leg-row-market">${escHtml(leg.market_label || '')}</div>
+      </div>
+      <div class="leg-row-right">
+        <div class="leg-row-odds">$${(leg.decimal_odds || 0).toFixed(2)}</div>
+        <div class="leg-row-metrics">
+          <span class="leg-metric">Model ${(prob * 100).toFixed(1)}%</span>
+          <span class="leg-metric ${evClass}">EV ${evStr}</span>
+          <span class="conf-badge ${confCls}">${conf >= 65 ? 'High' : conf >= 45 ? 'Med' : 'Low'} conf</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
+function resetWorkflow() {
+  clearInterval(pollTimer);
+  currentJobId = null;
+  jobStartTime = null;
+
+  document.getElementById('section-progress').classList.add('hidden');
+  document.getElementById('section-results').classList.add('hidden');
+  document.getElementById('btn-generate').disabled = selectedFixtureIds.size === 0;
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ── Screen helpers ────────────────────────────────────────────────────────────
+function showLoadingScreen(msg) {
+  document.getElementById('loading-detail').textContent = msg;
+  document.getElementById('loading-screen').classList.remove('hidden');
+  document.getElementById('error-screen').classList.add('hidden');
+  document.getElementById('workflow').classList.add('hidden');
+}
+
+function hideLoadingScreen() {
+  document.getElementById('loading-screen').classList.add('hidden');
+  document.getElementById('workflow').classList.remove('hidden');
+}
+
+function showErrorScreen(msg) {
+  document.getElementById('loading-screen').classList.add('hidden');
+  document.getElementById('error-screen').classList.remove('hidden');
+  document.getElementById('error-detail').textContent = msg;
+  document.getElementById('workflow').classList.add('hidden');
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function escHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function capitalize(str) {
+  if (!str) return '';
   return str.charAt(0).toUpperCase() + str.slice(1).replace(/_/g, ' ');
 }
-
-// ── Init: load summary on page load ──────────────────────────────────────
-window.addEventListener('load', () => {
-  apiGet('/reports/summary').then(r => {
-    const ds = r.data_summary;
-    setStatus(
-      `Ready · ${ds.completed_fixtures} completed fixtures · ` +
-      `${ds.upcoming_fixtures} upcoming · ` +
-      `Models: ${r.models_available.length > 0 ? r.models_available.join(', ') : 'none trained yet'}`,
-      'default'
-    );
-  }).catch(() => setStatus('API ready', 'default'));
-});

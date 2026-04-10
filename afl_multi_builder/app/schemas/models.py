@@ -93,3 +93,39 @@ class SummaryResponse(BaseModel):
     data_summary: Dict[str, Any]
     models_available: List[str]
     settings: Dict[str, Any]
+
+
+# ── New selection-driven generation workflow ──────────────────────────────────
+
+class GenerateRequest(BaseModel):
+    """Request body for POST /generate."""
+    fixture_ids: List[int] = Field(..., min_length=1, description="Fixture IDs to include")
+    multi_style: str = Field(
+        "balanced",
+        pattern="^(safest|balanced|value|aggressive|longshot)$",
+        description="Multi style profile",
+    )
+    n_multis: int = Field(3, ge=1, le=20, description="Exact number of multis to generate")
+
+
+class WeekendFixture(BaseModel):
+    """A single upcoming AFL fixture for the weekend selector."""
+    fixture_id: int
+    round: int
+    season: int
+    home_team: str
+    away_team: str
+    venue: str
+    display_time: str
+    date: str
+    time: str
+    status: str
+
+
+class WeekendFixturesResponse(BaseModel):
+    """Response for GET /fixtures/weekend."""
+    round: int
+    season: int
+    n_fixtures: int
+    fixtures: List[WeekendFixture]
+    styles: Dict[str, Any]

@@ -7,94 +7,151 @@
   <link rel="stylesheet" href="/static/styles.css"/>
 </head>
 <body>
-  <header>
-    <div class="header-inner">
-      <h1>AFL Multi Builder</h1>
-      <span class="subtitle">Calibrated probabilities · Edge detection · Correlation-aware multis</span>
+
+<!-- ── Header ─────────────────────────────────────────────────────────────── -->
+<header>
+  <div class="header-inner">
+    <div class="header-brand">
+      <span class="header-logo">AFL</span>
+      <div>
+        <h1>Multi Builder</h1>
+        <span class="subtitle">Calibrated probabilities · Edge detection · Correlation-aware multis</span>
+      </div>
     </div>
-  </header>
+    <div class="header-status">
+      <span id="api-status-dot" class="status-dot"></span>
+      <span id="api-status-text" class="status-dot-label">Connecting...</span>
+    </div>
+  </div>
+</header>
 
-  <main>
-    <!-- Control Panel -->
-    <section class="panel controls">
-      <h2>Controls</h2>
-      <div class="button-row">
-        <button id="btn-run-pipeline" class="btn btn-primary">▶ Run Pipeline</button>
-        <button id="btn-run-training" class="btn btn-secondary">⚙ Train Models</button>
-        <button id="btn-run-backtest" class="btn btn-secondary">📊 Run Backtest</button>
-        <button id="btn-summary" class="btn btn-outline">ℹ Summary</button>
+<main>
+
+  <!-- ── Loading screen ─────────────────────────────────────────────────── -->
+  <div id="loading-screen" class="loading-screen">
+    <div class="loading-spinner-large"></div>
+    <div class="loading-title">Loading AFL Fixtures</div>
+    <div class="loading-sub" id="loading-detail">Connecting to data source...</div>
+  </div>
+
+  <!-- ── Error screen ───────────────────────────────────────────────────── -->
+  <div id="error-screen" class="error-screen hidden">
+    <div class="error-icon">⚠</div>
+    <div class="error-title">Unable to Load Fixtures</div>
+    <div class="error-detail" id="error-detail"></div>
+    <button class="btn btn-primary mt-16" onclick="loadWeekendFixtures()">Retry</button>
+  </div>
+
+  <!-- ── Main workflow (hidden until fixtures load) ─────────────────────── -->
+  <div id="workflow" class="hidden">
+
+    <!-- ── Step 1: Select games ─────────────────────────────────────────── -->
+    <section class="workflow-section" id="section-fixtures">
+      <div class="section-header">
+        <div class="step-badge">1</div>
+        <div>
+          <div class="section-title">Select Games</div>
+          <div class="section-sub" id="round-label">Round — loading...</div>
+        </div>
+        <div class="fixture-controls">
+          <button class="btn btn-sm btn-outline" onclick="selectAllFixtures()">Select All</button>
+          <button class="btn btn-sm btn-outline" onclick="deselectAllFixtures()">Deselect All</button>
+        </div>
       </div>
-      <div id="status-bar" class="status-bar"></div>
-    </section>
-
-    <!-- Tabs -->
-    <nav class="tabs">
-      <button class="tab active" data-tab="legs">Value Legs</button>
-      <button class="tab" data-tab="safe-legs">Safe Legs</button>
-      <button class="tab" data-tab="value-multis">Value Multis</button>
-      <button class="tab" data-tab="safe-multis">Safe Multis</button>
-      <button class="tab" data-tab="same-game">Same-Game</button>
-      <button class="tab" data-tab="backtest">Backtest</button>
-    </nav>
-
-    <!-- Legs Tab -->
-    <section class="tab-content active" id="tab-legs">
-      <div class="filter-row">
-        <label>Min EV: <input type="number" id="filter-ev" value="0.02" step="0.01" min="0" max="1"/></label>
-        <label>Market:
-          <select id="filter-market">
-            <option value="">All</option>
-            <option value="head_to_head">Head to Head</option>
-            <option value="player_disposals">Player Disposals</option>
-          </select>
-        </label>
-        <button class="btn btn-outline btn-sm" onclick="applyLegFilters()">Filter</button>
-      </div>
-      <div id="legs-container" class="cards-container">
-        <p class="placeholder">Run the pipeline to see value legs.</p>
-      </div>
-    </section>
-
-    <!-- Safe Legs Tab -->
-    <section class="tab-content" id="tab-safe-legs">
-      <div id="safe-legs-container" class="cards-container">
-        <p class="placeholder">Run the pipeline to see safe legs.</p>
+      <div id="fixture-grid" class="fixture-grid"></div>
+      <div class="selection-count-row">
+        <span id="selection-count" class="selection-count">0 games selected</span>
       </div>
     </section>
 
-    <!-- Value Multis Tab -->
-    <section class="tab-content" id="tab-value-multis">
-      <div id="value-multis-container" class="cards-container">
-        <p class="placeholder">Run the pipeline to see value multis.</p>
+    <!-- ── Step 2: Multi style ──────────────────────────────────────────── -->
+    <section class="workflow-section" id="section-style">
+      <div class="section-header">
+        <div class="step-badge">2</div>
+        <div>
+          <div class="section-title">Choose Multi Style</div>
+          <div class="section-sub">Select the risk/reward profile for your multis</div>
+        </div>
+      </div>
+      <div id="style-grid" class="style-grid">
+        <!-- Populated dynamically -->
       </div>
     </section>
 
-    <!-- Safe Multis Tab -->
-    <section class="tab-content" id="tab-safe-multis">
-      <div id="safe-multis-container" class="cards-container">
-        <p class="placeholder">Run the pipeline to see safe multis.</p>
+    <!-- ── Step 3: Quantity ─────────────────────────────────────────────── -->
+    <section class="workflow-section" id="section-quantity">
+      <div class="section-header">
+        <div class="step-badge">3</div>
+        <div>
+          <div class="section-title">Number of Multis</div>
+          <div class="section-sub">Exactly how many multis would you like generated?</div>
+        </div>
+      </div>
+      <div class="quantity-row">
+        <button class="qty-btn active" data-qty="1">1</button>
+        <button class="qty-btn" data-qty="2">2</button>
+        <button class="qty-btn" data-qty="3">3</button>
+        <button class="qty-btn" data-qty="5">5</button>
+        <button class="qty-btn" data-qty="10">10</button>
+        <div class="qty-custom-wrapper">
+          <input
+            type="number"
+            id="qty-custom"
+            class="qty-input"
+            min="1" max="20"
+            placeholder="Custom"
+            title="Enter 1–20"
+          />
+        </div>
       </div>
     </section>
 
-    <!-- Same Game Tab -->
-    <section class="tab-content" id="tab-same-game">
-      <div id="same-game-container" class="cards-container">
-        <p class="placeholder">Run the pipeline to see same-game multis.</p>
-      </div>
+    <!-- ── Step 4: Generate button ──────────────────────────────────────── -->
+    <section class="generate-section">
+      <button id="btn-generate" class="btn btn-generate" onclick="startGenerate()">
+        <span class="btn-generate-icon">▶</span>
+        Generate Analysis
+      </button>
+      <div id="generate-hint" class="generate-hint">Select at least 1 game to continue</div>
     </section>
 
-    <!-- Backtest Tab -->
-    <section class="tab-content" id="tab-backtest">
-      <div id="backtest-container">
-        <p class="placeholder">Run backtest to see performance metrics.</p>
+    <!-- ── Step 5: Analysis progress ────────────────────────────────────── -->
+    <section id="section-progress" class="workflow-section hidden">
+      <div class="section-header">
+        <div class="step-badge step-badge-active">5</div>
+        <div>
+          <div class="section-title">Analysis in Progress</div>
+          <div class="section-sub" id="progress-summary">Initialising pipeline...</div>
+        </div>
+        <div class="progress-elapsed" id="progress-elapsed"></div>
       </div>
+      <div id="progress-stages" class="progress-stages"></div>
     </section>
-  </main>
 
-  <footer>
-    <p>AFL Multi Builder v1.0 · <a href="/docs" target="_blank">API Docs</a> · Demo mode</p>
-  </footer>
+    <!-- ── Step 6: Results ──────────────────────────────────────────────── -->
+    <section id="section-results" class="workflow-section hidden">
+      <div class="section-header">
+        <div class="step-badge step-badge-done">✓</div>
+        <div>
+          <div class="section-title">Generated Multis</div>
+          <div class="section-sub" id="results-summary"></div>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="resetWorkflow()">New Analysis</button>
+      </div>
+      <div id="results-grid" class="results-grid"></div>
+    </section>
 
-  <script src="/static/app.js"></script>
+  </div><!-- /workflow -->
+
+</main>
+
+<footer>
+  <p>AFL Multi Builder v2.0 &nbsp;·&nbsp;
+    <a href="/docs" target="_blank">API Docs</a> &nbsp;·&nbsp;
+    Data: <span id="footer-data-mode">live</span>
+  </p>
+</footer>
+
+<script src="/static/app.js"></script>
 </body>
 </html>

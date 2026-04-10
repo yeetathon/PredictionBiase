@@ -8,11 +8,13 @@ from app.schemas.models import (
     HealthResponse, PipelineRunRequest, PipelineResponse,
     MultiGenerateRequest, MultiResponse, LegResponse,
     TrainingRunResponse, BacktestRunResponse, SummaryResponse,
+    GenerateRequest,
 )
 from app.services.pipeline import PredictionPipeline
 from app.services.training import TrainingService
 from app.services.backtest import WalkForwardBacktester
 from app.services.reports import ReportsService
+from app.services.generate_service import GenerateService, STYLE_PROFILES
 from app.correlation.engine import Leg
 from app.optimizer.multi_builder import MultiBuilder
 from app.core.config import settings
@@ -316,3 +318,81 @@ async def get_evaluation_report(lookback_days: int = 30):
     except Exception as exc:
         logger.exception("reports/evaluation error: {}", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Selection-driven generation workflow  (new dashboard flow)
+# ---------------------------------------------------------------------------
+
+@router.get("/fixtures/weekend", response_model=Dict, tags=["Generate"])
+async def get_weekend_fixtures():
+    """
+    Return AFL fixtures for the current or next upcoming round.
+    Used by the dashboard to populate the fixture selection list.
+    """
+    try:
+        fixtures = GenerateService.get_weekend_fixtures()
+        styles = GenerateService.get_style_profiles()
+
+        # Round metadata
+        round_no = fixtures[0]["round"] if fixtures else 0
+        season = fixtures[0]["season"] if fixtures else 0
+
+        return {
+            "round": round_no,
+            "season": season,
+            "n_fixtures": len(fixtures),
+            "fixtures": fixtures,
+            "styles": styles,
+        }
+    except Exception as exc:
+        logger.exception("fixtures/weekend error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/generate", response_model=Dict, tags=["Generate"])
+async def start_generate(request: GenerateRequest):
+    """
+    Start an async multi-generation job for the selected fixtures.
+
+    Returns a job_id immediately. Poll /generate/{job_id}/status for progress
+    and results.
+
+    Body:
+        fixture_ids: list of fixture IDs to include
+        multi_style: one of safest | balanced | value | aggressive | longshot
+        n_multis:    exact number of multis to generate (1–20)
+    """
+    try:
+        job_id = GenerateService.start_job(
+            fixture_ids=request.fixture_ids,
+            multi_style=request.multi_style,
+            n_multis=request.n_multis,
+        )
+        logger.info(
+            "Started generate job %s: fixtures=%s style=%s n=%d",
+            job_id, request.fixture_ids, request.multi_style, request.n_multis,
+        )
+        return {"job_id": job_id, "status": "pending"}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("generate start error: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/generate/{job_id}/status", response_model=Dict, tags=["Generate"])
+async def get_generate_status(job_id: str):
+    """
+    Poll the status of a generate job.
+
+    Returns:
+        status:   pending | running | complete | error
+        stages:   list of pipeline stage progress objects
+        result:   populated when status == complete
+        error:    populated when status == error
+    """
+    data = GenerateService.get_job_status(job_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return data
