@@ -10,7 +10,7 @@ Raises RuntimeError on construction if SPORTRADAR_API_KEY is not set.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -353,19 +353,30 @@ class SportradarLoader:
             if fixture_id == 0:
                 continue
 
-            scheduled: str = event.get("scheduled") or ""
+            # Australian Rules v3/en uses "start_time"; fall back to "scheduled"
+            raw_dt_str: str = (
+                event.get("start_time")
+                or event.get("scheduled")
+                or ""
+            )
             date_str = ""
             time_str = ""
-            scheduled_utc = scheduled
-            if scheduled:
+            scheduled_utc = ""
+            if raw_dt_str:
                 try:
-                    dt = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
-                    dt_naive = dt.replace(tzinfo=None)
-                    date_str = dt_naive.strftime("%Y-%m-%d")
-                    time_str = dt_naive.strftime("%H:%M")
-                    scheduled_utc = dt_naive.isoformat()
+                    dt = datetime.fromisoformat(raw_dt_str.replace("Z", "+00:00"))
+                    # Always convert to UTC before stripping timezone so comparisons
+                    # against datetime.utcnow() are correct regardless of the offset
+                    # the API sends (e.g. +10:00 / +11:00 AEST/AEDT).
+                    if dt.tzinfo is not None:
+                        dt_utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        dt_utc = dt
+                    date_str = dt_utc.strftime("%Y-%m-%d")
+                    time_str = dt_utc.strftime("%H:%M")
+                    scheduled_utc = dt_utc.isoformat()
                 except Exception:
-                    pass
+                    scheduled_utc = raw_dt_str  # preserve raw; filter handles it
 
             sr_status = (event.get("status") or "not_started").lower()
             status = self._map_status(sr_status)
@@ -547,17 +558,25 @@ class SportradarLoader:
     # ------------------------------------------------------------------
 
     def load_upcoming_fixtures_df(self) -> pd.DataFrame:
-        """
-        Return only fixtures whose scheduled time is strictly in the future.
+        """Return only fixtures whose start time is strictly in the future (UTC).
 
-        Uses ``scheduled_utc`` parsed as naive UTC and compared against
-        ``datetime.utcnow()``. Does NOT rely on the ``status`` field alone,
-        which can be stale in cached responses.
+        Decision order per row
+        ----------------------
+        1. Parse ``scheduled_utc`` (already stored as naive UTC by _build_fixtures_df).
+        2. If that is empty/unparseable, fall back to ``status == "upcoming"``
+           so that fixtures with a missing datetime are not silently dropped.
+
+        Debug logs
+        ----------
+        * total events in fixtures_df
+        * sample scheduled_utc from first row
+        * current UTC comparison time
+        * count before and after the filter
 
         Raises
         ------
         NoUpcomingFixturesError
-            If no future fixtures are found in the current season schedule.
+            If no future fixtures are found.
         """
         fx = self.fixtures_df
         if fx.empty or "scheduled_utc" not in fx.columns:
@@ -566,20 +585,46 @@ class SportradarLoader:
             )
 
         now_utc = datetime.utcnow()
+
+        # ── Debug: show what we're working with ──────────────────────────────
+        logger.info(
+            "load_upcoming_fixtures_df: total=%d  now_utc=%s",
+            len(fx), now_utc.isoformat(),
+        )
+        if not fx.empty:
+            sample_raw = fx.iloc[0].get("scheduled_utc", "")
+            sample_status = fx.iloc[0].get("status", "")
+            logger.info(
+                "load_upcoming_fixtures_df: sample row — scheduled_utc=%r  status=%r",
+                sample_raw, sample_status,
+            )
+
         future_mask = []
         for _, row in fx.iterrows():
-            try:
-                raw = row["scheduled_utc"]
-                if not raw:
-                    future_mask.append(False)
+            raw = str(row.get("scheduled_utc", "") or "").strip()
+
+            if raw:
+                try:
+                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    # _build_fixtures_df already converts to UTC, but handle the
+                    # edge case where raw still carries a tzinfo offset.
+                    if dt.tzinfo is not None:
+                        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    future_mask.append(dt > now_utc)
                     continue
-                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                dt_naive = dt.replace(tzinfo=None)
-                future_mask.append(dt_naive > now_utc)
-            except Exception:
-                future_mask.append(False)
+                except Exception:
+                    pass  # fall through to status-based fallback
+
+            # Fallback: no parseable datetime — trust the status field
+            future_mask.append(str(row.get("status", "")).strip() == "upcoming")
 
         future_df = fx[future_mask].copy()
+
+        logger.info(
+            "load_upcoming_fixtures_df: %d upcoming after filter (discarded %d)",
+            len(future_df), len(fx) - len(future_df),
+        )
+
         if future_df.empty:
             raise NoUpcomingFixturesError(
                 f"No upcoming AFL fixtures found (checked {len(fx)} events). "
