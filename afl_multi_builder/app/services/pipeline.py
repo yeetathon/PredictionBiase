@@ -25,6 +25,7 @@ from app.core.metrics import (
     compute_ev, compute_edge, compute_confidence_score, implied_probability
 )
 from app.core.config import settings
+from app.services.preflight import PreflightService, PreflightError
 
 
 def _confidence_label(score: float) -> str:
@@ -107,55 +108,89 @@ class PredictionPipeline:
         self._fixture_info: Dict[int, Dict] = {}
 
     def run(self) -> Dict:
-        """Execute full pipeline. Returns structured, human-readable results."""
-        logger.info(f"[{self.run_id}] Starting prediction pipeline...")
+        """
+        Execute full prediction pipeline using live data only.
+
+        Runs preflight validation first — any missing required data source
+        raises PreflightError before touching any prediction logic.
+        Returns structured, human-readable results.
+        """
+        logger.info(f"[{self.run_id}] Starting prediction pipeline (live-data mode)...")
         start_time = datetime.utcnow()
+
+        # ── Stage 0: Preflight validation ──────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 0/7: Running preflight checks...")
+        preflight = PreflightService()
+        preflight.run(raise_on_failure=True)  # raises PreflightError on failure
+        logger.info(f"[{self.run_id}] Preflight passed.")
 
         # Build name lookups first
         self._build_lookups()
 
-        # 1. Get upcoming fixtures — strict future-only, never falls back to completed
+        # ── Stage 1: Load upcoming fixtures ───────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 1/7: Loading upcoming fixtures from Sportradar...")
         upcoming = self.loader.load_upcoming_fixtures_df()
         if upcoming.empty:
             raise NoUpcomingFixturesError(
-                "No upcoming AFL fixtures found. "
-                "The season may be over or fixtures not yet published."
+                "No upcoming AFL fixtures found in live Sportradar data. "
+                "The season may be over or fixtures not yet published. "
+                "Check SPORTRADAR_AFL_SEASON_ID in your .env file."
             )
+        logger.info(f"[{self.run_id}] Loaded {len(upcoming)} upcoming fixtures.")
 
-        logger.info(f"Processing {len(upcoming)} fixtures...")
-
-        # 2. Load/train models
+        # ── Stage 2: Load/train models ─────────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 2/7: Loading model artifacts...")
         match_model = self._get_match_model()
         player_model = self._get_player_model()
         player_calibrator = self._get_player_calibrator()
+        logger.info(
+            f"[{self.run_id}] Models ready: match_model={match_model is not None}, "
+            f"player_model={player_model is not None}"
+        )
 
-        # 3. Build team features
+        # ── Stage 3: Build features ────────────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 3/7: Building team features from live data...")
         team_features = self.feature_pipeline.get_team_features()
+        logger.info(f"[{self.run_id}] Features built: {len(team_features)} rows.")
 
-        # 4. Generate candidate legs
+        # ── Stage 4: Generate candidate legs ──────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 4/7: Generating candidate legs for {len(upcoming)} fixtures...")
         all_legs: List[Leg] = []
         legs_meta: Dict[str, Dict] = {}  # leg_id -> extra display metadata
+        skipped_fixtures: List[str] = []
 
         for _, fixture in upcoming.iterrows():
             fixture_id = int(fixture["fixture_id"])
-            legs, meta = self._generate_fixture_legs(
-                fixture_id=fixture_id,
-                fixture=fixture,
-                team_features=team_features,
-                match_model=match_model,
-                player_model=player_model,
-                player_calibrator=player_calibrator,
-            )
-            all_legs.extend(legs)
-            legs_meta.update(meta)
+            try:
+                legs, meta = self._generate_fixture_legs(
+                    fixture_id=fixture_id,
+                    fixture=fixture,
+                    team_features=team_features,
+                    match_model=match_model,
+                    player_model=player_model,
+                    player_calibrator=player_calibrator,
+                )
+                all_legs.extend(legs)
+                legs_meta.update(meta)
+            except Exception as exc:
+                logger.warning(f"[{self.run_id}] Skipping fixture {fixture_id}: {exc}")
+                skipped_fixtures.append(str(fixture_id))
 
-        logger.info(f"Generated {len(all_legs)} candidate legs.")
+        logger.info(
+            f"[{self.run_id}] Generated {len(all_legs)} candidate legs "
+            f"(skipped: {len(skipped_fixtures)} fixtures)."
+        )
 
-        # 5. Rank legs
+        # ── Stage 5: Rank legs ─────────────────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 5/7: Ranking legs by EV and confidence...")
         value_legs = self.leg_ranker.get_value_legs(all_legs, top_n=20)
         safe_legs = self.leg_ranker.get_safe_legs(all_legs, top_n=20)
+        logger.info(
+            f"[{self.run_id}] Ranked: {len(value_legs)} value legs, {len(safe_legs)} safe legs."
+        )
 
-        # 6. Build multis
+        # ── Stage 6: Build multis ──────────────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 6/7: Building correlation-aware multis...")
         value_multis = self.multi_builder.build(value_legs, mode="value", max_results=15)
         safe_multis = self.multi_builder.build(safe_legs, mode="safe", max_results=15)
 
@@ -165,23 +200,38 @@ class PredictionPipeline:
                 all_legs, fixture_id=int(fixture_id), max_results=5
             )
             same_game_multis.extend(sgm)
+        logger.info(
+            f"[{self.run_id}] Built: {len(value_multis)} value multis, "
+            f"{len(safe_multis)} safe multis, {len(same_game_multis)} SGMs."
+        )
 
-        # Build a leg dict lookup for multi enrichment
+        # ── Stage 7: Serialise results ─────────────────────────────────────
+        logger.info(f"[{self.run_id}] Stage 7/7: Serialising results...")
         leg_dict_lookup = {l.leg_id: self._leg_to_dict(l, legs_meta) for l in all_legs}
 
         elapsed = (datetime.utcnow() - start_time).total_seconds()
         logger.info(f"[{self.run_id}] Pipeline complete in {elapsed:.2f}s")
 
-        # Data source info
         data_source = self._get_data_source_label()
+        odds_source = "The Odds API (live)" if settings.is_odds_api_configured else "model-only (no odds API)"
 
         return {
             "run_id": self.run_id,
             "timestamp": datetime.utcnow().isoformat(),
             "data_source": data_source,
+            "odds_source": odds_source,
             "n_fixtures": len(upcoming),
             "n_candidate_legs": len(all_legs),
+            "n_skipped_fixtures": len(skipped_fixtures),
             "elapsed_seconds": round(elapsed, 2),
+            "pipeline_stages": {
+                "preflight": "passed",
+                "fixtures_loaded": len(upcoming),
+                "features_built": len(team_features),
+                "legs_generated": len(all_legs),
+                "legs_ranked": len(value_legs),
+                "multis_built": len(value_multis) + len(safe_multis) + len(same_game_multis),
+            },
             "value_legs": [self._leg_to_dict(l, legs_meta) for l in value_legs],
             "safe_legs": [self._leg_to_dict(l, legs_meta) for l in safe_legs],
             "value_multis": [self._multi_to_dict(m, leg_dict_lookup) for m in value_multis],
@@ -621,14 +671,13 @@ class PredictionPipeline:
         return cal
 
     def _get_data_source_label(self) -> str:
-        """Return a human-readable data source description."""
+        """Return a human-readable data source description. Always live."""
         mode = settings.effective_data_mode
         if mode == "live":
             return "Sportradar API (Live)"
         elif mode == "cache":
             return "Sportradar API (Cached)"
-        else:
-            return "Demo Data"
+        return "Sportradar API"
 
     # ------------------------------------------------------------------
     # Serialisation

@@ -3,28 +3,113 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AFL Multi Builder</title>
+  <title>AFL Prediction Intelligence</title>
   <link rel="stylesheet" href="/static/styles.css"/>
 </head>
 <body>
   <header>
     <div class="header-inner">
-      <h1>AFL Multi Builder</h1>
-      <span class="subtitle">Calibrated probabilities · Edge detection · Correlation-aware multis</span>
+      <div class="header-left">
+        <h1>AFL Prediction Intelligence</h1>
+        <span class="subtitle">Live data · Calibrated models · Edge detection · Correlation-aware multis</span>
+      </div>
+      <div class="header-right">
+        <span id="data-mode-badge" class="data-mode-badge">LIVE</span>
+      </div>
     </div>
   </header>
 
   <main>
-    <!-- Control Panel -->
+
+    <!-- System Health Panel -->
+    <section id="health-panel" class="panel health-panel">
+      <div class="health-header">
+        <h2>System Health</h2>
+        <button id="btn-refresh-health" class="btn btn-outline btn-sm">↻ Refresh</button>
+      </div>
+      <div id="health-grid" class="health-grid">
+        <div class="health-item" id="health-sportradar">
+          <span class="health-dot dot-unknown"></span>
+          <span class="health-label">Sportradar API</span>
+          <span class="health-detail" id="hd-sportradar">checking...</span>
+        </div>
+        <div class="health-item" id="health-odds">
+          <span class="health-dot dot-unknown"></span>
+          <span class="health-label">Odds API</span>
+          <span class="health-detail" id="hd-odds">checking...</span>
+        </div>
+        <div class="health-item" id="health-fixtures">
+          <span class="health-dot dot-unknown"></span>
+          <span class="health-label">Fixtures</span>
+          <span class="health-detail" id="hd-fixtures">—</span>
+        </div>
+        <div class="health-item" id="health-models">
+          <span class="health-dot dot-unknown"></span>
+          <span class="health-label">Models</span>
+          <span class="health-detail" id="hd-models">—</span>
+        </div>
+        <div class="health-item" id="health-cache">
+          <span class="health-dot dot-unknown"></span>
+          <span class="health-label">Data Freshness</span>
+          <span class="health-detail" id="hd-cache">—</span>
+        </div>
+      </div>
+      <div id="health-markets" class="health-markets"></div>
+    </section>
+
+    <!-- Controls -->
     <section class="panel controls">
       <h2>Controls</h2>
       <div class="button-row">
         <button id="btn-run-pipeline" class="btn btn-primary">▶ Run Pipeline</button>
         <button id="btn-run-training" class="btn btn-secondary">⚙ Train Models</button>
         <button id="btn-run-backtest" class="btn btn-secondary">📊 Run Backtest</button>
-        <button id="btn-summary" class="btn btn-outline">ℹ Summary</button>
+        <button id="btn-preflight" class="btn btn-outline">✓ Run Preflight</button>
       </div>
       <div id="status-bar" class="status-bar"></div>
+    </section>
+
+    <!-- Pipeline Stage Log (shown after pipeline runs) -->
+    <section id="stage-log-panel" class="panel stage-log-panel hidden">
+      <h2>Pipeline Stages</h2>
+      <div id="stage-log"></div>
+    </section>
+
+    <!-- Filters -->
+    <section id="filter-panel" class="panel filter-panel hidden">
+      <h2>Filters</h2>
+      <div class="filter-grid">
+        <label class="filter-item">
+          Game
+          <select id="filter-game">
+            <option value="">All Games</option>
+          </select>
+        </label>
+        <label class="filter-item">
+          Market
+          <select id="filter-market">
+            <option value="">All Markets</option>
+            <option value="head_to_head">Head to Head</option>
+            <option value="player_disposals">Player Disposals</option>
+          </select>
+        </label>
+        <label class="filter-item">
+          Min EV
+          <input type="number" id="filter-ev" value="0.02" step="0.01" min="0" max="1"/>
+        </label>
+        <label class="filter-item">
+          Min Confidence
+          <select id="filter-confidence">
+            <option value="">Any</option>
+            <option value="High">High only</option>
+            <option value="Medium">Medium+</option>
+          </select>
+        </label>
+        <div class="filter-actions">
+          <button class="btn btn-outline btn-sm" onclick="applyFilters()">Apply</button>
+          <button class="btn btn-outline btn-sm" onclick="clearFilters()">Clear</button>
+        </div>
+      </div>
     </section>
 
     <!-- Tabs -->
@@ -37,19 +122,8 @@
       <button class="tab" data-tab="backtest">Backtest</button>
     </nav>
 
-    <!-- Legs Tab -->
+    <!-- Value Legs Tab -->
     <section class="tab-content active" id="tab-legs">
-      <div class="filter-row">
-        <label>Min EV: <input type="number" id="filter-ev" value="0.02" step="0.01" min="0" max="1"/></label>
-        <label>Market:
-          <select id="filter-market">
-            <option value="">All</option>
-            <option value="head_to_head">Head to Head</option>
-            <option value="player_disposals">Player Disposals</option>
-          </select>
-        </label>
-        <button class="btn btn-outline btn-sm" onclick="applyLegFilters()">Filter</button>
-      </div>
       <div id="legs-container" class="cards-container">
         <p class="placeholder">Run the pipeline to see value legs.</p>
       </div>
@@ -89,10 +163,11 @@
         <p class="placeholder">Run backtest to see performance metrics.</p>
       </div>
     </section>
+
   </main>
 
   <footer>
-    <p>AFL Multi Builder v1.0 · <a href="/docs" target="_blank">API Docs</a> · Demo mode</p>
+    <p>AFL Prediction Intelligence · <a href="/docs" target="_blank">API Docs</a> · <a href="/api/v1/preflight" target="_blank">Preflight</a> · Live data only</p>
   </footer>
 
   <script src="/static/app.js"></script>

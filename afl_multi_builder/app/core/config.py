@@ -1,6 +1,8 @@
 """
 Extended application configuration.
 All secrets read from environment variables / .env file only.
+
+Live-data only — no demo mode, no fallback to CSV files.
 """
 from pathlib import Path
 from typing import List, Literal
@@ -24,7 +26,6 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/afl_multi_builder.db"
 
     # ── Data paths ─────────────────────────────────────────────────────────
-    demo_data_dir: Path = Path("./data/demo")
     artifacts_dir: Path = Path("./data/models")
     raw_cache_dir: Path = Path("./data/cache")
 
@@ -45,9 +46,10 @@ class Settings(BaseSettings):
     odds_api_sport: str = "aussierules_afl"
     odds_api_bookmakers: str = "tab,sportsbet,bet365,unibet,pointsbet,betfair,williamhill,neds"
 
-    # ── Data Mode ─────────────────────────────────────────────────────────
-    data_mode: Literal["live", "cache", "demo"] = "live"
-    enable_demo_fallback: bool = False
+    # ── Data Mode (live | cache only — no demo) ───────────────────────────
+    # live  = fetch from Sportradar API (uses cache, respects TTL)
+    # cache = only use cached Sportradar responses (no new API calls)
+    data_mode: Literal["live", "cache"] = "live"
 
     # ── Rate Limiting & Quota ─────────────────────────────────────────────
     api_rate_limit_qps: float = 1.0
@@ -121,7 +123,7 @@ class Settings(BaseSettings):
 
     @property
     def effective_data_mode(self) -> str:
-        """Return the effective data mode. Never silently falls back to demo."""
+        """Return the effective data mode. Only 'live' or 'cache' — never demo."""
         return self.data_mode
 
     @property
