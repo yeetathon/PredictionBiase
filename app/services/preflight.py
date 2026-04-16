@@ -181,21 +181,19 @@ def _check_upcoming_fixtures() -> CheckResult:
             required=True,
         )
     try:
-        from app.data_ingestion.data_source_manager import SportradarDataProvider
-        provider = SportradarDataProvider()
-        df = provider.get_schedule(settings.sportradar_afl_season_id)
+        from app.data_ingestion.sportradar_loader import SportradarLoader
+        loader = SportradarLoader()
+        df = loader.fixtures_df
         if df.empty:
             return CheckResult(
                 name="upcoming_fixtures",
                 passed=False,
-                detail="Schedule returned zero rows — season may be over or season ID is wrong",
+                detail="Season returned zero fixtures — season may be over or season ID is wrong",
                 fix="Verify SPORTRADAR_AFL_SEASON_ID is correct for the current season. "
                     "Check the Sportradar seasons endpoint to get the valid season ID.",
                 required=True,
             )
-        upcoming = df[df.get("status", df.get("status", "")).eq("not_started") |
-                      df.get("status", df.get("status", "")).eq("upcoming")] \
-            if "status" in df.columns else df
+        upcoming = df[df["status"] == "upcoming"] if "status" in df.columns else df
         n = len(upcoming) if not upcoming.empty else len(df)
         return CheckResult(
             name="upcoming_fixtures",
@@ -207,7 +205,7 @@ def _check_upcoming_fixtures() -> CheckResult:
             name="upcoming_fixtures",
             passed=False,
             detail=f"Failed to load fixtures: {exc}",
-            fix="Check Sportradar API key and season ID. Ensure your trial plan covers fixture schedules.",
+            fix="Check Sportradar API key and season ID. Ensure your trial plan covers fixture summaries.",
             required=True,
         )
 

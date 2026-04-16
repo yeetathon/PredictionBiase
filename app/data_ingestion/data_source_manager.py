@@ -68,9 +68,16 @@ class SportradarDataProvider:
         return _stamp(pd.DataFrame(rows), src)
 
     def get_schedule(self, season_id: str) -> pd.DataFrame:
-        endpoint = f"seasons/{season_id}/schedules.json"
+        # Sportradar AFL v3/en: schedules.json is not available — use summaries.json
+        endpoint = f"seasons/{season_id}/summaries.json"
         data = self._client.get(endpoint, cache_ttl_seconds=settings.cache_ttl_upcoming_hours * 3600)
-        rows = self._norm.normalize_schedule(data)
+        # Unwrap sport_events_summaries wrappers before passing to the normalizer
+        wrappers = data.get("sport_events_summaries") or data.get("summaries") or []
+        sport_events = [
+            w["sport_event"] for w in wrappers
+            if isinstance(w, dict) and w.get("sport_event")
+        ]
+        rows = self._norm.normalize_schedule({"sport_events": sport_events})
         src = SOURCE_API if data.get("_source") == "api_live" else SOURCE_CACHE
         return _stamp(pd.DataFrame(rows), src)
 
