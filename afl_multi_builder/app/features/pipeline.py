@@ -276,11 +276,34 @@ class TeamFeatureEngineer:
                     vals = prior[sc].dropna().values
                     pop_mean = float(ts[sc].mean()) if sc in ts.columns else 0.0
                     if len(vals) >= 1:
-                        feat[f"roll_{sc}_mean"] = float(np.mean(vals[-self.window:]))
-                        feat[f"roll_{sc}_std"] = float(np.std(vals[-self.window:])) if len(vals) >= 2 else 0.0
+                        roll_mean = float(np.mean(vals[-self.window:]))
+                        roll_std = float(np.std(vals[-self.window:])) if len(vals) >= 2 else 0.0
+                        feat[f"roll_{sc}_mean"] = roll_mean
+                        feat[f"roll_{sc}_std"] = roll_std
+
+                        # Score-specific extra features
+                        if sc == "score":
+                            # Coefficient of variation: lower = more consistent
+                            feat["score_cv"] = (
+                                roll_std / roll_mean if roll_mean > 0 else 0.0
+                            )
+                            # Form trend: last 2 games vs prior 3 games (momentum)
+                            if len(vals) >= 5:
+                                recent_avg = float(np.mean(vals[-2:]))
+                                prior_avg = float(np.mean(vals[-5:-2]))
+                                feat["form_trend_score"] = recent_avg - prior_avg
+                            elif len(vals) >= 3:
+                                recent_avg = float(np.mean(vals[-1:]))
+                                prior_avg = float(np.mean(vals[:-1]))
+                                feat["form_trend_score"] = recent_avg - prior_avg
+                            else:
+                                feat["form_trend_score"] = 0.0
                     else:
                         feat[f"roll_{sc}_mean"] = pop_mean
                         feat[f"roll_{sc}_std"] = 0.0
+                        if sc == "score":
+                            feat["score_cv"] = 0.0
+                            feat["form_trend_score"] = 0.0
 
                 n_games = len(prior)
                 feat["roll_n_games"] = n_games

@@ -22,8 +22,10 @@ from app.pricing.odds_processor import OddsProcessor, ProcessedOdds
 from app.correlation.engine import Leg
 from app.optimizer.multi_builder import MultiBuilder, LegRanker, Multi
 from app.core.metrics import (
-    compute_ev, compute_edge, compute_confidence_score, implied_probability
+    compute_ev, compute_edge, compute_confidence_score,
+    compute_signal_aware_confidence, implied_probability
 )
+from app.pricing.signal_engine import SignalEngine
 from app.core.config import settings
 from app.services.preflight import PreflightService, PreflightError
 
@@ -100,6 +102,7 @@ class PredictionPipeline:
         self.registry = ModelRegistry()
         self.leg_ranker = LegRanker()
         self.multi_builder = MultiBuilder()
+        self.signal_engine = SignalEngine()
         self.run_id = str(uuid.uuid4())[:8]
 
         # Name lookups — populated in run()
@@ -398,30 +401,40 @@ class PredictionPipeline:
         self, fixture_id: int, fixture: pd.Series,
         team_features: pd.DataFrame, match_model
     ) -> Tuple[List[Leg], Dict[str, Dict]]:
-        """Generate head-to-head win/loss legs."""
+        """
+        Generate head-to-head legs using multi-signal consensus.
+
+        Signal pipeline:
+          1. ML ensemble (Elo + LR + XGBoost) → primary probability estimate
+          2. SignalEngine (Elo, form, scoring, market) → consensus + agreement
+          3. Final probability = blend of ML ensemble and signal consensus
+          4. Confidence = signal_aware_confidence(agreement, edge, data_completeness)
+        """
         legs = []
         meta = {}
 
         fx_features = team_features[team_features["fixture_id"] == fixture_id]
 
-        cal_home_prob = None
-        raw_home_prob = None
+        # ── Step 1: ML ensemble probability ───────────────────────────────
+        ml_home_prob: Optional[float] = None
+        ml_breakdown: Dict[str, float] = {}
 
         if not fx_features.empty and match_model is not None:
             X_cols = [c for c in fx_features.columns
                       if c.startswith(("elo_", "home_roll_", "away_roll_", "diff_roll_",
-                                       "temperature_c", "wind_speed_kmh", "is_rain"))]
+                                       "temperature_c", "wind_speed_kmh", "is_rain",
+                                       "home_form_", "away_form_", "score_cv",
+                                       "home_score_", "away_score_"))]
             X_cols = [c for c in X_cols if c in fx_features.columns]
             if X_cols:
                 X_pred = fx_features[X_cols].fillna(0)
                 try:
                     probs = match_model.predict_proba(X_pred)
-                    cal_home_prob = float(probs[0, 1])
+                    ml_home_prob = float(probs[0, 1])
                     try:
-                        raw_probs_raw = match_model.predict_proba_raw(X_pred)
-                        raw_home_prob = float(raw_probs_raw[0, 1])
+                        ml_breakdown = match_model.predict_proba_breakdown(X_pred)
                     except Exception:
-                        raw_home_prob = cal_home_prob
+                        pass
                 except Exception as exc:
                     logger.debug(
                         "H2H model prediction failed for fixture {}: {} — using Elo only",
@@ -429,60 +442,79 @@ class PredictionPipeline:
                     )
                     elo_col = "elo_win_prob_home"
                     if elo_col in fx_features.columns:
-                        cal_home_prob = float(fx_features[elo_col].iloc[0])
-                        raw_home_prob = cal_home_prob
+                        ml_home_prob = float(fx_features[elo_col].iloc[0])
+                        ml_breakdown = {"elo": ml_home_prob}
 
-        # No valid probability — skip this fixture entirely.
-        # A coin-flip (0.5) is not a prediction; it is noise.
-        if cal_home_prob is None:
+        if ml_home_prob is None:
             logger.debug(
                 "H2H legs skipped for fixture {} — no model features and no Elo rating",
                 fixture_id,
             )
             return [], {}
 
-        cal_home_prob = float(np.clip(cal_home_prob, 0.01, 0.99))
-        raw_home_prob = float(np.clip(raw_home_prob if raw_home_prob is not None else cal_home_prob, 0.01, 0.99))
-
-        cal_away_prob = 1.0 - cal_home_prob
-
+        # ── Step 2: Market odds ────────────────────────────────────────────
         h2h_odds = self._get_best_odds(fixture_id, "head_to_head")
+        market_vig_probs: Optional[Dict[str, float]] = None
+        if h2h_odds:
+            market_vig_probs = {
+                sel: d["vig_adj_prob"]
+                for sel, d in h2h_odds.items()
+                if "vig_adj_prob" in d
+            }
+
+        # ── Step 3: Signal engine ──────────────────────────────────────────
+        features_dict = fx_features.iloc[0].to_dict() if not fx_features.empty else {}
+        home_sig, away_sig = self.signal_engine.compute_h2h_signals(
+            features=features_dict,
+            market_probs=market_vig_probs,
+        )
+
+        # ── Step 4: Blend ML + signal consensus ───────────────────────────
+        # Weighted blend: 50% ML ensemble (non-linear, trained) + 50% signal consensus
+        # When signal agreement is high, trust the consensus more.
+        # When signals disagree, blend more toward ML (it has the full feature set).
+        agree_weight = float(np.clip(home_sig.signal_agreement, 0.0, 1.0))
+        ml_weight = 0.5 + (1.0 - agree_weight) * 0.2   # 0.50–0.70
+        sig_weight = 1.0 - ml_weight                    # 0.50–0.30
+
+        ml_home_prob_clipped = float(np.clip(ml_home_prob, 0.02, 0.98))
+        home_consensus = float(np.clip(home_sig.consensus_probability, 0.02, 0.98))
+        away_consensus = float(np.clip(away_sig.consensus_probability, 0.02, 0.98))
+
+        final_home_prob = float(np.clip(
+            ml_weight * ml_home_prob_clipped + sig_weight * home_consensus,
+            0.02, 0.98
+        ))
+        final_away_prob = float(np.clip(1.0 - final_home_prob, 0.02, 0.98))
+
+        # ── Context ────────────────────────────────────────────────────────
         home_id = int(fixture["home_team_id"])
         away_id = int(fixture["away_team_id"])
         home_name = self._team_name(home_id)
         away_name = self._team_name(away_id)
         match_label = f"{home_name} vs {away_name}"
         start_time = self._start_time(fixture_id)
-
         fixture_info = self._fixture_info.get(fixture_id, {})
         round_no = fixture_info.get("round", "?")
         season = fixture_info.get("season", "?")
 
-        # Count historical games available for this fixture's teams — feeds confidence
-        n_hist = 0
-        if not fx_features.empty and "roll_n_games" in fx_features.columns:
-            try:
-                n_hist = int(fx_features["roll_n_games"].iloc[0])
-            except Exception:
-                n_hist = 0
+        # ── Per-selection leg generation ───────────────────────────────────
+        leg_data = [
+            ("home_win", final_home_prob, home_id, home_name, home_sig),
+            ("away_win", final_away_prob, away_id, away_name, away_sig),
+        ]
 
-        for selection, model_prob, team_id, team_name in [
-            ("home_win", cal_home_prob, home_id, home_name),
-            ("away_win", cal_away_prob, away_id, away_name),
-        ]:
+        for selection, model_prob, team_id, team_name, sig_result in leg_data:
             market_data = h2h_odds.get(selection)
             if market_data is None:
-                # No real bookmaker odds → skip entirely.
-                # Synthesising odds from model prob creates circular fake edge.
                 if settings.odds_required:
                     logger.debug(
                         "H2H leg skipped — no bookmaker odds for {} (fixture {})",
                         selection, fixture_id,
                     )
                     continue
-                # odds_required=False: use model-derived odds but flag as synthetic
                 decimal_odds = round(1.0 / max(model_prob, 0.05), 2)
-                vig_adj_prob = model_prob  # no vig adjustment possible without real market
+                vig_adj_prob = model_prob
                 is_synthetic = True
             else:
                 decimal_odds = market_data["decimal_odds"]
@@ -491,25 +523,47 @@ class PredictionPipeline:
 
             edge = compute_edge(model_prob, vig_adj_prob)
             ev = compute_ev(model_prob, decimal_odds)
-            confidence = compute_confidence_score(
-                model_prob, vig_adj_prob, edge, n_historical_games=max(n_hist, 1)
+
+            # Signal-aware confidence replaces the old formula
+            confidence = compute_signal_aware_confidence(
+                signal_agreement=sig_result.signal_agreement,
+                edge=edge,
+                data_completeness=sig_result.data_completeness,
+                prediction_variance=sig_result.prediction_variance,
+                n_active_signals=sig_result.n_active_signals,
             )
             conf_label = _confidence_label(confidence)
 
-            selection_label = _make_selection_label(selection, team_name=team_name)
+            # ── Explanation ────────────────────────────────────────────────
             opponent = away_name if selection == "home_win" else home_name
-            venue_note = "home advantage" if selection == "home_win" else "away challenge"
             synth_note = " [SYNTHETIC ODDS — no real market data]" if is_synthetic else ""
+            n_hist = int(float(features_dict.get("home_roll_n_games", 0) or 0))
             data_note = (
-                f"Based on {n_hist} historical games." if n_hist >= 5
-                else f"⚠ Limited data ({n_hist} games) — confidence penalised."
+                f"Based on {n_hist} prior games."
+                if n_hist >= 5
+                else f"⚠ Limited data ({n_hist} games) — confidence reduced."
+            )
+            # Signal breakdown for explainability
+            sig_detail = "; ".join(
+                f"{s.name}={s.probability:.1%}(×{s.reliability:.0%})"
+                for s in sig_result.signals
+            )
+            ml_detail = (
+                "ML: " + "/".join(f"{k}={v:.1%}" for k, v in ml_breakdown.items())
+                if ml_breakdown else f"ML ensemble: {ml_home_prob:.1%}"
             )
             explanation = (
                 f"{team_name} to win vs {opponent} (Rnd {round_no}, {season}). "
-                f"Model: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | Edge: {edge:+.1%}. "
-                f"Confidence is {conf_label.lower()} — factoring in {venue_note} and recent form. "
+                f"Consensus: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | "
+                f"Edge: {edge:+.1%} | EV: {ev:+.1%}. "
+                f"Signal agreement: {sig_result.signal_agreement:.0%} "
+                f"({sig_result.n_active_signals} signals). "
+                f"Signals: [{sig_detail}]. {ml_detail}. "
                 f"{data_note}{synth_note}"
             )
+
+            # Top factors for display
+            top_factors = sig_result.top_factors[:3]
 
             leg_id = "L_" + hashlib.md5(f"{fixture_id}_{selection}".encode()).hexdigest()[:8]
 
@@ -525,9 +579,13 @@ class PredictionPipeline:
                 ev=ev,
                 confidence_score=confidence,
                 explanation=explanation,
+                signal_agreement=sig_result.signal_agreement,
+                prediction_variance=sig_result.prediction_variance,
+                data_completeness=sig_result.data_completeness,
+                n_active_signals=sig_result.n_active_signals,
             ))
             meta[leg_id] = {
-                "selection_label": selection_label,
+                "selection_label": _make_selection_label(selection, team_name=team_name),
                 "match_label": match_label,
                 "home_team_name": home_name,
                 "away_team_name": away_name,
@@ -538,6 +596,10 @@ class PredictionPipeline:
                 "vig_adj_prob": vig_adj_prob,
                 "edge": edge,
                 "confidence_label": conf_label,
+                "signal_agreement": sig_result.signal_agreement,
+                "signal_breakdown": {s.name: round(s.probability, 4) for s in sig_result.signals},
+                "top_factors": top_factors,
+                "ml_breakdown": ml_breakdown,
             }
 
         return legs, meta
@@ -802,6 +864,15 @@ class PredictionPipeline:
             "confidence_score": round(leg.confidence_score, 1),
             "confidence_label": m.get("confidence_label", _confidence_label(leg.confidence_score)),
 
+            # Signal quality (multi-signal system)
+            "signal_agreement": round(leg.signal_agreement, 3),
+            "signal_breakdown": m.get("signal_breakdown", {}),
+            "top_factors": m.get("top_factors", []),
+            "ml_breakdown": m.get("ml_breakdown", {}),
+            "prediction_variance": round(leg.prediction_variance, 5),
+            "data_completeness": round(leg.data_completeness, 3),
+            "n_active_signals": leg.n_active_signals,
+
             # Explanation
             "explanation": leg.explanation,
         }
@@ -819,7 +890,13 @@ class PredictionPipeline:
                     "decimal_odds": ld.get("decimal_odds"),
                     "model_probability": ld.get("model_probability"),
                     "confidence_label": ld.get("confidence_label", ""),
+                    "signal_agreement": ld.get("signal_agreement", 0.0),
+                    "top_factors": ld.get("top_factors", []),
                 })
+
+        # Aggregate signal quality across all legs
+        sig_agreements = [l.get("signal_agreement", 0.0) for l in leg_summaries if l.get("signal_agreement")]
+        avg_sig_agreement = float(np.mean(sig_agreements)) if sig_agreements else 0.0
 
         return {
             "multi_id": multi.multi_id,
@@ -832,6 +909,7 @@ class PredictionPipeline:
             "correlation_score": round(multi.correlation_score, 3),
             "correlation_label": multi.correlation_label,
             "risk_score": round(multi.risk_score, 1),
+            "avg_signal_agreement": round(avg_sig_agreement, 3),
             "explanation": multi.explanation,
             "leg_ids": multi.leg_ids,
             "legs": leg_summaries,

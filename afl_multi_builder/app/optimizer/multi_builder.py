@@ -187,11 +187,22 @@ class MultiBuilder:
         else:
             multi_type = "mixed"
 
-        # Risk score (0-100): higher odds, higher correlation, more legs = riskier
+        # Signal uncertainty: average disagreement across legs (if computed)
+        signal_disagree_total = 0.0
+        n_with_signals = 0
+        for leg in legs:
+            if leg.signal_agreement > 0.0:
+                signal_disagree_total += 1.0 - leg.signal_agreement
+                n_with_signals += 1
+        avg_signal_disagree = signal_disagree_total / n_with_signals if n_with_signals > 0 else 0.0
+
+        # Risk score (0-100): higher odds, higher correlation, more legs,
+        # and higher signal disagreement all increase risk
         risk = min(100.0, (
-            (1 - adj_prob) * 50 +
-            corr.composite_score * 30 +
-            (n - 2) * 5
+            (1 - adj_prob) * 40 +
+            corr.composite_score * 25 +
+            (n - 2) * 5 +
+            avg_signal_disagree * 20     # signal uncertainty contribution
         ))
 
         # Explanation
@@ -259,6 +270,14 @@ class LegRanker:
     Precision-first: every leg must pass ALL hard gates before entering
     the pool. Nothing is included just to fill a count. If no legs pass,
     the pool is empty and the caller must return a no-bet result.
+
+    Gate hierarchy (applied in order):
+      1. Probability ≥ min_prob
+      2. EV ≥ min_ev
+      3. Odds in [1.05, max_odds]
+      4. Confidence ≥ min_confidence
+      5. Edge ≥ min_edge (vs vig-adjusted market)
+      6. Signal agreement ≥ min_signal_agreement (if signals were computed)
     """
 
     def __init__(
@@ -268,19 +287,24 @@ class LegRanker:
         min_prob: float = None,
         min_confidence: float = None,
         max_odds: float = None,
+        min_signal_agreement: float = None,
     ):
         self.min_edge = min_edge if min_edge is not None else settings.min_edge_threshold
         self.min_ev = min_ev if min_ev is not None else settings.min_ev_threshold
         self.min_prob = min_prob if min_prob is not None else settings.min_calibrated_probability
         self.min_confidence = min_confidence if min_confidence is not None else settings.min_confidence_score
         self.max_odds = max_odds if max_odds is not None else settings.max_leg_odds
+        self.min_signal_agreement = (
+            min_signal_agreement if min_signal_agreement is not None
+            else settings.min_signal_agreement
+        )
 
     def rank(self, legs: List[Leg], log_rejections: bool = True) -> List[Leg]:
         """
-        Apply all hard gates and rank surviving legs.
+        Apply all hard gates and rank surviving legs by quality-weighted EV.
 
-        Every rejection is logged with a reason. If the caller wants to
-        understand why no multis were built, the log tells them.
+        Every rejection is logged with a specific reason. If the caller wants
+        to understand why no multis were built, the log tells them exactly.
         """
         valid = []
         rejected_counts: Dict[str, int] = {}
@@ -292,15 +316,16 @@ class LegRanker:
                 if log_rejections:
                     logger.debug(
                         "LEG REJECTED [{}] {} — {}: prob={:.1%} ev={:.2%} "
-                        "edge={:.2%} conf={:.0f} odds={:.2f}",
+                        "edge={:.2%} conf={:.0f} odds={:.2f} sig_agree={:.0%}",
                         reason,
                         leg.selection,
                         leg.explanation[:60],
                         leg.calibrated_probability,
                         leg.ev,
-                        leg.ev - (leg.calibrated_probability * leg.decimal_odds - 1),
+                        leg.calibrated_probability - (1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0),
                         leg.confidence_score,
                         leg.decimal_odds,
+                        leg.signal_agreement,
                     )
                 continue
             valid.append(leg)
@@ -316,10 +341,15 @@ class LegRanker:
             len(valid), len(legs),
         )
 
-        # Sort: primary = edge-weighted confidence (quality proxy), secondary = EV
+        # Sort: primary = confidence-weighted EV (penalises high-uncertainty legs);
+        # secondary = raw EV; tertiary = signal agreement
         return sorted(
             valid,
-            key=lambda l: (l.confidence_score * l.ev, l.ev),
+            key=lambda l: (
+                l.confidence_score * l.ev,
+                l.ev,
+                l.signal_agreement,
+            ),
             reverse=True,
         )
 
@@ -333,11 +363,14 @@ class LegRanker:
             return f"odds_out_of_range[{leg.decimal_odds:.2f}]"
         if leg.confidence_score < self.min_confidence:
             return f"confidence<{self.min_confidence:.0f}"
-        # Require meaningful edge: model must beat market by min_edge
+        # Edge: model must beat market by min_edge
         implied_market = 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
         edge = leg.calibrated_probability - implied_market
         if edge < self.min_edge:
             return f"edge<{self.min_edge:.0%}[{edge:.1%}]"
+        # Signal agreement gate: only applied when signals were actually computed
+        if leg.signal_agreement > 0.0 and leg.signal_agreement < self.min_signal_agreement:
+            return f"signal_disagree<{self.min_signal_agreement:.0%}[{leg.signal_agreement:.0%}]"
         return None
 
     def get_value_legs(self, legs: List[Leg], top_n: int = 10) -> List[Leg]:

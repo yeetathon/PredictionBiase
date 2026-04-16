@@ -204,6 +204,22 @@ class EnsembleModel:
         p_ensemble = (w[0] * p_elo + w[1] * p_lr + w[2] * p_xgb) / total
         return np.column_stack([1 - p_ensemble, p_ensemble])
 
+    def predict_proba_breakdown(self, X: pd.DataFrame) -> Dict[str, float]:
+        """
+        Return individual component probabilities for a single row.
+        Used by the signal engine to detect intra-model disagreement.
+        Returns {"elo": 0.58, "logistic": 0.62, "xgboost": 0.61} for P(home win).
+        X should be a single-row DataFrame.
+        """
+        p_elo = float(self.elo.predict_proba(X)[:, 1][0])
+        p_lr = float(self.lr.predict_proba(X)[:, 1][0]) if self.lr._is_fitted else p_elo
+        p_xgb = float(self.xgb.predict_proba(X)[:, 1][0]) if self.xgb._is_fitted else p_elo
+        return {
+            "elo": round(p_elo, 5),
+            "logistic": round(p_lr, 5),
+            "xgboost": round(p_xgb, 5),
+        }
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
@@ -339,6 +355,12 @@ class CalibratedModel:
     @property
     def calibration_report(self) -> Optional[dict]:
         return self._calibration_report
+
+    def predict_proba_breakdown(self, X: pd.DataFrame) -> Dict[str, float]:
+        """Delegate to base model breakdown if available."""
+        if hasattr(self.base_model, "predict_proba_breakdown"):
+            return self.base_model.predict_proba_breakdown(X)
+        return {}
 
     def feature_importance(self) -> Dict[str, float]:
         if hasattr(self.base_model, "feature_importance"):

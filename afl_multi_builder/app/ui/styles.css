@@ -372,13 +372,47 @@ footer a { color: var(--c-primary); text-decoration: none; }
 .prob-bar-fill.market { background: var(--c-text-muted); opacity: 0.5; }
 
 /* Leg metrics */
-.leg-metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin: 8px 0; }
+.leg-metrics { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; margin: 8px 0; }
 .metric { text-align: center; }
 .metric-label { font-size: 10px; color: var(--c-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .metric-value { font-size: 13px; font-weight: 600; margin-top: 2px; }
 .metric-value.positive { color: var(--c-success); }
 .metric-value.negative { color: var(--c-danger); }
 .metric-value.neutral  { color: var(--c-text); }
+
+/* ── Signal breakdown ────────────────────────────────── */
+.sig-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 4px;
+}
+.sig-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--c-surface2);
+  border: 1px solid var(--c-border);
+  color: var(--c-text-muted);
+  font-family: monospace;
+  letter-spacing: 0.02em;
+}
+
+/* ── Top factors ─────────────────────────────────────── */
+.top-factors {
+  margin: 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.factor-row {
+  font-size: 11px;
+  color: var(--c-text-muted);
+  line-height: 1.4;
+  padding-left: 4px;
+  border-left: 2px solid var(--c-border);
+}
 
 .leg-explanation { font-size: 11px; color: var(--c-text-muted); margin-top: 8px; line-height: 1.5; }
 

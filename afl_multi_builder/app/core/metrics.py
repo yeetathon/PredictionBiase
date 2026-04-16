@@ -129,18 +129,75 @@ def compute_confidence_score(
     n_historical_games: int = 0,
 ) -> float:
     """
-    Composite confidence score (0-100).
+    Legacy confidence score (0-100). Kept for backward compatibility.
+    Prefer compute_signal_aware_confidence() when signal data is available.
     Higher when: edge is large, model agrees with market direction,
     sufficient data available.
     """
-    # Edge component: scaled 0-40
     edge_score = min(40.0, max(0.0, edge * 400))
-
-    # Agreement component: high when model and market are aligned
     agreement = 1.0 - abs(model_prob - market_prob) * 2
     agreement_score = max(0.0, agreement * 30)
-
-    # Data sufficiency component (0-30)
     data_score = min(30.0, n_historical_games * 0.5)
-
     return round(edge_score + agreement_score + data_score, 1)
+
+
+def compute_signal_aware_confidence(
+    signal_agreement: float,
+    edge: float,
+    data_completeness: float,
+    prediction_variance: float,
+    n_active_signals: int = 0,
+) -> float:
+    """
+    Signal-based confidence score (0-100).
+
+    Rewards:
+      - Signal agreement: all independent signals pointing the same way (0-40 pts)
+      - Edge vs vig-adjusted market probability (0-30 pts)
+      - Data completeness: sufficient historical games and feature coverage (0-20 pts)
+
+    Penalises:
+      - High prediction variance across signals (up to 25 pts)
+      - Fewer than 2 active signals (10 pt penalty)
+
+    Typical values:
+      4 agreeing signals (agree=0.90), 8% edge, completeness=0.8, var=0.01
+        → 36 + 16 + 16 − 4 = 64 pts (Medium-High)
+      3 disagreeing signals (agree=0.45), 5% edge, completeness=0.5, var=0.04
+        → 18 + 10 + 10 − 16 = 22 pts (Low — likely rejected)
+    """
+    # Signal agreement component (0-40)
+    agreement_score = float(signal_agreement) * 40.0
+
+    # Edge component (0-30): scaled so 5% edge ≈ 10 pts, 15% edge ≈ 30 pts
+    edge_score = min(30.0, max(0.0, float(edge) * 200.0))
+
+    # Data quality component (0-20)
+    quality_score = float(data_completeness) * 20.0
+
+    # Variance penalty: std 0.05 → var 0.0025 → 1 pt; std 0.25 → var 0.0625 → 25 pts
+    variance_penalty = min(25.0, float(prediction_variance) * 400.0)
+
+    # Thin signal penalty (< 2 active signals)
+    thin_penalty = 10.0 if n_active_signals < 2 else 0.0
+
+    raw = agreement_score + edge_score + quality_score - variance_penalty - thin_penalty
+    return round(max(0.0, min(100.0, raw)), 1)
+
+
+def compute_signal_agreement(probabilities: list) -> float:
+    """
+    Compute 0-1 agreement score from a list of signal probabilities.
+    1.0 = all signals identical; 0.0 = maximum disagreement (std ≥ 0.15).
+    """
+    if len(probabilities) < 2:
+        return 0.0
+    std = float(np.std(probabilities))
+    return float(np.clip(1.0 - std / 0.15, 0.0, 1.0))
+
+
+def compute_prediction_variance(probabilities: list) -> float:
+    """Variance of probabilities across independent signals."""
+    if len(probabilities) < 2:
+        return 0.0
+    return float(np.var(probabilities))

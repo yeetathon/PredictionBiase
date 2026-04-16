@@ -487,6 +487,23 @@ function legCard(leg) {
   const impliedStr = mktProb ? (mktProb * 100).toFixed(1) + '%' : '—';
   const bookmaker = leg.bookmaker || '';
 
+  // Signal agreement indicator
+  const sigAgree = leg.signal_agreement || 0;
+  const sigAgreeStr = sigAgree > 0 ? (sigAgree * 100).toFixed(0) + '%' : '—';
+  const sigAgreeCls = sigAgree >= 0.75 ? 'positive' : sigAgree >= 0.45 ? 'neutral' : 'negative';
+
+  // Signal breakdown chips
+  const sigBreakdown = leg.signal_breakdown || {};
+  const sigChips = Object.entries(sigBreakdown).map(([name, p]) =>
+    `<span class="sig-chip" title="${name}">${name.slice(0,3).toUpperCase()} ${(p*100).toFixed(0)}%</span>`
+  ).join('');
+
+  // Top factors
+  const topFactors = (leg.top_factors || []).slice(0, 2);
+  const factorsHtml = topFactors.length
+    ? `<div class="top-factors">${topFactors.map(f => `<div class="factor-row">• ${f}</div>`).join('')}</div>`
+    : '';
+
   return `
     <div class="leg-card ${cardClass}">
       <div class="leg-header">
@@ -506,7 +523,7 @@ function legCard(leg) {
 
       <div class="prob-comparison">
         <div class="prob-item">
-          <span class="prob-label">Model</span>
+          <span class="prob-label">Consensus</span>
           <span class="prob-value model-prob">${(prob * 100).toFixed(1)}%</span>
         </div>
         <div class="prob-arrow">→</div>
@@ -535,8 +552,14 @@ function legCard(leg) {
           <div class="metric-label">Confidence</div>
           <div class="metric-value"><span class="confidence-badge ${confCls}">${confLabel}</span></div>
         </div>
+        <div class="metric">
+          <div class="metric-label">Signal Agree</div>
+          <div class="metric-value ${sigAgreeCls}">${sigAgreeStr}</div>
+        </div>
       </div>
 
+      ${sigChips ? `<div class="sig-breakdown">${sigChips}</div>` : ''}
+      ${factorsHtml}
       <div class="leg-explanation">${leg.explanation}</div>
     </div>
   `;

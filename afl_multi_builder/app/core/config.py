@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     # If True, legs synthesised from model probability alone are rejected.
     odds_required: bool = True
 
+    # Minimum signal agreement (0–1) across independent prediction signals.
+    # Legs where signals strongly disagree are rejected regardless of EV.
+    # 0.30 rejects when signal std ≥ 0.105 (≈10.5 pp spread between signals).
+    # Set to 0.0 to disable (not recommended).
+    min_signal_agreement: float = 0.30
+
     # ── Training / Retraining ─────────────────────────────────────────────
     retrain_min_new_games: int = 10
     retrain_brier_degradation_threshold: float = 0.02

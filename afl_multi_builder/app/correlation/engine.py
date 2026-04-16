@@ -33,6 +33,11 @@ class Leg:
     ev: float
     confidence_score: float
     explanation: str = ""
+    # Multi-signal quality fields (populated by signal engine; 0.0 = not computed)
+    signal_agreement: float = 0.0       # 0–1; 1 = all signals agree
+    prediction_variance: float = 0.0    # variance of probabilities across signals
+    data_completeness: float = 0.0      # 0–1; quality of underlying data
+    n_active_signals: int = 0           # number of signals with meaningful reliability
 
 
 @dataclass
