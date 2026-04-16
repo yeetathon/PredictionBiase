@@ -148,7 +148,9 @@ class TrainingService:
 
         # Train regression model
         player_features_full = self.pipeline.get_player_features("disposals")
-        valid = player_features_full[player_features_full["target"].notna()]
+        valid = player_features_full[player_features_full["target"].notna()] \
+            if not player_features_full.empty and "target" in player_features_full.columns \
+            else pd.DataFrame()
 
         regression_model = PlayerDisposalsModel()
         y_reg = valid.iloc[:split_idx]["target"]

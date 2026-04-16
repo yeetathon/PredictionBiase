@@ -594,6 +594,8 @@ class FeaturePipeline:
         y = 1 if player went OVER the line, 0 otherwise.
         """
         features = self.get_player_features(stat_col)
+        if features.empty or "target" not in features.columns:
+            return pd.DataFrame(), pd.Series(dtype=float), []
         valid = features[features["target"].notna()].copy()
 
         if valid.empty:
