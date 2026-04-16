@@ -26,6 +26,8 @@ class SyncService:
     """
 
     def __init__(self) -> None:
+        from app.db.database import init_db
+        init_db()  # no-op if tables already exist
         from app.data_ingestion.data_source_manager import get_data_source_manager
         self._dsm = get_data_source_manager()
 

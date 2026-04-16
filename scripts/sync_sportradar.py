@@ -27,6 +27,10 @@ from pathlib import Path
 # Ensure the app package is importable when running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Initialise DB tables before any sync operation
+from app.db.database import init_db  # noqa: E402
+init_db()
+
 
 def cmd_upcoming(args):
     from app.services.sync import SyncService
