@@ -163,6 +163,7 @@ footer a { color: var(--c-primary); text-decoration: none; }
 .status-bar.loading { color: var(--c-warning); }
 .status-bar.success { color: var(--c-success); }
 .status-bar.error   { color: var(--c-danger);  white-space: pre-wrap; }
+.status-bar.warn    { color: #eab308; }
 
 /* ── Stage log panel ─────────────────────────────────── */
 .stage-log-panel { }
@@ -190,6 +191,45 @@ footer a { color: var(--c-primary); text-decoration: none; }
   font-size: 11px;
   color: var(--c-warning);
   font-style: italic;
+}
+
+/* ── No-bet banner ───────────────────────────────────── */
+.no-bet-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  background: rgba(234, 179, 8, 0.08);
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  border-left: 4px solid #eab308;
+  border-radius: 6px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+}
+.no-bet-banner.hidden { display: none; }
+.no-bet-icon { font-size: 22px; line-height: 1; flex-shrink: 0; }
+.no-bet-content { display: flex; flex-direction: column; gap: 5px; }
+.no-bet-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #eab308;
+}
+.no-bet-reason {
+  font-size: 12px;
+  color: var(--c-text-muted);
+  line-height: 1.5;
+}
+.no-bet-thresholds {
+  font-size: 11px;
+  color: var(--c-text-muted);
+  margin-top: 4px;
+}
+.no-bet-thresholds span {
+  background: var(--c-surface2);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-right: 4px;
+  font-family: monospace;
 }
 
 /* ── Filter panel ────────────────────────────────────── */

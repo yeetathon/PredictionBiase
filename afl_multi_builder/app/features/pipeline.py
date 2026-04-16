@@ -135,13 +135,8 @@ class TeamFeatureEngineer:
         # Build rolling team features (handles minimal team_stats gracefully)
         rolling_feats = self._compute_rolling_team_features(completed, team_stats)
 
-        # Merge Elo onto fixtures
-        elo_cols = ["fixture_id", "elo_home_pre", "elo_away_pre", "elo_win_prob_home", "elo_diff"]
-        result = all_fx.merge(
-            all_fx[elo_cols], on="fixture_id", how="left", suffixes=("", "_elo")
-        )
-
-        # Drop duplicate columns from double-merge
+        # Elo ratings are already embedded in all_fx by compute_ratings_history.
+        # Start result from all_fx directly — no self-merge needed.
         result = all_fx.copy()
 
         # Merge rolling features for home and away teams

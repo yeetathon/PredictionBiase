@@ -74,12 +74,17 @@ class TrainingService:
         calibrated = CalibratedModel(ensemble)
 
         if len(X_val) < 5:
-            # Not enough val data — fit without calibration
+            # Not enough held-out data — train base model only, skip calibration.
+            # Calibrating on training data causes data leakage and overconfident probs.
+            logger.warning(
+                "Validation set too small ({} samples) — calibration skipped to avoid leakage. "
+                "Collect more data before relying on calibrated probabilities.",
+                len(X_val),
+            )
             ensemble.fit(X_train, y_train)
             calibrated.base_model = ensemble
-            # Fit calibrator on train (not ideal but works for small datasets)
-            raw_train = ensemble.predict_proba(X_train)[:, 1]
-            calibrated.calibrator.fit(raw_train, y_train)
+            # Leave calibrator unfitted — it will pass through raw probs unchanged,
+            # which is honest about the lack of calibration data.
         else:
             calibrated.fit(X_train, y_train, X_val, y_val)
 

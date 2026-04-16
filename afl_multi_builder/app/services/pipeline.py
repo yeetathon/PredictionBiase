@@ -181,25 +181,52 @@ class PredictionPipeline:
             f"(skipped: {len(skipped_fixtures)} fixtures)."
         )
 
-        # ── Stage 5: Rank legs ─────────────────────────────────────────────
-        logger.info(f"[{self.run_id}] Stage 5/7: Ranking legs by EV and confidence...")
-        value_legs = self.leg_ranker.get_value_legs(all_legs, top_n=20)
-        safe_legs = self.leg_ranker.get_safe_legs(all_legs, top_n=20)
+        # ── Stage 5: Rank legs — strict quality gates ──────────────────────
+        logger.info(f"[{self.run_id}] Stage 5/7: Applying quality gates to {len(all_legs)} legs...")
+        quality_legs = self.leg_ranker.rank(all_legs, log_rejections=True)
+        value_legs = quality_legs[:10]
+        safe_legs = sorted(quality_legs, key=lambda l: l.calibrated_probability, reverse=True)[:10]
+
         logger.info(
-            f"[{self.run_id}] Ranked: {len(value_legs)} value legs, {len(safe_legs)} safe legs."
+            f"[{self.run_id}] Quality gate: {len(quality_legs)}/{len(all_legs)} legs passed "
+            f"(min_edge={settings.min_edge_threshold:.0%}, "
+            f"min_ev={settings.min_ev_threshold:.0%}, "
+            f"min_prob={settings.min_calibrated_probability:.0%}, "
+            f"min_conf={settings.min_confidence_score:.0f})."
         )
 
-        # ── Stage 6: Build multis ──────────────────────────────────────────
+        # ── Stage 6: Build multis (only if pool is large enough) ──────────
         logger.info(f"[{self.run_id}] Stage 6/7: Building correlation-aware multis...")
-        value_multis = self.multi_builder.build(value_legs, mode="value", max_results=15)
-        safe_multis = self.multi_builder.build(safe_legs, mode="safe", max_results=15)
-
-        same_game_multis: List[Multi] = []
-        for fixture_id in upcoming["fixture_id"].unique():
-            sgm = self.multi_builder.build_same_game_multis(
-                all_legs, fixture_id=int(fixture_id), max_results=5
+        no_bet_reason = ""
+        if len(quality_legs) < settings.min_pool_size_for_multi:
+            no_bet_reason = (
+                f"Only {len(quality_legs)} leg(s) passed quality gates "
+                f"(need {settings.min_pool_size_for_multi}). "
+                "Not enough high-conviction bets in this slate."
             )
-            same_game_multis.extend(sgm)
+            logger.warning(f"[{self.run_id}] NO-BET: {no_bet_reason}")
+            value_multis: List[Multi] = []
+            safe_multis: List[Multi] = []
+            same_game_multis: List[Multi] = []
+        else:
+            value_multis = self.multi_builder.build(quality_legs, mode="value", max_results=8)
+            safe_multis = self.multi_builder.build(quality_legs, mode="safe", max_results=8)
+
+            same_game_multis: List[Multi] = []
+            for fid in upcoming["fixture_id"].unique():
+                sgm = self.multi_builder.build_same_game_multis(
+                    quality_legs, fixture_id=int(fid), max_results=3
+                )
+                same_game_multis.extend(sgm)
+
+            if not value_multis and not safe_multis and not same_game_multis:
+                no_bet_reason = (
+                    "No combination of quality legs cleared all multi filters "
+                    "(correlation, EV, adjusted probability). "
+                    "No high-conviction multis found for this slate."
+                )
+                logger.warning(f"[{self.run_id}] NO-BET: {no_bet_reason}")
+
         logger.info(
             f"[{self.run_id}] Built: {len(value_multis)} value multis, "
             f"{len(safe_multis)} safe multis, {len(same_game_multis)} SGMs."
@@ -215,6 +242,8 @@ class PredictionPipeline:
         data_source = self._get_data_source_label()
         odds_source = "The Odds API (live)" if settings.is_odds_api_configured else "model-only (no odds API)"
 
+        has_bets = bool(value_multis or safe_multis or same_game_multis)
+
         return {
             "run_id": self.run_id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -222,14 +251,25 @@ class PredictionPipeline:
             "odds_source": odds_source,
             "n_fixtures": len(upcoming),
             "n_candidate_legs": len(all_legs),
+            "n_quality_legs": len(quality_legs),
             "n_skipped_fixtures": len(skipped_fixtures),
             "elapsed_seconds": round(elapsed, 2),
+            "has_bets": has_bets,
+            "no_bet_reason": no_bet_reason,
+            "quality_thresholds": {
+                "min_edge": settings.min_edge_threshold,
+                "min_ev": settings.min_ev_threshold,
+                "min_prob": settings.min_calibrated_probability,
+                "min_confidence": settings.min_confidence_score,
+                "max_odds": settings.max_leg_odds,
+                "max_correlation": settings.max_correlation_score,
+            },
             "pipeline_stages": {
                 "preflight": "passed",
                 "fixtures_loaded": len(upcoming),
                 "features_built": len(team_features),
                 "legs_generated": len(all_legs),
-                "legs_ranked": len(value_legs),
+                "legs_passed_quality_gate": len(quality_legs),
                 "multis_built": len(value_multis) + len(safe_multis) + len(same_game_multis),
             },
             "value_legs": [self._leg_to_dict(l, legs_meta) for l in value_legs],
@@ -364,6 +404,9 @@ class PredictionPipeline:
 
         fx_features = team_features[team_features["fixture_id"] == fixture_id]
 
+        cal_home_prob = None
+        raw_home_prob = None
+
         if not fx_features.empty and match_model is not None:
             X_cols = [c for c in fx_features.columns
                       if c.startswith(("elo_", "home_roll_", "away_roll_", "diff_roll_",
@@ -374,18 +417,32 @@ class PredictionPipeline:
                 try:
                     probs = match_model.predict_proba(X_pred)
                     cal_home_prob = float(probs[0, 1])
-                    raw_probs_raw = match_model.predict_proba_raw(X_pred)
-                    raw_home_prob = float(raw_probs_raw[0, 1])
-                except Exception:
-                    cal_home_prob = float(fx_features.get("elo_win_prob_home", pd.Series([0.5])).iloc[0])
-                    raw_home_prob = cal_home_prob
-            else:
-                cal_home_prob = float(fx_features.get("elo_win_prob_home", pd.Series([0.5])).iloc[0])
-                raw_home_prob = cal_home_prob
-        else:
-            elo_prob = float(fixture.get("elo_win_prob_home", 0.5)) if "elo_win_prob_home" in fixture else 0.5
-            cal_home_prob = elo_prob
-            raw_home_prob = elo_prob
+                    try:
+                        raw_probs_raw = match_model.predict_proba_raw(X_pred)
+                        raw_home_prob = float(raw_probs_raw[0, 1])
+                    except Exception:
+                        raw_home_prob = cal_home_prob
+                except Exception as exc:
+                    logger.debug(
+                        "H2H model prediction failed for fixture {}: {} — using Elo only",
+                        fixture_id, exc,
+                    )
+                    elo_col = "elo_win_prob_home"
+                    if elo_col in fx_features.columns:
+                        cal_home_prob = float(fx_features[elo_col].iloc[0])
+                        raw_home_prob = cal_home_prob
+
+        # No valid probability — skip this fixture entirely.
+        # A coin-flip (0.5) is not a prediction; it is noise.
+        if cal_home_prob is None:
+            logger.debug(
+                "H2H legs skipped for fixture {} — no model features and no Elo rating",
+                fixture_id,
+            )
+            return [], {}
+
+        cal_home_prob = float(np.clip(cal_home_prob, 0.01, 0.99))
+        raw_home_prob = float(np.clip(raw_home_prob if raw_home_prob is not None else cal_home_prob, 0.01, 0.99))
 
         cal_away_prob = 1.0 - cal_home_prob
 
@@ -401,30 +458,57 @@ class PredictionPipeline:
         round_no = fixture_info.get("round", "?")
         season = fixture_info.get("season", "?")
 
+        # Count historical games available for this fixture's teams — feeds confidence
+        n_hist = 0
+        if not fx_features.empty and "roll_n_games" in fx_features.columns:
+            try:
+                n_hist = int(fx_features["roll_n_games"].iloc[0])
+            except Exception:
+                n_hist = 0
+
         for selection, model_prob, team_id, team_name in [
             ("home_win", cal_home_prob, home_id, home_name),
             ("away_win", cal_away_prob, away_id, away_name),
         ]:
             market_data = h2h_odds.get(selection)
             if market_data is None:
+                # No real bookmaker odds → skip entirely.
+                # Synthesising odds from model prob creates circular fake edge.
+                if settings.odds_required:
+                    logger.debug(
+                        "H2H leg skipped — no bookmaker odds for {} (fixture {})",
+                        selection, fixture_id,
+                    )
+                    continue
+                # odds_required=False: use model-derived odds but flag as synthetic
                 decimal_odds = round(1.0 / max(model_prob, 0.05), 2)
-                vig_adj_prob = model_prob * 0.95
+                vig_adj_prob = model_prob  # no vig adjustment possible without real market
+                is_synthetic = True
             else:
                 decimal_odds = market_data["decimal_odds"]
                 vig_adj_prob = market_data["vig_adj_prob"]
+                is_synthetic = False
 
             edge = compute_edge(model_prob, vig_adj_prob)
             ev = compute_ev(model_prob, decimal_odds)
-            confidence = compute_confidence_score(model_prob, vig_adj_prob, edge, n_historical_games=30)
+            confidence = compute_confidence_score(
+                model_prob, vig_adj_prob, edge, n_historical_games=max(n_hist, 1)
+            )
             conf_label = _confidence_label(confidence)
 
             selection_label = _make_selection_label(selection, team_name=team_name)
             opponent = away_name if selection == "home_win" else home_name
             venue_note = "home advantage" if selection == "home_win" else "away challenge"
+            synth_note = " [SYNTHETIC ODDS — no real market data]" if is_synthetic else ""
+            data_note = (
+                f"Based on {n_hist} historical games." if n_hist >= 5
+                else f"⚠ Limited data ({n_hist} games) — confidence penalised."
+            )
             explanation = (
                 f"{team_name} to win vs {opponent} (Rnd {round_no}, {season}). "
                 f"Model: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | Edge: {edge:+.1%}. "
-                f"Confidence is {conf_label.lower()} — factoring in {venue_note} and recent form."
+                f"Confidence is {conf_label.lower()} — factoring in {venue_note} and recent form. "
+                f"{data_note}{synth_note}"
             )
 
             leg_id = "L_" + hashlib.md5(f"{fixture_id}_{selection}".encode()).hexdigest()[:8]

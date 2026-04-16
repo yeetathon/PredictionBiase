@@ -72,13 +72,50 @@ class Settings(BaseSettings):
     recent_settlement_lookback_days: int = 7
 
     # ── Model Settings ────────────────────────────────────────────────────
-    min_edge_threshold: float = 0.03
-    max_correlation_score: float = 0.7
-    min_ev_threshold: float = 0.02
-    max_legs_per_game: int = 3
-    max_legs_per_player: int = 2
-    max_multi_legs: int = 4
+    # Precision-first thresholds — conservative defaults.
+    # The system should produce FEWER, BETTER bets rather than many weak ones.
+
+    # Minimum real edge over bookmaker vig-adjusted probability
+    # 5% = meaningful edge; below this is noise given model uncertainty
+    min_edge_threshold: float = 0.05
+
+    # Maximum allowed correlation between legs in a multi.
+    # 0.45 rejects most same-game H2H+Line combos (0.85 correlation)
+    max_correlation_score: float = 0.45
+
+    # Minimum expected value per bet (5% = meaningful positive EV)
+    min_ev_threshold: float = 0.04
+
+    # Maximum legs per game in one multi (2 = enough same-game exposure)
+    max_legs_per_game: int = 2
+
+    # Maximum legs per player in one multi
+    max_legs_per_player: int = 1
+
+    # Maximum total legs in a multi (shorter = more reliable)
+    max_multi_legs: int = 3
+
+    # Minimum legs in a multi
     min_multi_legs: int = 2
+
+    # Minimum calibrated win probability for a leg to enter the pool.
+    # A leg at 51% is barely better than a coin flip — requires real conviction.
+    min_calibrated_probability: float = 0.54
+
+    # Minimum confidence score (0-100) for a leg to enter the pool.
+    min_confidence_score: float = 40.0
+
+    # Maximum decimal odds for any leg.
+    # High odds = high uncertainty; reject longshots regardless of edge.
+    max_leg_odds: float = 4.00
+
+    # Minimum legs in the quality pool before any multi is built.
+    # If fewer than this pass all gates, return no-bet instead of forcing output.
+    min_pool_size_for_multi: int = 3
+
+    # Require real bookmaker odds for a leg to qualify.
+    # If True, legs synthesised from model probability alone are rejected.
+    odds_required: bool = True
 
     # ── Training / Retraining ─────────────────────────────────────────────
     retrain_min_new_games: int = 10

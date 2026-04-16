@@ -239,6 +239,13 @@ async function runPipeline() {
     // Show stage log
     renderStageLog(result.pipeline_stages);
 
+    // Show/hide no-bet banner
+    if (!result.has_bets) {
+      showNoBetBanner(result.no_bet_reason, result.quality_thresholds);
+    } else {
+      hideNoBetBanner();
+    }
+
     // Show filter panel and populate game filter
     populateGameFilter(result.value_legs || []);
     document.getElementById('filter-panel').classList.remove('hidden');
@@ -246,17 +253,19 @@ async function runPipeline() {
     // Render tabs
     renderLegs(result.value_legs, 'legs-container');
     renderLegs(result.safe_legs, 'safe-legs-container');
-    renderMultis(result.value_multis, 'value-multis-container');
-    renderMultis(result.safe_multis, 'safe-multis-container');
-    renderMultis(result.same_game_multis, 'same-game-container');
+    renderMultis(result.value_multis, 'value-multis-container', result.no_bet_reason);
+    renderMultis(result.safe_multis, 'safe-multis-container', result.no_bet_reason);
+    renderMultis(result.same_game_multis, 'same-game-container', result.no_bet_reason);
 
     const src = result.data_source || 'Live';
     const odds = result.odds_source || 'unknown';
+    const nQ = result.n_quality_legs ?? '?';
+    const nC = result.n_candidate_legs ?? '?';
+    const qualityStr = `${nQ}/${nC} legs passed quality gates`;
     setStatus(
-      `✓ Pipeline complete in ${result.elapsed_seconds.toFixed(1)}s · ` +
-      `${result.n_candidate_legs} legs from ${result.n_fixtures} fixtures · ` +
-      `Data: ${src} · Odds: ${odds}`,
-      'success'
+      `${result.has_bets ? '✓' : '⚠'} Pipeline complete in ${result.elapsed_seconds.toFixed(1)}s · ` +
+      `${result.n_fixtures} fixtures · ${qualityStr} · Data: ${src} · Odds: ${odds}`,
+      result.has_bets ? 'success' : 'warn'
     );
 
     // Auto-refresh health
@@ -284,13 +293,19 @@ function renderStageLog(stages) {
   const panel = document.getElementById('stage-log-panel');
   const log = document.getElementById('stage-log');
   panel.classList.remove('hidden');
+
+  const nGen = stages.legs_generated || 0;
+  const nQ = stages.legs_passed_quality_gate ?? stages.legs_ranked ?? 0;
+  const qualityOk = nQ > 0;
+  const qualityVal = `${nQ} / ${nGen} (${nGen > 0 ? Math.round(nQ / nGen * 100) : 0}% pass rate)`;
+
   const entries = [
     { label: 'Preflight', value: stages.preflight || 'passed', ok: stages.preflight !== 'failed' },
     { label: 'Fixtures loaded', value: stages.fixtures_loaded, ok: stages.fixtures_loaded > 0 },
-    { label: 'Features built', value: stages.features_built + ' rows', ok: true },
-    { label: 'Legs generated', value: stages.legs_generated, ok: true },
-    { label: 'Legs ranked', value: stages.legs_ranked, ok: true },
-    { label: 'Multis built', value: stages.multis_built, ok: true },
+    { label: 'Features built', value: (stages.features_built || 0) + ' rows', ok: true },
+    { label: 'Legs generated', value: nGen, ok: nGen > 0 },
+    { label: 'Passed quality gates', value: qualityVal, ok: qualityOk },
+    { label: 'Multis built', value: stages.multis_built || 0, ok: true },
   ];
   log.innerHTML = entries.map(e => `
     <div class="stage-row ${e.ok ? 'stage-ok' : 'stage-warn'}">
@@ -299,6 +314,47 @@ function renderStageLog(stages) {
       <span class="stage-detail">${e.value}</span>
     </div>
   `).join('');
+}
+
+function showNoBetBanner(reason, thresholds) {
+  let banner = document.getElementById('no-bet-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'no-bet-banner';
+    banner.className = 'no-bet-banner';
+    // Insert before filter-panel
+    const filterPanel = document.getElementById('filter-panel');
+    filterPanel.parentNode.insertBefore(banner, filterPanel);
+  }
+  let thresholdHtml = '';
+  if (thresholds) {
+    const items = [
+      ['Min prob', thresholds.min_prob != null ? (thresholds.min_prob * 100).toFixed(0) + '%' : null],
+      ['Min edge', thresholds.min_edge != null ? (thresholds.min_edge * 100).toFixed(0) + '%' : null],
+      ['Min EV', thresholds.min_ev != null ? (thresholds.min_ev * 100).toFixed(0) + '%' : null],
+      ['Min confidence', thresholds.min_confidence != null ? thresholds.min_confidence : null],
+      ['Max odds', thresholds.max_odds != null ? '$' + thresholds.max_odds.toFixed(2) : null],
+    ].filter(([, v]) => v != null);
+    if (items.length) {
+      thresholdHtml = '<div class="no-bet-thresholds">Active gates: ' +
+        items.map(([k, v]) => `<span>${k}: ${v}</span>`).join(' · ') +
+        '</div>';
+    }
+  }
+  banner.innerHTML = `
+    <div class="no-bet-icon">⚠</div>
+    <div class="no-bet-content">
+      <div class="no-bet-title">No high-confidence multis found for this slate</div>
+      <div class="no-bet-reason">${reason || 'Insufficient legs cleared all quality gates.'}</div>
+      ${thresholdHtml}
+    </div>
+  `;
+  banner.classList.remove('hidden');
+}
+
+function hideNoBetBanner() {
+  const banner = document.getElementById('no-bet-banner');
+  if (banner) banner.classList.add('hidden');
 }
 
 async function runTraining() {
@@ -486,10 +542,13 @@ function legCard(leg) {
   `;
 }
 
-function renderMultis(multis, containerId) {
+function renderMultis(multis, containerId, noBetReason) {
   const c = document.getElementById(containerId);
   if (!multis || multis.length === 0) {
-    c.innerHTML = '<p class="placeholder">No multis available.</p>';
+    const msg = noBetReason
+      ? `No high-confidence multis. ${noBetReason}`
+      : 'No multis available.';
+    c.innerHTML = `<p class="placeholder">${msg}</p>`;
     return;
   }
   c.innerHTML = multis.map(m => multiCard(m)).join('');

@@ -68,64 +68,94 @@ class MultiBuilder:
         self,
         legs: List[Leg],
         n_legs: Optional[int] = None,
-        max_results: int = 20,
+        max_results: int = 10,
         mode: str = "value",  # "value" | "safe" | "same_game"
     ) -> List[Multi]:
         """
         Generate and rank multis from candidate legs.
 
-        Args:
-            legs: candidate legs (already filtered for edge/EV)
-            n_legs: specific number of legs, or None for all sizes
-            max_results: max multis to return
-            mode: "value" = rank by EV, "safe" = rank by hit probability, "same_game" = same fixture only
+        Precision-first: returns fewer, better multis. If the pool is too
+        thin or no combination clears all quality gates, returns empty list.
+        The caller is responsible for surfacing a "no bets found" message.
         """
-        if not legs:
+        min_pool = settings.min_pool_size_for_multi
+        if len(legs) < min_pool:
+            logger.info(
+                "MultiBuilder: pool has {} legs (need {}). No multis generated.",
+                len(legs), min_pool,
+            )
             return []
 
         sizes = [n_legs] if n_legs else list(range(self.min_legs, self.max_legs + 1))
         all_multis: List[Multi] = []
+        rejection_counts: Dict[str, int] = {}
 
         for size in sizes:
             if size > len(legs):
                 continue
             combos = list(itertools.combinations(legs, size))
-            logger.debug(f"Evaluating {len(combos)} combinations of size {size}")
+            logger.debug("MultiBuilder: evaluating {} combinations of size {}", len(combos), size)
 
             for combo in combos:
                 combo_legs = list(combo)
 
-                # Apply mode filter
+                # Mode filter: same-game multis must share a fixture
                 if mode == "same_game":
-                    fixture_ids = {leg.fixture_id for leg in combo_legs}
-                    if len(fixture_ids) != 1:
+                    if len({leg.fixture_id for leg in combo_legs}) != 1:
                         continue
 
-                # Constraint checks
+                # Structural constraints (per-game, per-player caps)
                 if not self._check_constraints(combo_legs):
+                    rejection_counts["constraint"] = rejection_counts.get("constraint", 0) + 1
                     continue
 
                 # Conflict detection
                 filtered = self.correlation_engine.filter_conflicting_legs(combo_legs)
                 if len(filtered) < len(combo_legs):
-                    continue  # Skip if any leg was removed as conflicting
+                    rejection_counts["conflict"] = rejection_counts.get("conflict", 0) + 1
+                    continue
 
-                # Correlation analysis
+                # Correlation gate — strict
                 corr_result = self.correlation_engine.analyse(combo_legs)
                 if corr_result.conflict_detected:
+                    rejection_counts["conflict"] = rejection_counts.get("conflict", 0) + 1
                     continue
                 if corr_result.composite_score > self.max_correlation:
+                    rejection_counts[f"correlation>{self.max_correlation:.2f}"] = (
+                        rejection_counts.get(f"correlation>{self.max_correlation:.2f}", 0) + 1
+                    )
                     continue
 
-                # Build multi
+                # Minimum adjusted probability gate:
+                # a 3-leg multi at 54%^3 = ~15.7%; reject below 10%
+                min_adj_prob = 0.10
+                if corr_result.adjusted_probability < min_adj_prob:
+                    rejection_counts[f"adj_prob<{min_adj_prob}"] = (
+                        rejection_counts.get(f"adj_prob<{min_adj_prob}", 0) + 1
+                    )
+                    continue
+
+                # EV gate
                 multi = self._build_multi(combo_legs, corr_result)
                 if multi.ev < self.min_ev:
+                    rejection_counts[f"ev<{self.min_ev}"] = (
+                        rejection_counts.get(f"ev<{self.min_ev}", 0) + 1
+                    )
                     continue
 
                 all_multis.append(multi)
 
-        # Rank
+        if rejection_counts:
+            logger.info(
+                "MultiBuilder: rejections — {}",
+                ", ".join(f"{k}={v}" for k, v in sorted(rejection_counts.items())),
+            )
+
         all_multis = self._rank(all_multis, mode)
+        logger.info(
+            "MultiBuilder: {} multis passed all quality gates (from {} legs, mode={})",
+            len(all_multis), len(legs), mode,
+        )
         return all_multis[:max_results]
 
     def _check_constraints(self, legs: List[Leg]) -> bool:
@@ -225,42 +255,94 @@ class MultiBuilder:
 class LegRanker:
     """
     Ranks individual legs by value.
-    Filters by edge, EV, uncertainty, market sanity.
+
+    Precision-first: every leg must pass ALL hard gates before entering
+    the pool. Nothing is included just to fill a count. If no legs pass,
+    the pool is empty and the caller must return a no-bet result.
     """
 
     def __init__(
         self,
         min_edge: float = None,
         min_ev: float = None,
-        max_uncertainty: float = 0.5,
+        min_prob: float = None,
+        min_confidence: float = None,
+        max_odds: float = None,
     ):
-        self.min_edge = min_edge or settings.min_edge_threshold
-        self.min_ev = min_ev or settings.min_ev_threshold
-        self.max_uncertainty = max_uncertainty
+        self.min_edge = min_edge if min_edge is not None else settings.min_edge_threshold
+        self.min_ev = min_ev if min_ev is not None else settings.min_ev_threshold
+        self.min_prob = min_prob if min_prob is not None else settings.min_calibrated_probability
+        self.min_confidence = min_confidence if min_confidence is not None else settings.min_confidence_score
+        self.max_odds = max_odds if max_odds is not None else settings.max_leg_odds
 
-    def rank(self, legs: List[Leg]) -> List[Leg]:
-        """Filter and rank legs by value."""
+    def rank(self, legs: List[Leg], log_rejections: bool = True) -> List[Leg]:
+        """
+        Apply all hard gates and rank surviving legs.
+
+        Every rejection is logged with a reason. If the caller wants to
+        understand why no multis were built, the log tells them.
+        """
         valid = []
+        rejected_counts: Dict[str, int] = {}
+
         for leg in legs:
-            if leg.ev < self.min_ev:
-                continue
-            # Uncertainty filter: reject legs where probability is very uncertain
-            # (close to 0.5 with no edge)
-            if abs(leg.calibrated_probability - 0.5) < 0.02:
-                continue
-            # Sanity: odds must be reasonable
-            if leg.decimal_odds < 1.01 or leg.decimal_odds > 50.0:
+            reason = self._reject_reason(leg)
+            if reason:
+                rejected_counts[reason] = rejected_counts.get(reason, 0) + 1
+                if log_rejections:
+                    logger.debug(
+                        "LEG REJECTED [{}] {} — {}: prob={:.1%} ev={:.2%} "
+                        "edge={:.2%} conf={:.0f} odds={:.2f}",
+                        reason,
+                        leg.selection,
+                        leg.explanation[:60],
+                        leg.calibrated_probability,
+                        leg.ev,
+                        leg.ev - (leg.calibrated_probability * leg.decimal_odds - 1),
+                        leg.confidence_score,
+                        leg.decimal_odds,
+                    )
                 continue
             valid.append(leg)
 
-        # Sort by EV descending, then by confidence
-        return sorted(valid, key=lambda l: (l.ev, l.confidence_score), reverse=True)
+        if rejected_counts and log_rejections:
+            logger.info(
+                "LegRanker: {} legs rejected — {}",
+                sum(rejected_counts.values()),
+                ", ".join(f"{k}={v}" for k, v in sorted(rejected_counts.items())),
+            )
+        logger.info(
+            "LegRanker: {}/{} legs passed all quality gates",
+            len(valid), len(legs),
+        )
+
+        # Sort: primary = edge-weighted confidence (quality proxy), secondary = EV
+        return sorted(
+            valid,
+            key=lambda l: (l.confidence_score * l.ev, l.ev),
+            reverse=True,
+        )
+
+    def _reject_reason(self, leg: Leg) -> Optional[str]:
+        """Return a reason string if the leg should be rejected, else None."""
+        if leg.calibrated_probability < self.min_prob:
+            return f"prob<{self.min_prob:.0%}"
+        if leg.ev < self.min_ev:
+            return f"ev<{self.min_ev:.0%}"
+        if leg.decimal_odds < 1.05 or leg.decimal_odds > self.max_odds:
+            return f"odds_out_of_range[{leg.decimal_odds:.2f}]"
+        if leg.confidence_score < self.min_confidence:
+            return f"confidence<{self.min_confidence:.0f}"
+        # Require meaningful edge: model must beat market by min_edge
+        implied_market = 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
+        edge = leg.calibrated_probability - implied_market
+        if edge < self.min_edge:
+            return f"edge<{self.min_edge:.0%}[{edge:.1%}]"
+        return None
 
     def get_value_legs(self, legs: List[Leg], top_n: int = 10) -> List[Leg]:
-        """Get top value legs."""
         return self.rank(legs)[:top_n]
 
     def get_safe_legs(self, legs: List[Leg], top_n: int = 10) -> List[Leg]:
-        """Get highest probability legs (with minimum edge)."""
-        valid = [l for l in legs if l.ev >= self.min_ev]
+        valid = self.rank(legs)
         return sorted(valid, key=lambda l: l.calibrated_probability, reverse=True)[:top_n]
