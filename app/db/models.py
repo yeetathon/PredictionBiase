@@ -66,10 +66,13 @@ class Fixture(Base):
     __tablename__ = "fixtures"
 
     id = Column(Integer, primary_key=True, index=True)
-    season = Column(Integer, nullable=False)
-    round = Column(Integer, nullable=False)
-    home_team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
-    away_team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    sportradar_event_id = Column(String(50), unique=True, nullable=True, index=True)
+    season = Column(Integer, nullable=True)
+    round = Column(Integer, nullable=True)
+    home_team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    away_team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    home_team_name = Column(String(100), nullable=True)
+    away_team_name = Column(String(100), nullable=True)
     venue_id = Column(Integer, ForeignKey("venues.id"))
     date = Column(String(20))
     time = Column(String(10))
@@ -89,7 +92,6 @@ class Fixture(Base):
     odds = relationship("Odds", back_populates="fixture")
 
     __table_args__ = (
-        UniqueConstraint("season", "round", "home_team_id", "away_team_id", name="uq_fixture"),
         Index("ix_fixtures_season_round", "season", "round"),
     )
 

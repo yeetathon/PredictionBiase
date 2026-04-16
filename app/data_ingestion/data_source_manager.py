@@ -173,44 +173,39 @@ class DataSourceManager:
     # ------------------------------------------------------------------
 
     def get_upcoming_fixtures(self, season_id: Optional[str] = None) -> pd.DataFrame:
-        """Return upcoming fixtures for the current season from Sportradar."""
-        sid = season_id or settings.sportradar_afl_season_id
-        if not sid:
-            raise RuntimeError(
-                "SPORTRADAR_AFL_SEASON_ID is not configured. "
-                "Set it in your .env file to fetch upcoming fixtures.\n"
-                "Find the current season ID via the Sportradar seasons endpoint."
-            )
+        """Return upcoming fixtures for the current season from Sportradar.
 
+        Uses SportradarLoader which fetches from summaries.json (the only
+        working endpoint for AFL v3) and filters by scheduled_utc > now.
+        Falls back to the full season DataFrame if no strictly-future games
+        are found (e.g. mid-season gaps).
+        """
+        from app.data_ingestion.sportradar_loader import SportradarLoader, NoUpcomingFixturesError
         try:
-            df = self._sportradar.get_schedule(sid)
+            loader = SportradarLoader()
+            try:
+                df = loader.load_upcoming_fixtures_df()
+            except NoUpcomingFixturesError:
+                # No strictly-future games — return full season for settlement
+                df = loader.fixtures_df
+                logger.warning(
+                    "No upcoming fixtures found; returning full season ({} rows) "
+                    "for settlement processing.", len(df)
+                )
+            if df.empty:
+                raise RuntimeError(
+                    "Sportradar returned an empty season. "
+                    "Verify SPORTRADAR_AFL_SEASON_ID in your .env file."
+                )
+            logger.info("Loaded {} fixtures from Sportradar", len(df))
+            return df
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch schedule for season {sid} from Sportradar: {exc}\n"
+                f"Failed to fetch fixtures from Sportradar: {exc}\n"
                 "Check API connectivity, API key, and season ID."
             ) from exc
-
-        if df.empty:
-            raise RuntimeError(
-                f"Sportradar returned an empty schedule for season {sid}. "
-                "The season may be over, or the season ID may be incorrect.\n"
-                "Verify SPORTRADAR_AFL_SEASON_ID in your .env file."
-            )
-
-        if "status" in df.columns:
-            upcoming = df[df["status"].isin(["not_started", "upcoming"])]
-            if not upcoming.empty:
-                logger.info("Loaded {} upcoming fixtures from Sportradar", len(upcoming))
-                return upcoming
-            # If no "upcoming" rows, return full schedule with a warning
-            logger.warning(
-                "No fixtures with status 'not_started'/'upcoming' in season {}. "
-                "Returning full schedule ({} rows) — check if season is active.",
-                sid, len(df),
-            )
-
-        logger.info("Loaded {} fixtures from Sportradar (season={})", len(df), sid)
-        return df
 
     def get_completed_fixtures(
         self,

@@ -190,7 +190,6 @@ class SyncService:
             "data_mode": ds_status.mode,
             "effective_mode": ds_status.effective_mode,
             "sportradar_configured": ds_status.sportradar_configured,
-            "demo_available": ds_status.demo_available,
             "quota": ds_status.quota_status,
             "db_fixtures": {
                 "total": total_fixtures,
@@ -204,38 +203,67 @@ class SyncService:
     # ------------------------------------------------------------------
 
     def _upsert_fixture(self, db, row) -> str:
-        """Insert or update a fixture row. Returns 'new' or 'updated'."""
-        sport_event_id = str(row.get("sport_event_id", ""))
-        season = int(row.get("season", 0)) if row.get("season") else 0
-        round_no = int(row.get("round", 0)) if row.get("round") else 0
+        """Insert or update a fixture row. Returns 'new' or 'updated'.
 
-        # Try lookup by sport_event_id if available
+        Accepts rows from SportradarLoader.fixtures_df which have columns:
+        sportradar_id, season, round, home_team_name, away_team_name,
+        date, time, status, home_score, away_score, home_win, margin, total_score.
+        """
+        # SportradarLoader uses 'sportradar_id'; normalizer uses 'sportradar_match_id'
+        sr_id = str(row.get("sportradar_id") or row.get("sportradar_match_id") or "").strip()
+        season = int(row["season"]) if row.get("season") else None
+        round_no = int(row["round"]) if row.get("round") else None
+        status = str(row.get("status") or "upcoming")
+        date_val = str(row["date"]) if row.get("date") else None
+        time_val = str(row["time"]) if row.get("time") else None
+        home_name = str(row.get("home_team_name") or "") or None
+        away_name = str(row.get("away_team_name") or "") or None
+
+        # Look up by Sportradar event ID (primary key for upsert)
         existing = None
-        if sport_event_id:
+        if sr_id:
             existing = db.query(Fixture).filter(
-                Fixture.sport_event_id == sport_event_id
-            ).first() if hasattr(Fixture, "sport_event_id") else None
-
-        if existing is None and season and round_no:
-            # Fallback: match by season + round (works for demo data)
-            existing = db.query(Fixture).filter(
-                Fixture.season == season,
-                Fixture.round == round_no,
+                Fixture.sportradar_event_id == sr_id
             ).first()
 
         if existing is None:
             fixture = Fixture(
+                sportradar_event_id=sr_id or None,
                 season=season,
                 round=round_no,
-                status=str(row.get("status", "upcoming")),
-                date=str(row.get("date", "")) if row.get("date") else None,
+                status=status,
+                date=date_val,
+                time=time_val,
+                home_team_name=home_name,
+                away_team_name=away_name,
             )
+            # Carry result fields if present (completed games from summaries)
+            if row.get("home_score") is not None:
+                fixture.result_home_score = int(row["home_score"])
+            if row.get("away_score") is not None:
+                fixture.result_away_score = int(row["away_score"])
+            if row.get("home_win") is not None:
+                fixture.home_win = int(row["home_win"])
+            if row.get("margin") is not None:
+                fixture.margin = int(row["margin"])
+            if row.get("total_score") is not None:
+                fixture.total_score = int(row["total_score"])
             db.add(fixture)
             return "new"
         else:
-            existing.status = str(row.get("status", existing.status))
-            if row.get("date"):
-                existing.date = str(row["date"])
+            existing.status = status
+            if date_val:
+                existing.date = date_val
+            if home_name:
+                existing.home_team_name = home_name
+            if away_name:
+                existing.away_team_name = away_name
+            if row.get("home_score") is not None:
+                existing.result_home_score = int(row["home_score"])
+            if row.get("away_score") is not None:
+                existing.result_away_score = int(row["away_score"])
+            if row.get("home_win") is not None:
+                existing.home_win = int(row["home_win"])
             db.add(existing)
             return "updated"
 
