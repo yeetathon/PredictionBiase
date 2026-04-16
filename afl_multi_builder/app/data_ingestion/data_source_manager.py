@@ -49,7 +49,10 @@ class SportradarDataProvider:
         from app.data_ingestion.sportradar_client import SportradarClient
         from app.data_ingestion.sportradar_normalizer import SportradarNormalizer
 
-        self._client = SportradarClient()
+        self._client = SportradarClient(
+            api_key=settings.sportradar_api_key,
+            base_url=settings.sportradar_base_url,
+        )
         self._norm = SportradarNormalizer()
 
     # ------------------------------------------------------------------

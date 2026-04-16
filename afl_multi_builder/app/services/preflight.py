@@ -129,7 +129,10 @@ def _check_sportradar_connectivity() -> CheckResult:
         )
     try:
         from app.data_ingestion.sportradar_client import SportradarClient
-        client = SportradarClient()
+        client = SportradarClient(
+            api_key=settings.sportradar_api_key,
+            base_url=settings.sportradar_base_url,
+        )
         competition_id = settings.sportradar_afl_competition_id
         data = client.get(
             f"competitions/{competition_id}/seasons.json",
