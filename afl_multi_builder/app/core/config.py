@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     afl_data_username: str = ""
     afl_data_password: str = ""
     afl_data_authkey: str = ""
-    afl_data_base_url: str = "https://api.afl.com.au"
+    afl_data_base_url: str = "https://dsg-api.com"
+    afl_data_season_id: str = ""   # auto-discovered if blank
     afl_data_competition_id: int = 1  # 1 = AFL Men's
 
     # ── The Odds API ───────────────────────────────────────────────────────

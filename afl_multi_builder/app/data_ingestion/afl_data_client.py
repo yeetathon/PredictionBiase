@@ -1,9 +1,13 @@
 """
-AFL Data Sports Group API HTTP client.
+Data Sports Group (DSG) API client for AFL data.
 
-Authentication: authkey as URL parameter (primary) + X-Auth-Key header.
+Endpoint pattern:
+    https://dsg-api.com/clients/{client}/australian_football/{endpoint}
+    ?client={client}&authkey={authkey}&ftype=json
+
+Authentication: client + authkey as query parameters on every request.
 No quota limits — unlimited call rate.
-Caches responses to minimise redundant calls.
+Responses cached to file to avoid redundant calls.
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from loguru import logger
@@ -24,36 +28,33 @@ from app.core.config import settings
 # Custom exception
 # ---------------------------------------------------------------------------
 
-class AFLDataAPIError(Exception):
+class DSGAPIError(Exception):
     def __init__(self, status_code: int, endpoint: str, message: str):
         self.status_code = status_code
         self.endpoint = endpoint
         self.message = message
-        super().__init__(f"AFL Data API error [{status_code}] {endpoint}: {message}")
+        super().__init__(f"DSG API [{status_code}] {endpoint}: {message}")
 
 
 # ---------------------------------------------------------------------------
-# Simple file-based cache (JSON, TTL-aware)
+# File-based JSON cache (TTL-aware)
 # ---------------------------------------------------------------------------
 
 class _FileCache:
-    """Lightweight JSON file cache with TTL."""
-
     def __init__(self, cache_dir: Path):
         self._dir = cache_dir
         self._dir.mkdir(parents=True, exist_ok=True)
 
-    def _key_path(self, key: str) -> Path:
-        return self._dir / f"afl_{key}.json"
+    def _path(self, key: str) -> Path:
+        return self._dir / f"dsg_{key}.json"
 
     def get(self, key: str, ttl_seconds: int) -> Optional[dict]:
-        p = self._key_path(key)
+        p = self._path(key)
         if not p.exists():
             return None
         try:
             raw = json.loads(p.read_text())
-            age = time.time() - raw.get("_ts", 0)
-            if age > ttl_seconds:
+            if time.time() - raw.get("_ts", 0) > ttl_seconds:
                 return None
             return raw.get("data")
         except Exception:
@@ -61,280 +62,296 @@ class _FileCache:
 
     def set(self, key: str, data: dict) -> None:
         try:
-            self._key_path(key).write_text(
+            self._path(key).write_text(
                 json.dumps({"_ts": time.time(), "data": data}, default=str)
             )
         except Exception as exc:
-            logger.debug("AFL cache write failed: {}", exc)
+            logger.debug("DSG cache write failed: {}", exc)
 
     @staticmethod
     def make_key(endpoint: str, params: dict) -> str:
-        raw = endpoint + json.dumps(sorted(params.items()), default=str)
+        raw = endpoint + json.dumps(
+            {k: v for k, v in sorted(params.items()) if k not in ("authkey", "client")},
+            default=str
+        )
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
-# AFL Data Sports Group API Client
+# DSG API Client
 # ---------------------------------------------------------------------------
 
-class AFLDataClient:
+class DSGClient:
     """
-    HTTP client for the AFL Data Sports Group API.
+    HTTP client for the Data Sports Group (DSG) API — Australian Football.
 
-    Authentication is via the authkey included as a query parameter on every
-    request. The username and password are stored for potential OAuth flows.
+    Every request is authenticated with `client` + `authkey` query parameters
+    and requests JSON responses via `ftype=json`.
 
-    The AFL Advanced Pack provides:
-      - Fixture lists (upcoming + historical)
-      - Live scores and match events
-      - Team and squad profiles
-      - Box scores with full advanced stats:
-          disposals, kicks, handballs, marks, goals, behinds, hitouts,
-          tackles, inside 50s, clearances, contested possessions,
-          uncontested possessions, score involvements, rebound 50s,
-          clangers, frees for/against, 50m penalties, effective disposals,
-          goal assists, time on ground, Brownlow votes
+    AFL Advanced Pack endpoints used:
+        get_competitions  — league list
+        get_seasons       — season IDs for a competition
+        get_rounds        — rounds in a season
+        get_matches       — fixtures + results (all rounds)
+        get_matches_day   — fixtures for a specific date
+        get_matches_updates — live in-progress match updates
+        get_teams         — team master list
+        get_squad         — team roster / squad
+        get_people        — player profiles
+        get_tables        — ladder / standings
+        get_head2head     — head-to-head historical record
     """
 
-    _RETRY_STATUSES = {429, 500, 502, 503, 504}
+    _SPORT = "australian_football"
     _MAX_RETRIES = 4
-    _BACKOFF_BASE = 2.0  # seconds
+    _BACKOFF = 2.0
 
     def __init__(self):
-        self._base_url = settings.afl_data_base_url.rstrip("/")
+        self._base = settings.afl_data_base_url.rstrip("/")
+        self._client = settings.afl_data_username      # DSG "client" = username
         self._authkey = settings.afl_data_authkey
-        self._username = settings.afl_data_username
-        self._password = settings.afl_data_password
-        self._competition_id = settings.afl_data_competition_id
-        self._cache = _FileCache(settings.raw_cache_dir / "afl_data")
+        self._cache = _FileCache(settings.raw_cache_dir / "dsg")
         self._session = requests.Session()
         self._session.headers.update({
-            "X-Auth-Key": self._authkey,
             "Accept": "application/json",
-            "User-Agent": "AFL-Multi-Builder/1.0",
+            "User-Agent": "AFL-Multi-Builder/2.0",
         })
-        # Some endpoints may also use Basic auth
-        if self._username and self._password:
-            self._session.auth = (self._username, self._password)
 
     def is_configured(self) -> bool:
-        return bool(self._authkey and self._authkey.strip())
+        return bool(self._authkey and self._authkey.strip()
+                    and self._client and self._client.strip())
 
     # ------------------------------------------------------------------
-    # Low-level HTTP
+    # Core HTTP
     # ------------------------------------------------------------------
 
     def get(self, endpoint: str, params: Optional[Dict] = None,
-            cache_ttl_seconds: int = 3600) -> dict:
+            ttl: int = 3600) -> dict:
         """
-        GET an endpoint, respecting cache TTL.
-
-        Always injects authkey into query params.
-        Retries on transient errors with exponential backoff.
+        GET /clients/{client}/australian_football/{endpoint}
+        with auth + json params injected automatically.
         """
         params = dict(params or {})
-        params["authkey"] = self._authkey
+        params.update({
+            "client": self._client,
+            "authkey": self._authkey,
+            "ftype": "json",
+        })
 
         cache_key = _FileCache.make_key(endpoint, params)
-        cached = self._cache.get(cache_key, cache_ttl_seconds)
+        cached = self._cache.get(cache_key, ttl)
         if cached is not None:
-            logger.debug("AFL Data cache hit: {}", endpoint)
+            logger.debug("DSG cache hit: {}", endpoint)
             cached["_source"] = "cache"
             return cached
 
-        url = f"{self._base_url}/{endpoint.lstrip('/')}"
+        url = f"{self._base}/clients/{self._client}/{self._SPORT}/{endpoint}"
         last_exc: Optional[Exception] = None
 
         for attempt in range(self._MAX_RETRIES):
             try:
                 resp = self._session.get(url, params=params, timeout=30)
 
-                if resp.status_code in self._RETRY_STATUSES:
-                    wait = self._BACKOFF_BASE ** attempt
-                    logger.warning(
-                        "AFL Data API {} → {} (attempt {}/{}), retry in {:.1f}s",
-                        endpoint, resp.status_code, attempt + 1, self._MAX_RETRIES, wait,
-                    )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    wait = self._BACKOFF ** attempt
+                    logger.warning("DSG {} → {} attempt {}/{}, retry in {:.1f}s",
+                                   endpoint, resp.status_code, attempt + 1,
+                                   self._MAX_RETRIES, wait)
                     time.sleep(wait)
                     continue
 
                 if resp.status_code == 401:
-                    raise AFLDataAPIError(401, endpoint,
-                                          "Unauthorised — check AFL_DATA_AUTHKEY")
+                    raise DSGAPIError(401, endpoint,
+                                      "Unauthorised — check AFL_DATA_AUTHKEY and AFL_DATA_USERNAME")
                 if resp.status_code == 403:
-                    raise AFLDataAPIError(403, endpoint,
-                                          "Forbidden — check API plan permissions")
+                    raise DSGAPIError(403, endpoint,
+                                      "Forbidden — check client name, authkey, and API plan permissions")
                 if resp.status_code == 404:
-                    raise AFLDataAPIError(404, endpoint,
-                                          "Not found — endpoint may not exist")
+                    raise DSGAPIError(404, endpoint, "Endpoint not found")
 
                 resp.raise_for_status()
-                data = resp.json()
-                data["_source"] = "api_live"
-                data["_fetched_at"] = datetime.utcnow().isoformat()
+
+                # DSG may return XML even when ftype=json is set on some endpoints —
+                # detect and handle gracefully.
+                content_type = resp.headers.get("Content-Type", "")
+                if "xml" in content_type and "json" not in content_type:
+                    logger.warning("DSG {} returned XML instead of JSON — "
+                                   "endpoint may not support JSON format", endpoint)
+                    data = {"_xml_response": resp.text, "_source": "api_live"}
+                else:
+                    data = resp.json()
+                    data["_source"] = "api_live"
+                    data["_fetched_at"] = datetime.utcnow().isoformat()
+
                 self._cache.set(cache_key, data)
-                logger.debug("AFL Data API live: {} → {} bytes", endpoint, len(resp.content))
+                logger.debug("DSG live: {} → {} bytes", endpoint, len(resp.content))
                 return data
 
-            except AFLDataAPIError:
+            except DSGAPIError:
                 raise
             except requests.RequestException as exc:
                 last_exc = exc
-                wait = self._BACKOFF_BASE ** attempt
-                logger.warning(
-                    "AFL Data network error on {} (attempt {}/{}): {} — retry in {:.1f}s",
-                    endpoint, attempt + 1, self._MAX_RETRIES, exc, wait,
-                )
+                wait = self._BACKOFF ** attempt
+                logger.warning("DSG network error {} attempt {}/{}: {} — retry {:.1f}s",
+                               endpoint, attempt + 1, self._MAX_RETRIES, exc, wait)
                 time.sleep(wait)
 
-        raise AFLDataAPIError(0, endpoint,
-                              f"All {self._MAX_RETRIES} attempts failed: {last_exc}")
+        raise DSGAPIError(0, endpoint,
+                          f"All {self._MAX_RETRIES} attempts failed: {last_exc}")
 
     # ------------------------------------------------------------------
-    # AFL Data endpoints — Fixtures
+    # Competition / season discovery
     # ------------------------------------------------------------------
 
-    def get_fixture_list(self, year: int, round_no: Optional[int] = None,
-                         ttl: int = 3600) -> dict:
-        """Return fixture list for a season (or specific round)."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        return self.get("cfs/afl/fixtureList", params=params, cache_ttl_seconds=ttl)
+    def get_competitions(self, ttl: int = 86400 * 7) -> dict:
+        """List all competitions (used to find AFL competition ID)."""
+        return self.get("get_competitions", ttl=ttl)
 
-    def get_scores(self, year: int, round_no: Optional[int] = None,
-                   ttl: int = 1800) -> dict:
-        """Return match scores for a season (or specific round)."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        return self.get("cfs/afl/scoreList", params=params, cache_ttl_seconds=ttl)
+    def get_seasons(self, competition_id: str, ttl: int = 86400) -> dict:
+        """List seasons for a competition."""
+        return self.get("get_seasons",
+                        params={"competition_id": competition_id}, ttl=ttl)
 
-    def get_match_details(self, match_id: str, ttl: int = 86400) -> dict:
-        """Return full box score and match events for a single match."""
-        return self.get(
-            f"cfs/afl/matchDetails",
-            params={"competitionId": self._competition_id, "matchId": match_id},
-            cache_ttl_seconds=ttl,
-        )
-
-    def get_match_results(self, year: int, round_no: Optional[int] = None,
-                          ttl: int = 3600) -> dict:
-        """Return completed match results for a season."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        return self.get("cfs/afl/matchResults", params=params, cache_ttl_seconds=ttl)
+    def get_rounds(self, season_id: str, ttl: int = 3600) -> dict:
+        """List rounds in a season."""
+        return self.get("get_rounds",
+                        params={"season_id": season_id}, ttl=ttl)
 
     # ------------------------------------------------------------------
-    # AFL Data endpoints — Teams and Players
+    # Matches / fixtures
     # ------------------------------------------------------------------
 
-    def get_team_list(self, year: int, ttl: int = 86400 * 7) -> dict:
-        """Return all teams for a competition year."""
-        return self.get(
-            "cfs/afl/teamList",
-            params={"competitionId": self._competition_id, "year": year},
-            cache_ttl_seconds=ttl,
-        )
+    def get_matches(self, season_id: str, ttl: int = 1800) -> dict:
+        """All fixtures + results for a season."""
+        return self.get("get_matches",
+                        params={"season_id": season_id}, ttl=ttl)
 
-    def get_squad_list(self, year: int, team_id: Optional[int] = None,
-                       ttl: int = 86400) -> dict:
-        """Return squad/player roster for a team or all teams."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if team_id is not None:
-            params["teamId"] = team_id
-        return self.get("cfs/afl/squadList", params=params, cache_ttl_seconds=ttl)
+    def get_matches_by_round(self, season_id: str, round_id: str,
+                             ttl: int = 1800) -> dict:
+        """Fixtures for a specific round."""
+        return self.get("get_matches",
+                        params={"season_id": season_id, "round_id": round_id},
+                        ttl=ttl)
 
-    # ------------------------------------------------------------------
-    # AFL Data endpoints — Statistics
-    # ------------------------------------------------------------------
+    def get_matches_day(self, date: str, ttl: int = 900) -> dict:
+        """Fixtures for a specific date (YYYY-MM-DD)."""
+        return self.get("get_matches_day", params={"date": date}, ttl=ttl)
 
-    def get_player_stats(self, year: int, round_no: Optional[int] = None,
-                         team_id: Optional[int] = None,
-                         player_id: Optional[int] = None,
-                         ttl: int = 3600) -> dict:
-        """
-        Return individual player statistics.
+    def get_matches_updates(self, ttl: int = 60) -> dict:
+        """Live in-progress match updates (very short TTL)."""
+        return self.get("get_matches_updates", ttl=ttl)
 
-        Advanced stats included (AFL Advanced Pack):
-          disposals, kicks, handballs, marks, goals, behinds, hitouts,
-          tackles, inside_50s, clearances, contested_possessions,
-          uncontested_possessions, score_involvements, rebound_50s,
-          clangers, frees_for, frees_against, effective_kicks,
-          effective_handballs, effective_disposals, goal_assists,
-          time_on_ground, contested_marks, marks_inside_50,
-          one_percenters, brownlow_votes
-        """
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        if team_id is not None:
-            params["teamId"] = team_id
-        if player_id is not None:
-            params["playerId"] = player_id
-        return self.get("cfs/afl/playerStats", params=params, cache_ttl_seconds=ttl)
-
-    def get_team_stats(self, year: int, round_no: Optional[int] = None,
-                       ttl: int = 3600) -> dict:
-        """Return team-level aggregated statistics per match."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        return self.get("cfs/afl/teamStats", params=params, cache_ttl_seconds=ttl)
-
-    def get_ladder(self, year: int, round_no: Optional[int] = None,
-                   ttl: int = 3600) -> dict:
-        """Return competition ladder/standings."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if round_no is not None:
-            params["roundId"] = round_no
-        return self.get("cfs/afl/ladderList", params=params, cache_ttl_seconds=ttl)
-
-    def get_live_scores(self, ttl: int = 60) -> dict:
-        """Return live in-progress match scores (very short TTL)."""
-        return self.get(
-            "cfs/afl/liveScores",
-            params={"competitionId": self._competition_id},
-            cache_ttl_seconds=ttl,
-        )
-
-    def get_player_list(self, year: int, team_id: Optional[int] = None,
-                        ttl: int = 86400) -> dict:
-        """Return full player list (with profiles)."""
-        params: Dict[str, Any] = {
-            "competitionId": self._competition_id,
-            "year": year,
-        }
-        if team_id is not None:
-            params["teamId"] = team_id
-        return self.get("cfs/afl/playerList", params=params, cache_ttl_seconds=ttl)
+    def get_match(self, match_id: str, ttl: int = 86400) -> dict:
+        """Full details for a single match (box score, events)."""
+        return self.get("get_match", params={"match_id": match_id}, ttl=ttl)
 
     # ------------------------------------------------------------------
-    # Convenience: current year
+    # Teams / players
+    # ------------------------------------------------------------------
+
+    def get_teams(self, season_id: str, ttl: int = 86400 * 7) -> dict:
+        """Team master list for a season."""
+        return self.get("get_teams", params={"season_id": season_id}, ttl=ttl)
+
+    def get_team(self, team_id: str, ttl: int = 86400) -> dict:
+        """Single team profile."""
+        return self.get("get_team", params={"team_id": team_id}, ttl=ttl)
+
+    def get_squad(self, team_id: str, season_id: str = "", ttl: int = 86400) -> dict:
+        """Team roster / squad."""
+        params: Dict[str, Any] = {"team_id": team_id}
+        if season_id:
+            params["season_id"] = season_id
+        return self.get("get_squad", params=params, ttl=ttl)
+
+    def get_people(self, person_id: str, ttl: int = 86400 * 7) -> dict:
+        """Player/person profile."""
+        return self.get("get_people", params={"person_id": person_id}, ttl=ttl)
+
+    def get_peoples(self, team_id: str = "", season_id: str = "",
+                    ttl: int = 86400) -> dict:
+        """List of players (optionally filtered by team/season)."""
+        params: Dict[str, Any] = {}
+        if team_id:
+            params["team_id"] = team_id
+        if season_id:
+            params["season_id"] = season_id
+        return self.get("get_peoples", params=params, ttl=ttl)
+
+    # ------------------------------------------------------------------
+    # Standings / H2H
+    # ------------------------------------------------------------------
+
+    def get_tables(self, season_id: str, ttl: int = 3600) -> dict:
+        """Ladder / standings for a season."""
+        return self.get("get_tables", params={"season_id": season_id}, ttl=ttl)
+
+    def get_head2head(self, team1_id: str, team2_id: str,
+                      ttl: int = 86400) -> dict:
+        """Head-to-head historical record between two teams."""
+        return self.get("get_head2head",
+                        params={"team_id": team1_id, "team2_id": team2_id},
+                        ttl=ttl)
+
+    # ------------------------------------------------------------------
+    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def current_year() -> int:
         return datetime.utcnow().year
+
+    def discover_afl_competition(self) -> Optional[str]:
+        """
+        Auto-discover the AFL competition ID from get_competitions.
+        Returns the competition_id string, or None if not found.
+        """
+        try:
+            data = self.get_competitions()
+            competitions = (
+                data.get("competitions") or
+                data.get("competition") or
+                data.get("data", {}).get("competitions") or []
+            )
+            if isinstance(competitions, dict):
+                competitions = [competitions]
+            for comp in (competitions or []):
+                name = (comp.get("name") or comp.get("competition_name") or "").lower()
+                if "afl" in name or "australian" in name:
+                    cid = comp.get("id") or comp.get("competition_id")
+                    if cid:
+                        logger.info("DSG: discovered AFL competition_id={}", cid)
+                        return str(cid)
+        except Exception as exc:
+            logger.warning("DSG: competition discovery failed: {}", exc)
+        return None
+
+    def discover_current_season(self, competition_id: str) -> Optional[str]:
+        """
+        Auto-discover the current/most recent season ID.
+        Returns season_id string, or None.
+        """
+        try:
+            data = self.get_seasons(competition_id)
+            seasons = (
+                data.get("seasons") or
+                data.get("season") or
+                data.get("data", {}).get("seasons") or []
+            )
+            if isinstance(seasons, dict):
+                seasons = [seasons]
+            if not seasons:
+                return None
+            # Sort by year descending, pick the most recent
+            def _year(s):
+                return int(s.get("year") or s.get("name") or "0")
+            seasons_sorted = sorted(seasons, key=_year, reverse=True)
+            current = seasons_sorted[0]
+            sid = current.get("id") or current.get("season_id")
+            if sid:
+                logger.info("DSG: discovered current season_id={} year={}",
+                            sid, current.get("year"))
+                return str(sid)
+        except Exception as exc:
+            logger.warning("DSG: season discovery failed: {}", exc)
+        return None

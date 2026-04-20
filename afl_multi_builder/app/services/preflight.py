@@ -111,34 +111,35 @@ def _check_afl_data_connectivity() -> CheckResult:
             required=True,
         )
     try:
-        from app.data_ingestion.afl_data_client import AFLDataClient
-        client = AFLDataClient()
-        year = client.current_year()
-        data = client.get_team_list(year=year, ttl=3600)
+        from app.data_ingestion.afl_data_client import DSGClient
+        client = DSGClient()
+        data = client.get_competitions(ttl=3600)
         if isinstance(data, dict):
-            # Any valid response (even empty team list) means API is reachable
             source = data.get("_source", "unknown")
-            teams = data.get("teams") or data.get("teamList") or data.get("data", {}).get("teams", [])
-            n_teams = len(teams) if isinstance(teams, list) else "?"
+            competitions = (
+                data.get("competitions") or
+                data.get("competition") or []
+            )
+            n_comps = len(competitions) if isinstance(competitions, list) else "?"
             return CheckResult(
                 name="afl_data_connectivity",
                 passed=True,
-                detail=f"AFL Data API reachable (source={source}, {n_teams} teams returned)",
+                detail=f"DSG API reachable (source={source}, {n_comps} competitions returned)",
             )
         return CheckResult(
             name="afl_data_connectivity",
             passed=False,
-            detail=f"AFL Data API returned unexpected response: {str(data)[:200]}",
-            fix="Check AFL_DATA_AUTHKEY and AFL_DATA_BASE_URL are correct",
+            detail=f"DSG API returned unexpected response: {str(data)[:200]}",
+            fix="Check AFL_DATA_AUTHKEY and AFL_DATA_BASE_URL (should be https://dsg-api.com)",
             required=True,
         )
     except Exception as exc:
         return CheckResult(
             name="afl_data_connectivity",
             passed=False,
-            detail=f"AFL Data API unreachable: {exc}",
+            detail=f"DSG API unreachable: {exc}",
             fix="Check network connectivity, AFL_DATA_AUTHKEY validity, "
-                "and AFL_DATA_BASE_URL. Default: https://api.afl.com.au",
+                "and AFL_DATA_BASE_URL=https://dsg-api.com in .env",
             required=True,
         )
 
