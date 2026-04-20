@@ -12,7 +12,11 @@ import pandas as pd
 from loguru import logger
 
 from app.data_ingestion.loader import DataLoader
-from app.data_ingestion.sportradar_loader import NoUpcomingFixturesError
+from app.data_ingestion.afl_data_loader import AFLDataLoader as _AFLDataLoader
+
+
+class NoUpcomingFixturesError(RuntimeError):
+    """Raised when the AFL Data API returns no upcoming fixtures."""
 from app.features.pipeline import FeaturePipeline
 from app.pricing.models import (
     CalibratedModel, PlayerDisposalsModel, ModelRegistry, EnsembleModel
@@ -131,13 +135,13 @@ class PredictionPipeline:
         self._build_lookups()
 
         # ── Stage 1: Load upcoming fixtures ───────────────────────────────
-        logger.info(f"[{self.run_id}] Stage 1/7: Loading upcoming fixtures from Sportradar...")
+        logger.info(f"[{self.run_id}] Stage 1/7: Loading upcoming fixtures from AFL Data API...")
         upcoming = self.loader.load_upcoming_fixtures_df()
         if upcoming.empty:
             raise NoUpcomingFixturesError(
-                "No upcoming AFL fixtures found in live Sportradar data. "
-                "The season may be over or fixtures not yet published. "
-                "Check SPORTRADAR_AFL_SEASON_ID in your .env file."
+                "No upcoming AFL fixtures found in AFL Data Sports Group API. "
+                "The season may be over or between rounds. "
+                "Check AFL_DATA_AUTHKEY and AFL_DATA_COMPETITION_ID in your .env file."
             )
         logger.info(f"[{self.run_id}] Loaded {len(upcoming)} upcoming fixtures.")
 
@@ -300,7 +304,7 @@ class PredictionPipeline:
                 pass
 
         # Also populate team names from fixtures_df home/away name columns
-        # (SportradarLoader embeds names directly; avoids needing a separate teams endpoint)
+        # (AFLDataLoader embeds names directly in fixtures_df)
         if "home_team_name" in fixtures_df.columns and "home_team_id" in fixtures_df.columns:
             for _, row in fixtures_df.iterrows():
                 try:
@@ -820,10 +824,10 @@ class PredictionPipeline:
         """Return a human-readable data source description. Always live."""
         mode = settings.effective_data_mode
         if mode == "live":
-            return "Sportradar API (Live)"
+            return "AFL Data Sports Group API (Live)"
         elif mode == "cache":
-            return "Sportradar API (Cached)"
-        return "Sportradar API"
+            return "AFL Data Sports Group API (Cached)"
+        return "AFL Data Sports Group API"
 
     # ------------------------------------------------------------------
     # Serialisation

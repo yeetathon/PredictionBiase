@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
-"""Sportradar sync script.
+"""AFL Data sync script.
 
 Usage
 -----
-    python scripts/sync_sportradar.py --mode upcoming
-    python scripts/sync_sportradar.py --mode settle_recent
-    python scripts/sync_sportradar.py --mode backfill --season-ids sr:season:12345
-    python scripts/sync_sportradar.py --mode status
+    python scripts/sync_afl_data.py --mode upcoming
+    python scripts/sync_afl_data.py --mode settle_recent
+    python scripts/sync_afl_data.py --mode backfill
+    python scripts/sync_afl_data.py --mode status
 
 Modes
 -----
 upcoming
-    Pull fixtures for the next N days and upsert to DB.
+    Pull fixtures for the next N days from AFL Data Sports Group API and upsert to DB.
 settle_recent
     Fetch completed game results and settle open predictions.
 backfill
-    Bulk-load historical data for one or more season IDs (costs quota).
+    Bulk-load historical fixture data (unlimited call rate).
 status
-    Show data-source and quota status without making changes.
+    Show data-source status without making changes.
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
-# Ensure the app package is importable when running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
@@ -43,13 +42,9 @@ def cmd_settle_recent(args):
 
 
 def cmd_backfill(args):
-    season_ids = args.season_ids or []
-    if not season_ids:
-        print("ERROR: --season-ids is required for backfill mode", file=sys.stderr)
-        sys.exit(1)
     from app.services.sync import SyncService
     svc = SyncService()
-    result = svc.sync_backfill(season_ids=season_ids, max_fixtures=args.max_fixtures)
+    result = svc.sync_backfill(max_fixtures=args.max_fixtures)
     _print(result)
 
 
@@ -66,7 +61,7 @@ def _print(data):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync AFL data from Sportradar",
+        description="Sync AFL data from AFL Data Sports Group API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -89,16 +84,10 @@ def main():
         help="Days back for 'settle_recent' mode (default: 7)",
     )
     parser.add_argument(
-        "--season-ids",
-        nargs="+",
-        metavar="SEASON_ID",
-        help="Sportradar season IDs for 'backfill' mode",
-    )
-    parser.add_argument(
         "--max-fixtures",
         type=int,
-        default=50,
-        help="Max fixtures to backfill (default: 50)",
+        default=200,
+        help="Max fixtures to backfill (default: 200, rate is unlimited)",
     )
 
     args = parser.parse_args()

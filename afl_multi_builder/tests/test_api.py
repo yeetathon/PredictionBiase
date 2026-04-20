@@ -1,8 +1,8 @@
 """Tests for FastAPI endpoints.
 
 The pipeline/training/backtest endpoints internally call DataLoader(), which
-would try to instantiate SportradarLoader without an API key. We patch
-_make_afl_provider to return a DemoAFLDataProvider so all tests run offline.
+would try to instantiate AFLDataLoader without an authkey. We patch
+_make_afl_provider to return a mock provider so all tests run offline.
 """
 import pytest
 from pathlib import Path

@@ -3,6 +3,7 @@ Extended application configuration.
 All secrets read from environment variables / .env file only.
 
 Live-data only — no demo mode, no fallback to CSV files.
+Data source: AFL Data Sports Group API + The Odds API.
 """
 from pathlib import Path
 from typing import List, Literal
@@ -29,16 +30,12 @@ class Settings(BaseSettings):
     artifacts_dir: Path = Path("./data/models")
     raw_cache_dir: Path = Path("./data/cache")
 
-    # ── Sportradar API ─────────────────────────────────────────────────────
-    sportradar_api_key: str = ""
-    sportradar_base_url: str = "https://api.sportradar.com/australianrules/trial/v3/en"
-    sportradar_afl_competition_id: str = "sr:competition:656"
-    sportradar_afl_season_id: str = ""
-
-    # ── API-Sports AFL ─────────────────────────────────────────────────────
-    api_sports_key: str = ""
-    api_sports_base_url: str = "https://v1.afl.api-sports.io"
-    api_sports_afl_league_id: int = 1
+    # ── AFL Data Sports Group API ──────────────────────────────────────────
+    afl_data_username: str = ""
+    afl_data_password: str = ""
+    afl_data_authkey: str = ""
+    afl_data_base_url: str = "https://api.afl.com.au"
+    afl_data_competition_id: int = 1  # 1 = AFL Men's
 
     # ── The Odds API ───────────────────────────────────────────────────────
     odds_api_key: str = ""
@@ -47,8 +44,8 @@ class Settings(BaseSettings):
     odds_api_bookmakers: str = "tab,sportsbet,bet365,unibet,pointsbet,betfair,williamhill,neds"
 
     # ── Data Mode (live | cache only — no demo) ───────────────────────────
-    # live  = fetch from Sportradar API (uses cache, respects TTL)
-    # cache = only use cached Sportradar responses (no new API calls)
+    # live  = fetch from AFL Data Sports Group API (uses cache, respects TTL)
+    # cache = only use cached responses (no new API calls)
     data_mode: Literal["live", "cache"] = "live"
 
     # ── Rate Limiting & Quota ─────────────────────────────────────────────
@@ -149,12 +146,8 @@ class Settings(BaseSettings):
         return self.artifacts_dir
 
     @property
-    def is_sportradar_configured(self) -> bool:
-        return bool(self.sportradar_api_key and self.sportradar_api_key.strip())
-
-    @property
-    def is_api_sports_configured(self) -> bool:
-        return bool(self.api_sports_key and self.api_sports_key.strip())
+    def is_afl_data_configured(self) -> bool:
+        return bool(self.afl_data_authkey and self.afl_data_authkey.strip())
 
     @property
     def is_odds_api_configured(self) -> bool:
@@ -171,7 +164,7 @@ class Settings(BaseSettings):
 
     @property
     def any_api_configured(self) -> bool:
-        return self.is_sportradar_configured or self.is_api_sports_configured
+        return self.is_afl_data_configured
 
 
 settings = Settings()

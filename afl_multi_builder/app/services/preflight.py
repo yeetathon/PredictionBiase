@@ -11,11 +11,10 @@ No demo fallbacks. No partial data. No silent degradation for required inputs.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from loguru import logger
 
@@ -83,128 +82,105 @@ class PreflightError(RuntimeError):
 # Individual checks
 # ---------------------------------------------------------------------------
 
-def _check_sportradar_key() -> CheckResult:
-    if settings.is_sportradar_configured:
+def _check_afl_data_key() -> CheckResult:
+    if settings.is_afl_data_configured:
+        key_preview = settings.afl_data_authkey[:6] + "..." if len(settings.afl_data_authkey) > 6 else "***"
         return CheckResult(
-            name="sportradar_api_key",
+            name="afl_data_authkey",
             passed=True,
-            detail=f"SPORTRADAR_API_KEY present ({len(settings.sportradar_api_key)} chars)",
+            detail=f"AFL_DATA_AUTHKEY present ({key_preview}, {len(settings.afl_data_authkey)} chars)",
         )
     return CheckResult(
-        name="sportradar_api_key",
+        name="afl_data_authkey",
         passed=False,
-        detail="SPORTRADAR_API_KEY is missing or empty",
-        fix="Add SPORTRADAR_API_KEY=<your_key> to your .env file. "
-            "Get a key at https://developer.sportradar.com/",
+        detail="AFL_DATA_AUTHKEY is missing or empty",
+        fix="Add AFL_DATA_AUTHKEY=<your_key> to your .env file. "
+            "Contact AFL Data Sports Group to obtain credentials.",
         required=True,
     )
 
 
-def _check_sportradar_season() -> CheckResult:
-    if settings.sportradar_afl_season_id and settings.sportradar_afl_season_id.strip():
+def _check_afl_data_connectivity() -> CheckResult:
+    """Attempt a lightweight connectivity check against AFL Data Sports Group API."""
+    if not settings.is_afl_data_configured:
         return CheckResult(
-            name="sportradar_season_id",
-            passed=True,
-            detail=f"SPORTRADAR_AFL_SEASON_ID = {settings.sportradar_afl_season_id}",
-        )
-    return CheckResult(
-        name="sportradar_season_id",
-        passed=False,
-        detail="SPORTRADAR_AFL_SEASON_ID is not set — cannot fetch fixtures for the current season",
-        fix="Add SPORTRADAR_AFL_SEASON_ID=sr:season:<id> to your .env file. "
-            "Find the season ID by calling GET /competitions/{id}/seasons.json from the Sportradar API.",
-        required=True,
-    )
-
-
-def _check_sportradar_connectivity() -> CheckResult:
-    """Attempt a lightweight connectivity check against Sportradar."""
-    if not settings.is_sportradar_configured:
-        return CheckResult(
-            name="sportradar_connectivity",
+            name="afl_data_connectivity",
             passed=False,
-            detail="Skipped — no API key configured",
-            fix="Configure SPORTRADAR_API_KEY first",
+            detail="Skipped — no AFL_DATA_AUTHKEY configured",
+            fix="Configure AFL_DATA_AUTHKEY first",
             required=True,
         )
     try:
-        from app.data_ingestion.sportradar_client import SportradarClient
-        client = SportradarClient()
-        competition_id = settings.sportradar_afl_competition_id
-        data = client.get(
-            f"competitions/{competition_id}/seasons.json",
-            cache_ttl_seconds=3600,
-        )
-        if isinstance(data, dict) and ("seasons" in data or "_source" in data):
+        from app.data_ingestion.afl_data_client import AFLDataClient
+        client = AFLDataClient()
+        year = client.current_year()
+        data = client.get_team_list(year=year, ttl=3600)
+        if isinstance(data, dict):
+            # Any valid response (even empty team list) means API is reachable
+            source = data.get("_source", "unknown")
+            teams = data.get("teams") or data.get("teamList") or data.get("data", {}).get("teams", [])
+            n_teams = len(teams) if isinstance(teams, list) else "?"
             return CheckResult(
-                name="sportradar_connectivity",
+                name="afl_data_connectivity",
                 passed=True,
-                detail=f"Sportradar API reachable (source={data.get('_source', 'unknown')})",
+                detail=f"AFL Data API reachable (source={source}, {n_teams} teams returned)",
             )
         return CheckResult(
-            name="sportradar_connectivity",
+            name="afl_data_connectivity",
             passed=False,
-            detail=f"Sportradar API returned unexpected response: {str(data)[:200]}",
-            fix="Check your SPORTRADAR_API_KEY and SPORTRADAR_BASE_URL are correct",
+            detail=f"AFL Data API returned unexpected response: {str(data)[:200]}",
+            fix="Check AFL_DATA_AUTHKEY and AFL_DATA_BASE_URL are correct",
             required=True,
         )
     except Exception as exc:
         return CheckResult(
-            name="sportradar_connectivity",
+            name="afl_data_connectivity",
             passed=False,
-            detail=f"Sportradar API unreachable: {exc}",
-            fix="Check network connectivity, API key validity, and base URL. "
-                "Verify SPORTRADAR_BASE_URL=https://api.sportradar.com/australianrules/trial/v3/en",
+            detail=f"AFL Data API unreachable: {exc}",
+            fix="Check network connectivity, AFL_DATA_AUTHKEY validity, "
+                "and AFL_DATA_BASE_URL. Default: https://api.afl.com.au",
             required=True,
         )
 
 
 def _check_upcoming_fixtures() -> CheckResult:
-    """Check that at least one upcoming fixture exists for the configured season."""
-    if not settings.is_sportradar_configured:
+    """Check that at least one upcoming fixture is available."""
+    if not settings.is_afl_data_configured:
         return CheckResult(
             name="upcoming_fixtures",
             passed=False,
-            detail="Skipped — no Sportradar API key",
-            fix="Configure SPORTRADAR_API_KEY",
-            required=True,
-        )
-    if not settings.sportradar_afl_season_id:
-        return CheckResult(
-            name="upcoming_fixtures",
-            passed=False,
-            detail="Skipped — SPORTRADAR_AFL_SEASON_ID not set",
-            fix="Set SPORTRADAR_AFL_SEASON_ID in your .env file",
+            detail="Skipped — no AFL_DATA_AUTHKEY configured",
+            fix="Configure AFL_DATA_AUTHKEY",
             required=True,
         )
     try:
-        from app.data_ingestion.data_source_manager import SportradarDataProvider
-        provider = SportradarDataProvider()
-        df = provider.get_schedule(settings.sportradar_afl_season_id)
+        from app.data_ingestion.afl_data_loader import AFLDataLoader
+        loader = AFLDataLoader()
+        df = loader.load_upcoming_fixtures_df()
         if df.empty:
+            all_df = loader.fixtures_df
             return CheckResult(
                 name="upcoming_fixtures",
                 passed=False,
-                detail="Schedule returned zero rows — season may be over or season ID is wrong",
-                fix="Verify SPORTRADAR_AFL_SEASON_ID is correct for the current season. "
-                    "Check the Sportradar seasons endpoint to get the valid season ID.",
+                detail=(
+                    f"No upcoming fixtures found (total fixtures in schedule: {len(all_df)}). "
+                    "The season may be between rounds or the competition ID may be wrong."
+                ),
+                fix=f"Verify AFL_DATA_COMPETITION_ID={settings.afl_data_competition_id} "
+                    "is correct for the current AFL season.",
                 required=True,
             )
-        upcoming = df[df.get("status", df.get("status", "")).eq("not_started") |
-                      df.get("status", df.get("status", "")).eq("upcoming")] \
-            if "status" in df.columns else df
-        n = len(upcoming) if not upcoming.empty else len(df)
         return CheckResult(
             name="upcoming_fixtures",
             passed=True,
-            detail=f"Found {n} upcoming fixtures in season {settings.sportradar_afl_season_id}",
+            detail=f"Found {len(df)} upcoming fixtures",
         )
     except Exception as exc:
         return CheckResult(
             name="upcoming_fixtures",
             passed=False,
-            detail=f"Failed to load fixtures: {exc}",
-            fix="Check Sportradar API key and season ID. Ensure your trial plan covers fixture schedules.",
+            detail=f"Failed to load upcoming fixtures: {exc}",
+            fix="Check AFL_DATA_AUTHKEY and AFL_DATA_COMPETITION_ID.",
             required=True,
         )
 
@@ -218,7 +194,7 @@ def _check_odds_api() -> CheckResult:
             detail="ODDS_API_KEY is missing — market odds unavailable, edge calculations disabled",
             fix="Add ODDS_API_KEY=<your_key> to your .env file. "
                 "Get a free key at https://the-odds-api.com/",
-            required=False,  # Optional: pipeline still runs but no market comparison
+            required=False,
         )
     try:
         from app.data_ingestion.odds_api_client import OddsAPIClient
@@ -234,7 +210,7 @@ def _check_odds_api() -> CheckResult:
             name="odds_api_key",
             passed=False,
             detail="Odds API returned null — key may be invalid or quota exhausted",
-            fix="Check ODDS_API_KEY in your .env file and your quota at https://the-odds-api.com/account/",
+            fix="Check ODDS_API_KEY in your .env file and quota at https://the-odds-api.com/account/",
             required=False,
         )
     except Exception as exc:
@@ -256,9 +232,8 @@ def _check_model_artifacts() -> CheckResult:
             passed=False,
             detail=f"Artifacts directory missing: {artifacts_dir}",
             fix="Run 'python scripts/run_training.py' to train and save models",
-            required=False,  # Pipeline auto-trains if missing
+            required=False,
         )
-    # Look for any .joblib files
     model_files = list(artifacts_dir.glob("*.joblib"))
     if not model_files:
         return CheckResult(
@@ -266,7 +241,7 @@ def _check_model_artifacts() -> CheckResult:
             passed=False,
             detail=f"No model files found in {artifacts_dir}",
             fix="Run 'python scripts/run_training.py' to train models",
-            required=False,  # Pipeline auto-trains
+            required=False,
         )
     names = [f.stem for f in model_files]
     return CheckResult(
@@ -278,38 +253,39 @@ def _check_model_artifacts() -> CheckResult:
 
 def _check_data_freshness() -> CheckResult:
     """Check whether cached data is fresh enough to use."""
-    cache_dir = settings.raw_cache_dir
+    import time
+    cache_dir = settings.raw_cache_dir / "afl_data"
     if not cache_dir.exists():
         return CheckResult(
             name="data_freshness",
-            passed=True,  # Cache will be populated on first run
+            passed=True,
             detail="Cache directory does not exist yet — will be created on first API call",
         )
-    cache_files = list(cache_dir.glob("*.json")) + list(cache_dir.glob("*.pickle"))
+    cache_files = list(cache_dir.glob("*.json"))
     if not cache_files:
         return CheckResult(
             name="data_freshness",
             passed=True,
             detail="No cached data yet — fresh API calls will be made",
         )
-    # Find the most recent cache file
     most_recent = max(cache_files, key=lambda f: f.stat().st_mtime)
-    age_hours = (datetime.utcnow().timestamp() - most_recent.stat().st_mtime) / 3600
+    age_hours = (time.time() - most_recent.stat().st_mtime) / 3600
     max_age = settings.cache_ttl_hours
     if age_hours > max_age * 2:
         return CheckResult(
             name="data_freshness",
             passed=False,
-            detail=f"Most recent cache file is {age_hours:.1f}h old (max allowed: {max_age * 2}h). "
-                   f"Stale data may lead to incorrect predictions.",
-            fix="Run the pipeline with data_mode=live to refresh the cache, "
-                "or run 'python scripts/sync_sportradar.py'",
+            detail=(
+                f"Most recent cache file is {age_hours:.1f}h old (limit: {max_age * 2}h). "
+                "Stale data may lead to incorrect predictions."
+            ),
+            fix="Run the pipeline with data_mode=live to refresh the cache.",
             required=False,
         )
     return CheckResult(
         name="data_freshness",
         passed=True,
-        detail=f"Cache is fresh (most recent file: {age_hours:.1f}h old, limit: {max_age * 2}h)",
+        detail=f"Cache is fresh (most recent: {age_hours:.1f}h old, limit: {max_age * 2}h)",
     )
 
 
@@ -347,16 +323,6 @@ class PreflightService:
     """
 
     def run(self, raise_on_failure: bool = True) -> PreflightReport:
-        """
-        Execute all preflight checks and return a report.
-
-        Args:
-            raise_on_failure: If True (default) raise PreflightError when any
-                              *required* check fails.
-
-        Returns:
-            PreflightReport with all check results.
-        """
         start = datetime.utcnow()
         logger.info("Running preflight checks...")
 
@@ -364,9 +330,8 @@ class PreflightService:
 
         # --- Required checks ---
         checks.append(_check_data_mode())
-        checks.append(_check_sportradar_key())
-        checks.append(_check_sportradar_season())
-        checks.append(_check_sportradar_connectivity())
+        checks.append(_check_afl_data_key())
+        checks.append(_check_afl_data_connectivity())
         checks.append(_check_upcoming_fixtures())
 
         # --- Optional checks (warn but don't block) ---

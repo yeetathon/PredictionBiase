@@ -192,8 +192,8 @@ class TeamFeatureEngineer:
         """
         Compute rolling team features from prior games only (no lookahead).
 
-        Works with minimal team_stats_df (score + is_home only, as returned by
-        SportradarLoader) as well as full demo CSVs with disposals/marks/etc.
+        Works with both minimal team_stats_df (score + is_home only) and full
+        AFL Data Sports Group stats (disposals, marks, clearances, etc.).
 
         Returns a DataFrame indexed by (fixture_id, team_id).
         """

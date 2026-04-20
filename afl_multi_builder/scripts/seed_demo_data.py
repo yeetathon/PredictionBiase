@@ -9,15 +9,14 @@ There is no demo seeding, no CSV seeding, and no offline fallback.
 
 Setup instructions:
   1. Configure your API keys in .env:
-       SPORTRADAR_API_KEY=<your_key>
-       SPORTRADAR_AFL_SEASON_ID=<season_id>
-       ODDS_API_KEY=<your_key>          (optional)
+       AFL_DATA_AUTHKEY=<your_key>
+       ODDS_API_KEY=<your_key>  (optional)
 
   2. Verify your setup:
        python -c "from app.services.preflight import PreflightService; PreflightService().run()"
 
   3. Sync live data:
-       python scripts/sync_sportradar.py
+       python scripts/sync_afl_data.py --mode upcoming
 
   4. Train models on live data:
        python scripts/run_training.py
@@ -36,11 +35,10 @@ print(
     "This system uses live data from real APIs only. There is no demo mode.\n"
     "\n"
     "Setup steps:\n"
-    "  1. Add SPORTRADAR_API_KEY to your .env file\n"
-    "  2. Add SPORTRADAR_AFL_SEASON_ID to your .env file\n"
-    "  3. Optionally add ODDS_API_KEY for bookmaker edge calculations\n"
-    "  4. Run: python scripts/sync_sportradar.py\n"
-    "  5. Run: python scripts/run_training.py\n"
+    "  1. Add AFL_DATA_AUTHKEY to your .env file\n"
+    "  2. Optionally add ODDS_API_KEY for bookmaker edge calculations\n"
+    "  3. Run: python scripts/sync_afl_data.py --mode upcoming\n"
+    "  4. Run: python scripts/run_training.py\n"
     "\n"
     "See README.md for full setup instructions.\n",
     file=sys.stderr

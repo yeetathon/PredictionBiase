@@ -31,12 +31,12 @@ def _make_minimal_loader(
 ):
     """
     Build a DataLoader backed by in-memory DataFrames that look like real
-    Sportradar-sourced data (with _source_type='sportradar_api').
+    AFL Data Sports Group API sourced data (with _source_type='afl_data_api').
     No CSV files. No demo data. No network calls.
     """
     from app.data_ingestion.loader import DataLoader
 
-    def _df(rows, source="sportradar_api"):
+    def _df(rows, source="afl_data_api"):
         df = pd.DataFrame(rows or [])
         if not df.empty:
             df["_source_type"] = source
@@ -101,50 +101,32 @@ def _make_minimal_loader(
 class TestPreflightHardFail:
     """Pipeline must block and raise PreflightError when API keys are absent."""
 
-    def test_preflight_fails_without_sportradar_key(self, monkeypatch):
-        """No Sportradar key → PreflightError before any prediction logic runs."""
+    def test_preflight_fails_without_afl_data_key(self, monkeypatch):
+        """No AFL Data key → PreflightError before any prediction logic runs."""
         from app.services.preflight import PreflightService, PreflightError
         from app.core import config
 
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
-        monkeypatch.setattr(config.settings, "sportradar_afl_season_id", "")
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
 
         svc = PreflightService()
         report = svc.run(raise_on_failure=False)
 
-        assert not report.passed, "Preflight should fail without Sportradar key"
+        assert not report.passed, "Preflight should fail without AFL Data authkey"
         failed_names = [c.name for c in report.checks if not c.passed and c.required]
-        assert "sportradar_api_key" in failed_names
-
-    def test_preflight_fails_without_season_id(self, monkeypatch):
-        """Key present but no season ID → preflight should fail."""
-        from app.services.preflight import PreflightService
-        from app.core import config
-
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "dummy_key_xyz")
-        monkeypatch.setattr(config.settings, "sportradar_afl_season_id", "")
-
-        svc = PreflightService()
-        report = svc.run(raise_on_failure=False)
-
-        # Connectivity check will also fail (dummy key), but season check must also fail
-        assert not report.passed
-        failed_names = [c.name for c in report.checks if not c.passed and c.required]
-        assert "sportradar_season_id" in failed_names
+        assert "afl_data_authkey" in failed_names
 
     def test_preflight_error_includes_fix_instructions(self, monkeypatch):
         """PreflightError message must include actionable fix instructions."""
         from app.services.preflight import PreflightService, PreflightError
         from app.core import config
 
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
-        monkeypatch.setattr(config.settings, "sportradar_afl_season_id", "")
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
 
         svc = PreflightService()
         report = svc.run(raise_on_failure=False)
         error = PreflightError(report)
 
-        assert "SPORTRADAR_API_KEY" in str(error), \
+        assert "AFL_DATA_AUTHKEY" in str(error), \
             "Error message must mention the missing env var"
         assert "Fix:" in str(error), \
             "Error message must include fix instructions"
@@ -154,8 +136,7 @@ class TestPreflightHardFail:
         from app.services.preflight import PreflightService
         from app.core import config
 
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
-        monkeypatch.setattr(config.settings, "sportradar_afl_season_id", "")
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
 
         svc = PreflightService()
         report = svc.run(raise_on_failure=False)
@@ -237,9 +218,9 @@ class TestNoDemoData:
         assert "demo" not in result.get("data_source", "").lower(), \
             f"data_source must not reference demo data, got: {result.get('data_source')}"
         assert result["data_source"] in (
-            "Sportradar API (Live)",
-            "Sportradar API (Cached)",
-            "Sportradar API",
+            "AFL Data Sports Group API (Live)",
+            "AFL Data Sports Group API (Cached)",
+            "AFL Data Sports Group API",
         ), f"Unexpected data_source: {result.get('data_source')}"
 
 
@@ -429,7 +410,7 @@ class TestNoUpcomingFixtures:
     def test_empty_fixtures_raises(self):
         """Pipeline must raise (not silently produce zero results) when no fixtures exist."""
         from app.services.pipeline import PredictionPipeline
-        from app.data_ingestion.sportradar_loader import NoUpcomingFixturesError
+        from app.services.pipeline import NoUpcomingFixturesError
 
         loader = _make_minimal_loader(fixtures=[])  # empty
 

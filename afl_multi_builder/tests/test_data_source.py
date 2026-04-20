@@ -2,15 +2,12 @@
 Data source tests — live-only system.
 
 Verifies:
-  1. DataSourceManager requires Sportradar API key (no silent fallback)
+  1. DataSourceManager requires AFL Data API key (no silent fallback)
   2. Provenance stamping (_source_type, _fetch_ts) works correctly
   3. DataSourceStatus reports correct live/cache modes
   4. config.Settings rejects 'demo' as a data_mode
   5. No DemoDataProvider or load_all_demo() exists anywhere
-  6. SportradarDataProvider stamps DataFrames with correct source types
-
-Tests requiring actual network calls are skipped unless SPORTRADAR_API_KEY
-is set in the environment — they are NOT replaced with demo data.
+  6. AFLDataProvider stamps DataFrames with correct source types
 """
 import pytest
 import pandas as pd
@@ -55,20 +52,34 @@ class TestConfigLiveOnly:
             monkeypatch.setattr(config.settings, "data_mode", mode)
             assert config.settings.effective_data_mode == mode
 
-    def test_is_sportradar_configured_false_without_key(self, monkeypatch):
+    def test_is_afl_data_configured_false_without_key(self, monkeypatch):
         from app.core import config
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
-        assert config.settings.is_sportradar_configured is False
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
+        assert config.settings.is_afl_data_configured is False
 
-    def test_is_sportradar_configured_true_with_key(self, monkeypatch):
+    def test_is_afl_data_configured_true_with_key(self, monkeypatch):
         from app.core import config
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "abc123xyz")
-        assert config.settings.is_sportradar_configured is True
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "abc123xyz")
+        assert config.settings.is_afl_data_configured is True
 
     def test_is_odds_api_configured_false_without_key(self, monkeypatch):
         from app.core import config
         monkeypatch.setattr(config.settings, "odds_api_key", "")
         assert config.settings.is_odds_api_configured is False
+
+    def test_no_sportradar_settings(self):
+        """Sportradar settings must be completely removed from config."""
+        from app.core.config import settings
+        assert not hasattr(settings, "sportradar_api_key"), \
+            "sportradar_api_key must be removed"
+        assert not hasattr(settings, "sportradar_base_url"), \
+            "sportradar_base_url must be removed"
+
+    def test_no_api_sports_settings(self):
+        """API-Sports settings must be completely removed from config."""
+        from app.core.config import settings
+        assert not hasattr(settings, "api_sports_key"), \
+            "api_sports_key must be removed"
 
 
 # ---------------------------------------------------------------------------
@@ -106,20 +117,26 @@ class TestProvenanceStamping:
         assert not hasattr(dsm, "SOURCE_DEMO"), \
             "SOURCE_DEMO must not exist — demo mode is removed"
 
+    def test_source_api_references_afl_data(self):
+        """SOURCE_API must reference AFL Data, not Sportradar."""
+        from app.data_ingestion.data_source_manager import SOURCE_API
+        assert "afl" in SOURCE_API.lower(), \
+            f"SOURCE_API should reference AFL Data, got: {SOURCE_API!r}"
+
 
 # ---------------------------------------------------------------------------
-# Test: DataSourceManager requires API key
+# Test: DataSourceManager requires AFL Data API key
 # ---------------------------------------------------------------------------
 
 class TestDataSourceManagerRequiresKey:
-    def test_raises_without_sportradar_key(self, monkeypatch):
-        """DataSourceManager must raise RuntimeError if no API key is configured."""
+    def test_raises_without_afl_data_key(self, monkeypatch):
+        """DataSourceManager must raise RuntimeError if no AFL Data key is configured."""
         from app.data_ingestion import data_source_manager
         from app.core import config
 
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
 
-        with pytest.raises(RuntimeError, match="SPORTRADAR_API_KEY"):
+        with pytest.raises(RuntimeError, match="AFL_DATA_AUTHKEY"):
             data_source_manager.DataSourceManager()
 
     def test_no_demo_provider_in_manager(self):
@@ -140,6 +157,15 @@ class TestDataSourceManagerRequiresKey:
         field_names = {f.name for f in dataclasses.fields(DataSourceStatus)}
         assert "demo_available" not in field_names, \
             "DataSourceStatus must not expose demo_available"
+
+    def test_manager_status_has_afl_data_fields(self):
+        """DataSourceStatus must have AFL Data specific fields."""
+        from app.data_ingestion.data_source_manager import DataSourceStatus
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(DataSourceStatus)}
+        assert "afl_data_configured" in field_names, \
+            "DataSourceStatus must have afl_data_configured field"
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +189,8 @@ class TestDemoLoaderRemoved:
         try:
             import app.data_ingestion.demo_loader
         except ImportError as e:
-            assert "SPORTRADAR_API_KEY" in str(e), \
-                "ImportError must mention SPORTRADAR_API_KEY"
+            assert "AFL_DATA_AUTHKEY" in str(e), \
+                "ImportError must mention AFL_DATA_AUTHKEY"
         else:
             pytest.fail("ImportError was not raised")
 
@@ -175,10 +201,10 @@ class TestDemoLoaderRemoved:
 
 class TestDataLoaderLiveOnly:
     def test_make_afl_provider_raises_without_key(self, monkeypatch):
-        """_make_afl_provider must raise RuntimeError if Sportradar key is absent."""
+        """_make_afl_provider must raise RuntimeError if AFL Data key is absent."""
         from app.core import config
 
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "")
+        monkeypatch.setattr(config.settings, "afl_data_authkey", "")
 
         from app.data_ingestion.loader import _make_afl_provider
         with pytest.raises(RuntimeError):
@@ -209,7 +235,7 @@ class TestDataLoaderLiveOnly:
         status = loader.get_source_status()
 
         assert isinstance(status, dict)
-        assert "sportradar" in status
+        assert "afl_data" in status
         assert "odds_api" in status
 
     def test_null_odds_provider_returns_empty_df(self):
@@ -226,61 +252,3 @@ class TestDataLoaderLiveOnly:
 
         provider = _NullWeatherProvider()
         assert provider.get_weather(fixture_id=999) is None
-
-
-# ---------------------------------------------------------------------------
-# Test: SportradarDataProvider stamps correctly (with mocked client)
-# ---------------------------------------------------------------------------
-
-class TestSportradarDataProviderStamping:
-    def test_get_schedule_stamps_live_source(self, monkeypatch):
-        """When SportradarClient returns _source=api_live, source must be SOURCE_API."""
-        from app.data_ingestion.data_source_manager import (
-            SportradarDataProvider, SOURCE_API, SOURCE_CACHE
-        )
-        from app.core import config
-
-        monkeypatch.setattr(config.settings, "sportradar_api_key", "test_key")
-        monkeypatch.setattr(config.settings, "sportradar_afl_season_id", "sr:season:999")
-
-        mock_client = MagicMock()
-        mock_client.get.return_value = {
-            "_source": "api_live",
-            "sport_events": [],
-        }
-        mock_norm = MagicMock()
-        mock_norm.normalize_schedule.return_value = [
-            {"fixture_id": "1", "status": "not_started"}
-        ]
-
-        provider = SportradarDataProvider.__new__(SportradarDataProvider)
-        provider._client = mock_client
-        provider._norm = mock_norm
-
-        df = provider.get_schedule("sr:season:999")
-        assert "_source_type" in df.columns
-        assert (df["_source_type"] == SOURCE_API).all()
-
-    def test_get_schedule_stamps_cache_source(self, monkeypatch):
-        """When SportradarClient returns _source=cache, source must be SOURCE_CACHE."""
-        from app.data_ingestion.data_source_manager import (
-            SportradarDataProvider, SOURCE_CACHE
-        )
-
-        mock_client = MagicMock()
-        mock_client.get.return_value = {
-            "_source": "cache",
-            "sport_events": [],
-        }
-        mock_norm = MagicMock()
-        mock_norm.normalize_schedule.return_value = [
-            {"fixture_id": "1", "status": "not_started"}
-        ]
-
-        provider = SportradarDataProvider.__new__(SportradarDataProvider)
-        provider._client = mock_client
-        provider._norm = mock_norm
-
-        df = provider.get_schedule("sr:season:999")
-        assert "_source_type" in df.columns
-        assert (df["_source_type"] == SOURCE_CACHE).all()

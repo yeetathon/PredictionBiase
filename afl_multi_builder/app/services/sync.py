@@ -1,9 +1,9 @@
-"""Sync service: pull data from Sportradar and persist to local DB.
+"""Sync service: pull data from AFL Data Sports Group API and persist to local DB.
 
 Provides three sync operations:
-  - ``sync_upcoming``  — refresh fixtures for the next N days
+  - ``sync_upcoming``      — refresh fixtures for the next N days
   - ``sync_settle_recent`` — settle predictions against finished games
-  - ``sync_backfill``  — bulk-load historical seasons (use sparingly — costs quota)
+  - ``sync_backfill``      — bulk-load historical season data
 """
 from __future__ import annotations
 
@@ -38,35 +38,21 @@ class SyncService:
         season_id: Optional[str] = None,
         lookahead_days: int = 14,
     ) -> Dict[str, Any]:
-        """Pull upcoming fixtures from Sportradar and upsert to DB.
-
-        Parameters
-        ----------
-        season_id:
-            Sportradar season ID.  Defaults to ``settings.sportradar_afl_season_id``.
-        lookahead_days:
-            How many days ahead to include.
-
-        Returns
-        -------
-        dict with ``n_synced``, ``n_new``, ``n_updated``, ``status``
-        """
+        """Pull upcoming fixtures from AFL Data API and upsert to DB."""
         run_id = str(uuid.uuid4())[:8]
         logger.info("SyncService.sync_upcoming run_id={} lookahead={}d", run_id, lookahead_days)
 
-        df = self._dsm.get_upcoming_fixtures(season_id=season_id)
+        df = self._dsm.get_upcoming_fixtures()
         if df.empty:
             return {"run_id": run_id, "status": "no_data", "n_synced": 0}
 
         cutoff = datetime.utcnow() + timedelta(days=lookahead_days)
         if "date" in df.columns:
-            # filter rows within lookahead window
             def _parse_date(d):
                 try:
                     return datetime.fromisoformat(str(d).replace("Z", "+00:00").split("+")[0])
                 except Exception:
                     return datetime.utcnow()
-
             df = df[df["date"].apply(_parse_date) <= cutoff]
 
         n_new = 0
@@ -88,25 +74,17 @@ class SyncService:
             "n_synced": n_new + n_updated,
             "n_new": n_new,
             "n_updated": n_updated,
-            "source": df["_source_type"].iloc[0] if "_source_type" in df.columns else "unknown",
+            "source": df["_source_type"].iloc[0] if "_source_type" in df.columns else "afl_data",
         }
 
     def sync_settle_recent(self, lookback_days: Optional[int] = None) -> Dict[str, Any]:
-        """Fetch completed fixtures and settle open predictions.
-
-        Parameters
-        ----------
-        lookback_days:
-            How far back to look for completions. Defaults to
-            ``settings.recent_settlement_lookback_days``.
-        """
+        """Fetch completed fixtures and settle open predictions."""
         from app.services.settlement import SettlementService
 
         lookback = lookback_days or settings.recent_settlement_lookback_days
         run_id = str(uuid.uuid4())[:8]
         logger.info("SyncService.sync_settle_recent run_id={} lookback={}d", run_id, lookback)
 
-        # First update DB with completed results from API
         df = self._dsm.get_completed_fixtures(lookback_days=lookback)
         n_results_updated = 0
         if not df.empty:
@@ -116,7 +94,6 @@ class SyncService:
                         n_results_updated += 1
                 db.commit()
 
-        # Now run settlement logic
         svc = SettlementService()
         leg_summary = svc.settle_recent(lookback_days=lookback)
         multi_summary = svc.settle_multis()
@@ -134,46 +111,32 @@ class SyncService:
     def sync_backfill(
         self,
         season_ids: Optional[List[str]] = None,
-        max_fixtures: int = 50,
+        max_fixtures: int = 200,
     ) -> Dict[str, Any]:
-        """Back-fill historical fixture data (costs API quota — use sparingly).
+        """Back-fill historical fixture data from AFL Data API.
 
-        Parameters
-        ----------
-        season_ids:
-            List of Sportradar season IDs to backfill.
-        max_fixtures:
-            Hard cap on fixtures to fetch summaries for (to manage quota).
+        AFL Data Sports Group has unlimited call rate so max_fixtures is generous.
         """
-        if settings.effective_data_mode == "demo":
-            return {"status": "skipped", "reason": "demo_mode"}
-
         run_id = str(uuid.uuid4())[:8]
-        logger.info("SyncService.sync_backfill run_id={} seasons={}", run_id, season_ids)
+        logger.info("SyncService.sync_backfill run_id={}", run_id)
 
-        if not season_ids:
-            return {"run_id": run_id, "status": "no_seasons_specified"}
+        df = self._dsm.get_completed_fixtures()
+        if df.empty:
+            return {"run_id": run_id, "status": "no_data", "n_fetched": 0}
 
         n_fetched = 0
-        for sid in season_ids:
-            df = self._dsm.get_completed_fixtures(season_id=sid)
-            if df.empty:
-                continue
-            with SessionLocal() as db:
-                for _, row in df.iterrows():
-                    if n_fetched >= max_fixtures:
-                        break
-                    if self._upsert_fixture(db, row) == "new":
-                        n_fetched += 1
-                db.commit()
-            if n_fetched >= max_fixtures:
-                break
+        with SessionLocal() as db:
+            for _, row in df.iterrows():
+                if n_fetched >= max_fixtures:
+                    break
+                if self._upsert_fixture(db, row) == "new":
+                    n_fetched += 1
+            db.commit()
 
         return {
             "run_id": run_id,
             "status": "ok",
             "n_fetched": n_fetched,
-            "seasons_processed": len(season_ids),
         }
 
     def get_sync_status(self) -> Dict[str, Any]:
@@ -187,9 +150,7 @@ class SyncService:
         return {
             "data_mode": ds_status.mode,
             "effective_mode": ds_status.effective_mode,
-            "sportradar_configured": ds_status.sportradar_configured,
-            "demo_available": ds_status.demo_available,
-            "quota": ds_status.quota_status,
+            "afl_data_configured": ds_status.afl_data_configured,
             "db_fixtures": {
                 "total": total_fixtures,
                 "upcoming": upcoming,
@@ -207,15 +168,14 @@ class SyncService:
         season = int(row.get("season", 0)) if row.get("season") else 0
         round_no = int(row.get("round", 0)) if row.get("round") else 0
 
-        # Try lookup by sport_event_id if available
         existing = None
         if sport_event_id:
-            existing = db.query(Fixture).filter(
-                Fixture.sport_event_id == sport_event_id
-            ).first() if hasattr(Fixture, "sport_event_id") else None
+            existing = (
+                db.query(Fixture).filter(Fixture.sport_event_id == sport_event_id).first()
+                if hasattr(Fixture, "sport_event_id") else None
+            )
 
         if existing is None and season and round_no:
-            # Fallback: match by season + round (works for demo data)
             existing = db.query(Fixture).filter(
                 Fixture.season == season,
                 Fixture.round == round_no,

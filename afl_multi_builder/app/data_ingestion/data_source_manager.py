@@ -1,4 +1,4 @@
-"""Live-only data source manager: live API → cache.
+"""Live-only data source manager: AFL Data Sports Group API → cache.
 
 Every DataFrame returned carries ``_source_type`` and ``_fetch_ts`` columns
 so downstream code can distinguish provenance.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from loguru import logger
@@ -21,8 +21,8 @@ from app.core.config import settings
 # ---------------------------------------------------------------------------
 # Provenance constants
 # ---------------------------------------------------------------------------
-SOURCE_API = "sportradar_api"
-SOURCE_CACHE = "sportradar_cache"
+SOURCE_API = "afl_data_api"
+SOURCE_CACHE = "afl_data_cache"
 SOURCE_DERIVED = "derived"
 
 
@@ -35,59 +35,48 @@ def _stamp(df: pd.DataFrame, source_type: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# SportradarDataProvider
+# AFLDataProvider
 # ---------------------------------------------------------------------------
 
-class SportradarDataProvider:
-    """Fetches and normalises Sportradar AFL API data.
+class AFLDataProvider:
+    """
+    Fetches and normalises AFL Data Sports Group API data.
 
-    Uses the SportradarClient (handles rate-limiting / caching / quota) and
-    SportradarNormalizer to produce clean DataFrames.
+    Uses AFLDataClient (handles caching + retry) and AFLDataLoader
+    to produce clean DataFrames.
     """
 
     def __init__(self) -> None:
-        from app.data_ingestion.sportradar_client import SportradarClient
-        from app.data_ingestion.sportradar_normalizer import SportradarNormalizer
+        from app.data_ingestion.afl_data_loader import AFLDataLoader
+        self._loader = AFLDataLoader()
 
-        self._client = SportradarClient()
-        self._norm = SportradarNormalizer()
+    def get_fixtures(self) -> pd.DataFrame:
+        df = self._loader.fixtures_df.copy()
+        source = SOURCE_CACHE  # AFLDataLoader uses internal cache
+        return _stamp(df, source)
 
-    # ------------------------------------------------------------------
-    # High-level fetch methods
-    # ------------------------------------------------------------------
-
-    def get_seasons(self) -> pd.DataFrame:
-        competition_id = settings.sportradar_afl_competition_id
-        endpoint = f"competitions/{competition_id}/seasons.json"
-        data = self._client.get(endpoint, cache_ttl_seconds=86400)
-        rows = self._norm.normalize_seasons(data)
-        src = SOURCE_API if data.get("_source") == "api_live" else SOURCE_CACHE
-        return _stamp(pd.DataFrame(rows), src)
-
-    def get_schedule(self, season_id: str) -> pd.DataFrame:
-        endpoint = f"seasons/{season_id}/schedules.json"
-        data = self._client.get(endpoint, cache_ttl_seconds=settings.cache_ttl_upcoming_hours * 3600)
-        rows = self._norm.normalize_schedule(data)
-        src = SOURCE_API if data.get("_source") == "api_live" else SOURCE_CACHE
-        return _stamp(pd.DataFrame(rows), src)
-
-    def get_match_summary(self, sport_event_id: str) -> pd.DataFrame:
-        endpoint = f"sport_events/{sport_event_id}/summary.json"
-        data = self._client.get(endpoint, cache_ttl_seconds=settings.cache_ttl_results_hours * 3600)
-        rows = self._norm.normalize_match_summary(data)
-        src = SOURCE_API if data.get("_source") == "api_live" else SOURCE_CACHE
-        return _stamp(pd.DataFrame(rows) if rows else pd.DataFrame(), src)
+    def get_upcoming_fixtures(self) -> pd.DataFrame:
+        df = self._loader.load_upcoming_fixtures_df()
+        return _stamp(df, SOURCE_CACHE)
 
     def get_teams(self) -> pd.DataFrame:
-        competition_id = settings.sportradar_afl_competition_id
-        endpoint = f"competitions/{competition_id}/teams.json"
-        data = self._client.get(endpoint, cache_ttl_seconds=86400 * 7)
-        rows = self._norm.normalize_teams(data)
-        src = SOURCE_API if data.get("_source") == "api_live" else SOURCE_CACHE
-        return _stamp(pd.DataFrame(rows), src)
+        df = self._loader.teams_df.copy()
+        return _stamp(df, SOURCE_CACHE)
+
+    def get_team_stats(self) -> pd.DataFrame:
+        df = self._loader.team_stats_df.copy()
+        return _stamp(df, SOURCE_CACHE)
+
+    def get_player_stats(self) -> pd.DataFrame:
+        df = self._loader.player_stats_df.copy()
+        return _stamp(df, SOURCE_CACHE)
+
+    def get_players(self) -> pd.DataFrame:
+        df = self._loader.players_df.copy()
+        return _stamp(df, SOURCE_CACHE)
 
     def is_available(self) -> bool:
-        return self._client.is_configured()
+        return self._loader._client.is_configured()
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +87,8 @@ class SportradarDataProvider:
 class DataSourceStatus:
     mode: str
     effective_mode: str
-    sportradar_configured: bool
-    sportradar_available: bool
+    afl_data_configured: bool
+    afl_data_available: bool
     quota_status: Optional[Dict[str, Any]] = None
 
 
@@ -108,33 +97,32 @@ class DataSourceStatus:
 # ---------------------------------------------------------------------------
 
 class DataSourceManager:
-    """Orchestrates the 2-tier live data source hierarchy.
+    """Orchestrates the live AFL Data Sports Group data source.
 
     Priority (based on ``settings.effective_data_mode``):
-      1. ``live``   — fetch from Sportradar API (uses cache, respects TTL)
-      2. ``cache``  — only use cached Sportradar responses
+      1. ``live``   — fetch from AFL Data API (uses cache, respects TTL)
+      2. ``cache``  — only use cached responses
 
-    If the requested source is unavailable → raises a clear RuntimeError.
+    If the data source is unavailable → raises a clear RuntimeError.
     There is no demo or CSV fallback. Ever.
     """
 
     def __init__(self) -> None:
-        self._sportradar: Optional[SportradarDataProvider] = None
-        if settings.is_sportradar_configured:
+        self._provider: Optional[AFLDataProvider] = None
+        if settings.is_afl_data_configured:
             try:
-                self._sportradar = SportradarDataProvider()
+                self._provider = AFLDataProvider()
             except Exception as exc:
-                logger.error("Could not initialise SportradarDataProvider: {}", exc)
+                logger.error("Could not initialise AFLDataProvider: {}", exc)
                 raise RuntimeError(
-                    f"Sportradar data provider failed to initialise: {exc}\n"
-                    "Check your SPORTRADAR_API_KEY and SPORTRADAR_BASE_URL settings."
+                    f"AFL Data provider failed to initialise: {exc}\n"
+                    "Check your AFL_DATA_AUTHKEY setting in .env."
                 ) from exc
         else:
             raise RuntimeError(
-                "SPORTRADAR_API_KEY is not configured. "
-                "Live predictions require a valid Sportradar API key.\n"
-                "Add SPORTRADAR_API_KEY=<your_key> to your .env file.\n"
-                "Get a key at https://developer.sportradar.com/"
+                "AFL_DATA_AUTHKEY is not configured. "
+                "Live predictions require a valid AFL Data Sports Group API key.\n"
+                "Add AFL_DATA_AUTHKEY=<your_key> to your .env file."
             )
 
     # ------------------------------------------------------------------
@@ -142,20 +130,11 @@ class DataSourceManager:
     # ------------------------------------------------------------------
 
     def get_status(self) -> DataSourceStatus:
-        quota = None
-        if self._sportradar is not None:
-            try:
-                from app.data_ingestion.quota_manager import QuotaManager
-                quota = QuotaManager().get_status()
-            except Exception:
-                pass
-
         return DataSourceStatus(
             mode=settings.data_mode,
             effective_mode=settings.effective_data_mode,
-            sportradar_configured=settings.is_sportradar_configured,
-            sportradar_available=self._sportradar is not None and self._sportradar.is_available(),
-            quota_status=quota,
+            afl_data_configured=settings.is_afl_data_configured,
+            afl_data_available=self._provider is not None and self._provider.is_available(),
         )
 
     # ------------------------------------------------------------------
@@ -163,43 +142,22 @@ class DataSourceManager:
     # ------------------------------------------------------------------
 
     def get_upcoming_fixtures(self, season_id: Optional[str] = None) -> pd.DataFrame:
-        """Return upcoming fixtures for the current season from Sportradar."""
-        sid = season_id or settings.sportradar_afl_season_id
-        if not sid:
-            raise RuntimeError(
-                "SPORTRADAR_AFL_SEASON_ID is not configured. "
-                "Set it in your .env file to fetch upcoming fixtures.\n"
-                "Find the current season ID via the Sportradar seasons endpoint."
-            )
-
+        """Return upcoming fixtures from AFL Data Sports Group API."""
         try:
-            df = self._sportradar.get_schedule(sid)
+            df = self._provider.get_upcoming_fixtures()
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch schedule for season {sid} from Sportradar: {exc}\n"
-                "Check API connectivity, API key, and season ID."
+                f"Failed to fetch upcoming fixtures from AFL Data API: {exc}\n"
+                "Check AFL_DATA_AUTHKEY and network connectivity."
             ) from exc
 
         if df.empty:
             raise RuntimeError(
-                f"Sportradar returned an empty schedule for season {sid}. "
-                "The season may be over, or the season ID may be incorrect.\n"
-                "Verify SPORTRADAR_AFL_SEASON_ID in your .env file."
+                "AFL Data API returned an empty fixture list. "
+                "The season may not have started yet, or the competition ID may be wrong.\n"
+                f"Current AFL_DATA_COMPETITION_ID={settings.afl_data_competition_id}"
             )
-
-        if "status" in df.columns:
-            upcoming = df[df["status"].isin(["not_started", "upcoming"])]
-            if not upcoming.empty:
-                logger.info("Loaded {} upcoming fixtures from Sportradar", len(upcoming))
-                return upcoming
-            # If no "upcoming" rows, return full schedule with a warning
-            logger.warning(
-                "No fixtures with status 'not_started'/'upcoming' in season {}. "
-                "Returning full schedule ({} rows) — check if season is active.",
-                sid, len(df),
-            )
-
-        logger.info("Loaded {} fixtures from Sportradar (season={})", len(df), sid)
+        logger.info("Loaded {} upcoming fixtures from AFL Data API", len(df))
         return df
 
     def get_completed_fixtures(
@@ -207,36 +165,20 @@ class DataSourceManager:
         season_id: Optional[str] = None,
         lookback_days: int = 30,
     ) -> pd.DataFrame:
-        """Return recently completed fixtures from Sportradar."""
-        sid = season_id or settings.sportradar_afl_season_id
-        if not sid:
-            raise RuntimeError(
-                "SPORTRADAR_AFL_SEASON_ID is not configured. "
-                "Set it in your .env file."
-            )
-
+        """Return recently completed fixtures."""
         try:
-            df = self._sportradar.get_schedule(sid)
+            df = self._provider.get_fixtures()
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch completed fixtures for season {sid}: {exc}"
+                f"Failed to fetch completed fixtures from AFL Data API: {exc}"
             ) from exc
 
         if df.empty:
             return df
 
         if "status" in df.columns:
-            return df[df["status"].isin(["closed", "completed", "ended"])]
+            return df[df["status"].isin(["completed"])].copy()
         return df
-
-    def get_match_summary(self, sport_event_id: str) -> pd.DataFrame:
-        """Return detailed match summary for one fixture from Sportradar."""
-        try:
-            return self._sportradar.get_match_summary(sport_event_id)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to fetch match summary for {sport_event_id}: {exc}"
-            ) from exc
 
     # ------------------------------------------------------------------
     # Teams / players
@@ -244,72 +186,41 @@ class DataSourceManager:
 
     def get_teams(self) -> pd.DataFrame:
         try:
-            df = self._sportradar.get_teams()
+            df = self._provider.get_teams()
             if not df.empty:
                 return df
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch teams from Sportradar: {exc}\n"
-                "Check API key and connectivity."
+                f"Failed to fetch teams from AFL Data API: {exc}"
             ) from exc
-
-        raise RuntimeError(
-            "Sportradar returned an empty teams response. "
-            "Check your competition ID and API plan permissions."
-        )
+        raise RuntimeError("AFL Data API returned an empty teams response.")
 
     def get_players(self) -> pd.DataFrame:
-        """
-        Player roster data.
-
-        The Sportradar trial plan does not expose individual player roster
-        endpoints. If the live API supports it, it will be returned; otherwise
-        an empty DataFrame is returned and player-props markets are disabled.
-        """
-        logger.warning(
-            "Player roster endpoint not available via Sportradar trial plan. "
-            "Player-prop markets will be disabled."
-        )
-        return pd.DataFrame()
-
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
+        try:
+            return self._provider.get_players()
+        except Exception as exc:
+            logger.warning("get_players failed: {} — returning empty DataFrame", exc)
+            return pd.DataFrame()
 
     def get_player_stats(self) -> pd.DataFrame:
-        """
-        Player statistics.
-
-        These must come from live match summaries fetched via Sportradar.
-        If not available → returns empty DataFrame (player markets disabled).
-        """
-        logger.warning(
-            "Player stats not available from Sportradar trial plan. "
-            "Player-prop markets will be disabled for this session."
-        )
-        return pd.DataFrame()
+        try:
+            return self._provider.get_player_stats()
+        except Exception as exc:
+            logger.warning("get_player_stats failed: {} — player markets disabled", exc)
+            return pd.DataFrame()
 
     def get_team_stats(self) -> pd.DataFrame:
-        """
-        Team statistics derived from completed match summaries.
-        """
-        logger.warning(
-            "Direct team stats endpoint not available via current plan. "
-            "Team stats will be derived from match summaries."
-        )
-        return pd.DataFrame()
+        try:
+            return self._provider.get_team_stats()
+        except Exception as exc:
+            logger.warning("get_team_stats failed: {}", exc)
+            return pd.DataFrame()
 
     def get_odds(self) -> pd.DataFrame:
-        """
-        Live bookmaker odds from The Odds API.
-
-        Returns empty DataFrame if ODDS_API_KEY is not configured —
-        head-to-head legs will use Elo-derived probabilities only.
-        """
+        """Live bookmaker odds from The Odds API."""
         if not settings.is_odds_api_configured:
             logger.warning(
-                "ODDS_API_KEY not configured — live odds unavailable. "
-                "Edge calculations will use model probability only."
+                "ODDS_API_KEY not configured — live odds unavailable."
             )
             return pd.DataFrame()
         try:

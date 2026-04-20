@@ -59,9 +59,9 @@ async def system_status():
     status: Dict[str, Any] = {
         "timestamp": datetime.utcnow().isoformat(),
         "data_mode": settings.effective_data_mode,
-        "sportradar": {
-            "configured": settings.is_sportradar_configured,
-            "season_id": settings.sportradar_afl_season_id or None,
+        "afl_data": {
+            "configured": settings.is_afl_data_configured,
+            "competition_id": settings.afl_data_competition_id,
         },
         "odds_api": {
             "configured": settings.is_odds_api_configured,
@@ -71,15 +71,23 @@ async def system_status():
     }
 
     # Determine supported markets based on what's configured
-    if settings.is_sportradar_configured:
+    if settings.is_afl_data_configured:
         status["supported_markets"].append({
             "market": "head_to_head",
-            "reason": "Sportradar fixtures available",
+            "reason": "AFL Data Sports Group API fixtures available",
+        })
+        status["supported_markets"].append({
+            "market": "player_disposals",
+            "reason": "AFL Advanced Pack player stats available",
         })
     else:
         status["disabled_markets"].append({
             "market": "head_to_head",
-            "reason": "SPORTRADAR_API_KEY not configured",
+            "reason": "AFL_DATA_AUTHKEY not configured",
+        })
+        status["disabled_markets"].append({
+            "market": "player_disposals",
+            "reason": "AFL_DATA_AUTHKEY not configured",
         })
 
     if settings.is_odds_api_configured:
@@ -92,21 +100,6 @@ async def system_status():
             "market": "bookmaker_odds",
             "reason": "ODDS_API_KEY not configured — edge vs market unavailable",
         })
-
-    # Player props always disabled with trial Sportradar plan
-    status["disabled_markets"].append({
-        "market": "player_disposals",
-        "reason": "Player roster/stats endpoints not available on Sportradar trial plan",
-    })
-
-    # Quota info
-    if settings.is_sportradar_configured:
-        try:
-            from app.data_ingestion.quota_manager import QuotaManager
-            quota = QuotaManager().get_status()
-            status["sportradar"]["quota"] = quota
-        except Exception:
-            pass
 
     if settings.is_odds_api_configured:
         try:
@@ -153,7 +146,7 @@ async def run_pipeline(request: PipelineRunRequest = None):
 
     Runs preflight validation first — fails immediately if required data
     sources are unavailable. Generates candidate legs and multis for
-    upcoming fixtures using live Sportradar + Odds API data only.
+    upcoming fixtures using live AFL Data Sports Group API + Odds API data only.
     """
     global _last_pipeline_result
     logger.info("API: Running prediction pipeline...")
@@ -355,7 +348,7 @@ async def get_training_report():
 
 @router.post("/sync/upcoming", response_model=Dict, tags=["Sync"])
 async def sync_upcoming(lookahead_days: int = 14):
-    """Pull upcoming fixtures from Sportradar and upsert to DB."""
+    """Pull upcoming fixtures from AFL Data Sports Group API and upsert to DB."""
     try:
         from app.services.sync import SyncService
         svc = SyncService()
@@ -407,23 +400,13 @@ async def run_bootstrap(force_retrain: bool = False, background_tasks: Backgroun
 
 @router.get("/quota/status", response_model=Dict, tags=["Quota"])
 async def quota_status():
-    """Return Sportradar API quota usage."""
-    if not settings.is_sportradar_configured:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "SPORTRADAR_NOT_CONFIGURED",
-                "message": "SPORTRADAR_API_KEY is not set. Live predictions require a Sportradar API key.",
-                "fix": "Add SPORTRADAR_API_KEY=<your_key> to your .env file.",
-            },
-        )
-    try:
-        from app.data_ingestion.quota_manager import QuotaManager
-        qm = QuotaManager()
-        return {"configured": True, **qm.get_status()}
-    except Exception as exc:
-        logger.exception("quota/status error: {}", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+    """Return AFL Data API status (unlimited calls — no quota)."""
+    return {
+        "configured": settings.is_afl_data_configured,
+        "provider": "AFL Data Sports Group",
+        "call_rate": "unlimited",
+        "message": "AFL Data Sports Group API has unlimited call rate — no quota tracking needed.",
+    }
 
 
 @router.get("/reports/bootstrap", response_model=Dict, tags=["Reports"])
