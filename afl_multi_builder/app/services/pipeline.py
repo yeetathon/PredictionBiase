@@ -190,7 +190,7 @@ class PredictionPipeline:
 
         # ── Stage 5: Rank legs — strict quality gates ──────────────────────
         logger.info(f"[{self.run_id}] Stage 5/7: Applying quality gates to {len(all_legs)} legs...")
-        quality_legs = self.leg_ranker.rank(all_legs, log_rejections=True)
+        quality_legs, rejection_log = self.leg_ranker.rank(all_legs, log_rejections=True)
         value_legs = quality_legs[:10]
         safe_legs = sorted(quality_legs, key=lambda l: l.calibrated_probability, reverse=True)[:10]
 
@@ -251,6 +251,25 @@ class PredictionPipeline:
 
         has_bets = bool(value_multis or safe_multis or same_game_multis)
 
+        # Summarise rejection log by reason
+        rejection_summary: Dict[str, int] = {}
+        for r in rejection_log:
+            rejection_summary[r.reason] = rejection_summary.get(r.reason, 0) + 1
+        rejection_details = [
+            {
+                "leg_id": r.leg_id,
+                "selection": r.selection,
+                "reason": r.reason,
+                "detail": r.detail,
+                "ev": round(r.ev, 4),
+                "edge": round(r.edge, 4),
+                "confidence_score": round(r.confidence_score, 1),
+                "signal_agreement": round(r.signal_agreement, 3),
+                "prediction_variance": round(r.prediction_variance, 5),
+            }
+            for r in rejection_log
+        ]
+
         return {
             "run_id": self.run_id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -259,6 +278,7 @@ class PredictionPipeline:
             "n_fixtures": len(upcoming),
             "n_candidate_legs": len(all_legs),
             "n_quality_legs": len(quality_legs),
+            "n_rejected_legs": len(rejection_log),
             "n_skipped_fixtures": len(skipped_fixtures),
             "elapsed_seconds": round(elapsed, 2),
             "has_bets": has_bets,
@@ -277,8 +297,11 @@ class PredictionPipeline:
                 "features_built": len(team_features),
                 "legs_generated": len(all_legs),
                 "legs_passed_quality_gate": len(quality_legs),
+                "legs_rejected": len(rejection_log),
+                "rejection_reasons": rejection_summary,
                 "multis_built": len(value_multis) + len(safe_multis) + len(same_game_multis),
             },
+            "rejection_log": rejection_details,
             "value_legs": [self._leg_to_dict(l, legs_meta) for l in value_legs],
             "safe_legs": [self._leg_to_dict(l, legs_meta) for l in safe_legs],
             "value_multis": [self._multi_to_dict(m, leg_dict_lookup) for m in value_multis],
@@ -474,12 +497,14 @@ class PredictionPipeline:
         )
 
         # ── Step 4: Blend ML + signal consensus ───────────────────────────
-        # Weighted blend: 50% ML ensemble (non-linear, trained) + 50% signal consensus
-        # When signal agreement is high, trust the consensus more.
-        # When signals disagree, blend more toward ML (it has the full feature set).
+        # Weighted blend: 50-60% ML ensemble + 40-50% signal consensus.
+        # Lean toward ML when signals disagree OR data is thin.
+        # Both signal_agreement AND data_completeness must be high to trust the consensus.
         agree_weight = float(np.clip(home_sig.signal_agreement, 0.0, 1.0))
-        ml_weight = 0.5 + (1.0 - agree_weight) * 0.2   # 0.50–0.70
-        sig_weight = 1.0 - ml_weight                    # 0.50–0.30
+        data_quality = float(np.clip(home_sig.data_completeness, 0.0, 1.0))
+        signal_quality = agree_weight * data_quality    # requires both to be high
+        ml_weight = 0.60 - signal_quality * 0.20        # 0.40–0.60
+        sig_weight = 1.0 - ml_weight                    # 0.60–0.40
 
         ml_home_prob_clipped = float(np.clip(ml_home_prob, 0.02, 0.98))
         home_consensus = float(np.clip(home_sig.consensus_probability, 0.02, 0.98))
@@ -587,6 +612,8 @@ class PredictionPipeline:
                 prediction_variance=sig_result.prediction_variance,
                 data_completeness=sig_result.data_completeness,
                 n_active_signals=sig_result.n_active_signals,
+                prediction_low=sig_result.prediction_low,
+                prediction_high=sig_result.prediction_high,
             ))
             meta[leg_id] = {
                 "selection_label": _make_selection_label(selection, team_name=team_name),
@@ -876,6 +903,9 @@ class PredictionPipeline:
             "prediction_variance": round(leg.prediction_variance, 5),
             "data_completeness": round(leg.data_completeness, 3),
             "n_active_signals": leg.n_active_signals,
+            "prediction_low": round(leg.prediction_low, 4),
+            "prediction_high": round(leg.prediction_high, 4),
+            "prediction_interval_width": round(leg.prediction_high - leg.prediction_low, 4),
 
             # Explanation
             "explanation": leg.explanation,
@@ -910,6 +940,8 @@ class PredictionPipeline:
             "raw_probability": round(getattr(multi, "raw_probability", multi.adjusted_probability), 4),
             "adjusted_probability": round(multi.adjusted_probability, 4),
             "ev": round(multi.ev, 4),
+            "objective_score": round(getattr(multi, "objective_score", 0.0), 4),
+            "volatility_score": round(getattr(multi, "volatility_score", 0.0), 4),
             "correlation_score": round(multi.correlation_score, 3),
             "correlation_label": multi.correlation_label,
             "risk_score": round(multi.risk_score, 1),

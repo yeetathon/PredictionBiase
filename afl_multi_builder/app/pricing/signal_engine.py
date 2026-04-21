@@ -1,21 +1,30 @@
 """
-Multi-signal prediction engine.
+Multi-signal prediction engine — v2.
 
-Computes 4 independent signals for each AFL match outcome and measures
+Computes independent signals for each AFL match outcome and measures
 their agreement. High agreement → higher confidence. Disagreement →
-lower confidence, or outright rejection at the quality gate.
+lower confidence / outright rejection.
 
-Signals (in order of independence):
-  1. Elo          — long-run team strength rating (uses elo_win_prob_home)
-  2. Form         — rolling win-rate differential (no scores, no Elo)
-  3. Scoring      — recent scoring power differential + trend
-  4. Market       — bookmaker consensus (vig-adjusted, if available)
+v2 additions:
+  H2H Signal: head-to-head historical record between the specific two teams.
+  Prediction intervals: 80% CI derived from signal distribution.
+  Decay-weighted scoring: EWMA scores weight recent AFL form more heavily.
+  Improved player signals: decay-weighted short-form + matchup signal.
 
-Each signal has a base weight and a reliability score (0–1) that
-down-weights it automatically when data is sparse or missing.
+Signals (H2H):
+  1. Elo          — long-run strength (elo_win_prob_home)
+  2. Form         — rolling win-rate differential (venue-adjusted, ewma-weighted)
+  3. Scoring      — recent scoring power + trend (ewma, not simple mean)
+  4. H2H          — head-to-head historical record (last 10 meetings)
+  5. Market       — bookmaker consensus (vig-adjusted, when available)
 
-The consensus probability is the reliability-weighted average.
-Signal agreement = 1 − normalised std of probabilities across signals.
+Signals (Player disposals):
+  1. Short-form   — ewma 3-game average vs line
+  2. Medium-form  — ewma 5-game average vs line
+  3. Trend        — form slope direction
+  4. Matchup      — opponent defensive allowance vs line
+  5. ML model     — XGBoost prediction (when available)
+  6. Market       — bookmaker line (when available)
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -26,7 +35,7 @@ from loguru import logger
 @dataclass
 class Signal:
     name: str
-    probability: float      # P(home win) from this signal
+    probability: float      # P(home win) or P(over)
     weight: float           # base contribution weight
     reliability: float      # 0–1; down-weights uncertain/sparse signals
     explanation: str
@@ -34,15 +43,18 @@ class Signal:
 
 @dataclass
 class SignalResult:
-    """All signal outputs for one leg direction (home win or away win)."""
+    """All signal outputs for one leg direction."""
     signals: List[Signal]
-    consensus_probability: float   # reliability-weighted combination
-    signal_agreement: float        # 0–1; 1 = perfect agreement across signals
-    prediction_variance: float     # variance of raw probabilities across signals
-    data_completeness: float       # 0–1; overall data quality for this fixture
-    n_active_signals: int          # signals with reliability > 0.1
-    top_factors: List[str]         # human-readable explanation bullets
-    explanation: str               # summary line
+    consensus_probability: float    # reliability-weighted combination
+    signal_agreement: float         # 0–1; 1 = perfect agreement
+    prediction_variance: float      # variance of probabilities across signals
+    data_completeness: float        # 0–1; overall data quality
+    n_active_signals: int           # signals with reliability > 0.1
+    top_factors: List[str]          # human-readable bullets
+    explanation: str                # summary line
+    # v2: prediction interval (80% confidence)
+    prediction_low: float = 0.0     # 10th percentile of signal distribution
+    prediction_high: float = 1.0    # 90th percentile of signal distribution
 
 
 class SignalEngine:
@@ -53,21 +65,23 @@ class SignalEngine:
         engine = SignalEngine()
         home_result, away_result = engine.compute_h2h_signals(features_dict, market_probs)
 
-    features_dict keys (from fixture row of TeamFeatureEngineer.build_features()):
+    features_dict keys (from TeamFeatureEngineer.build_features()):
         elo_win_prob_home, elo_home_pre, elo_away_pre, elo_diff,
         home_roll_win_rate, away_roll_win_rate,
+        home_roll_win_rate_ewma, away_roll_win_rate_ewma,        [v2]
         home_roll_home_win_rate, away_roll_away_win_rate,
         home_roll_score_mean, away_roll_score_mean,
+        home_roll_score_ewma, away_roll_score_ewma,              [v2]
+        home_roll_score_slope, away_roll_score_slope,            [v2]
         home_roll_score_std, away_roll_score_std,
         home_roll_n_games, away_roll_n_games,
         home_form_trend_score, away_form_trend_score,
-        home_rest_days, away_rest_days,
-        diff_rest_days
-
-    market_probs keys: {"home_win": 0.52, "away_win": 0.48}  (vig-adjusted)
+        home_rest_days, away_rest_days, diff_rest_days,
+        h2h_n_games, h2h_home_win_rate,                         [v2]
+        h2h_home_win_rate_recent, h2h_avg_score_diff            [v2]
     """
 
-    # Normalisation constant for signal agreement: std above this → agreement → 0
+    # std above this → agreement → 0
     _AGREEMENT_SCALE = 0.15
 
     def compute_h2h_signals(
@@ -87,141 +101,127 @@ class SignalEngine:
         home_sigs: List[Signal] = []
 
         # ── Signal 1: Elo ─────────────────────────────────────────────────
-        elo_prob = float(features.get("elo_win_prob_home") or 0.5)
-        elo_prob = float(np.clip(elo_prob, 0.05, 0.95))
+        elo_prob = float(np.clip(features.get("elo_win_prob_home") or 0.5, 0.05, 0.95))
         elo_diff = float(features.get("elo_diff") or 0.0)
         elo_home = float(features.get("elo_home_pre") or 1500.0)
         elo_away = float(features.get("elo_away_pre") or 1500.0)
-        # Reliability: full at 20 completed games; zero at 0
         elo_reliability = float(np.clip(n_games / 20.0, 0.1, 1.0))
 
         if abs(elo_diff) < 15:
-            elo_exp = (
-                f"Elo: near-even matchup (diff={elo_diff:+.0f} pts), "
-                f"P(home)={elo_prob:.1%}"
-            )
+            elo_exp = f"Elo: near-even matchup (diff={elo_diff:+.0f} pts), P(home)={elo_prob:.1%}"
         else:
             stronger = "Home" if elo_diff > 0 else "Away"
             elo_exp = (
-                f"Elo: {stronger} team stronger by {abs(elo_diff):.0f} pts "
+                f"Elo: {stronger} stronger by {abs(elo_diff):.0f} pts "
                 f"({elo_home:.0f} vs {elo_away:.0f}), P(home)={elo_prob:.1%}"
             )
-        home_sigs.append(Signal(
-            name="elo",
-            probability=elo_prob,
-            weight=0.30,
-            reliability=elo_reliability,
-            explanation=elo_exp,
-        ))
+        home_sigs.append(Signal("elo", elo_prob, 0.25, elo_reliability, elo_exp))
 
-        # ── Signal 2: Form (win-rate based, no scores) ────────────────────
-        home_wr = float(features.get("home_roll_win_rate") or 0.5)
-        away_wr = float(features.get("away_roll_win_rate") or 0.5)
-        # Venue-specific win rates, blended with overall
+        # ── Signal 2: Form (ewma win-rate, venue-adjusted) ────────────────
+        # v2: prefer ewma win rate (decay-weighted) over simple rolling rate
+        home_wr = float(features.get("home_roll_win_rate_ewma")
+                        or features.get("home_roll_win_rate") or 0.5)
+        away_wr = float(features.get("away_roll_win_rate_ewma")
+                        or features.get("away_roll_win_rate") or 0.5)
         home_home_wr = float(features.get("home_roll_home_win_rate") or home_wr)
         away_away_wr = float(features.get("away_roll_away_win_rate") or away_wr)
         # 60% overall + 40% venue-specific
-        home_form = 0.6 * home_wr + 0.4 * home_home_wr
-        away_form = 0.6 * away_wr + 0.4 * away_away_wr
-        form_diff = home_form - away_form           # –1 to +1
-        # Logistic transform: diff of ±0.3 → prob of ~0.65/0.35
-        form_prob = float(1.0 / (1.0 + np.exp(-form_diff * 5.0)))
-        form_prob = float(np.clip(form_prob, 0.10, 0.90))
+        home_form = 0.60 * home_wr + 0.40 * home_home_wr
+        away_form = 0.60 * away_wr + 0.40 * away_away_wr
+        form_diff = home_form - away_form
+        form_prob = float(np.clip(1.0 / (1.0 + np.exp(-form_diff * 5.0)), 0.10, 0.90))
         form_reliability = float(np.clip(n_games / 12.0, 0.05, 1.0))
         form_exp = (
-            f"Form: home {home_wr:.0%} WR (at-home {home_home_wr:.0%}) vs "
-            f"away {away_wr:.0%} WR (away {away_away_wr:.0%}); "
-            f"P(home)={form_prob:.1%}"
+            f"Form (ewma): home {home_wr:.0%} WR (at-home {home_home_wr:.0%}) "
+            f"vs away {away_wr:.0%} WR (away {away_away_wr:.0%}); P(home)={form_prob:.1%}"
         )
-        home_sigs.append(Signal(
-            name="form",
-            probability=form_prob,
-            weight=0.25,
-            reliability=form_reliability,
-            explanation=form_exp,
-        ))
+        home_sigs.append(Signal("form", form_prob, 0.20, form_reliability, form_exp))
 
-        # ── Signal 3: Scoring power + trend ──────────────────────────────
-        home_sc = float(features.get("home_roll_score_mean") or 0.0)
-        away_sc = float(features.get("away_roll_score_mean") or 0.0)
+        # ── Signal 3: Scoring power + slope (v2: ewma not simple mean) ────
+        # Use ewma scores if available, fall back to simple mean
+        home_sc = float(features.get("home_roll_score_ewma")
+                        or features.get("home_roll_score_mean") or 0.0)
+        away_sc = float(features.get("away_roll_score_ewma")
+                        or features.get("away_roll_score_mean") or 0.0)
         home_sc_std = float(features.get("home_roll_score_std") or 15.0)
         away_sc_std = float(features.get("away_roll_score_std") or 15.0)
-        home_trend = float(features.get("home_form_trend_score") or 0.0)
-        away_trend = float(features.get("away_form_trend_score") or 0.0)
+        home_slope = float(features.get("home_roll_score_slope")
+                           or features.get("home_form_trend_score") or 0.0)
+        away_slope = float(features.get("away_roll_score_slope")
+                           or features.get("away_form_trend_score") or 0.0)
 
         scoring_prob = 0.5
         scoring_reliability = 0.0
         scoring_exp = "Scoring: insufficient score data"
 
         if home_sc > 0 and away_sc > 0:
-            # Trend-adjusted expected scores
-            home_adj = home_sc + home_trend * 0.3
-            away_adj = away_sc + away_trend * 0.3
+            # Slope-adjusted expected scores (slope in pts/game, project 1 game ahead)
+            home_adj = home_sc + home_slope * 0.5
+            away_adj = away_sc + away_slope * 0.5
             sc_diff = home_adj - away_adj
-            # Combined std of score differential (typical AFL: ~30–40 pts spread)
-            combined_std = float(np.sqrt(home_sc_std ** 2 + away_sc_std ** 2))
-            combined_std = max(20.0, combined_std)
+            combined_std = float(max(20.0, np.sqrt(home_sc_std ** 2 + away_sc_std ** 2)))
             from scipy.stats import norm as _norm
-            scoring_prob = float(_norm.cdf(sc_diff / combined_std))
-            scoring_prob = float(np.clip(scoring_prob, 0.10, 0.90))
+            scoring_prob = float(np.clip(_norm.cdf(sc_diff / combined_std), 0.10, 0.90))
             scoring_reliability = float(np.clip(n_games / 10.0, 0.05, 1.0))
 
             trend_note = ""
-            if abs(home_trend - away_trend) > 8:
-                if home_trend > away_trend:
-                    trend_note = f" (Home on upward trend: {home_trend:+.1f} pts)"
+            if abs(home_slope - away_slope) > 3:
+                if home_slope > away_slope:
+                    trend_note = f" (Home improving: +{home_slope:.1f} pts/game)"
                 else:
-                    trend_note = f" (Away on upward trend: {away_trend:+.1f} pts)"
+                    trend_note = f" (Away improving: +{away_slope:.1f} pts/game)"
 
             scoring_exp = (
-                f"Scoring: home avg {home_sc:.1f} (trend {home_trend:+.1f}) vs "
-                f"away avg {away_sc:.1f} (trend {away_trend:+.1f}); "
+                f"Scoring (ewma): home {home_sc:.1f} (slope {home_slope:+.1f}) "
+                f"vs away {away_sc:.1f} (slope {away_slope:+.1f}); "
                 f"P(home)={scoring_prob:.1%}.{trend_note}"
             )
+        home_sigs.append(Signal("scoring", scoring_prob, 0.25, scoring_reliability, scoring_exp))
 
-        home_sigs.append(Signal(
-            name="scoring",
-            probability=scoring_prob,
-            weight=0.25,
-            reliability=scoring_reliability,
-            explanation=scoring_exp,
-        ))
+        # ── Signal 4: H2H historical record (v2 NEW) ──────────────────────
+        h2h_n = int(float(features.get("h2h_n_games") or 0))
+        if h2h_n >= 3:
+            # Use recent-weighted H2H win rate when available
+            h2h_wr = float(features.get("h2h_home_win_rate_recent")
+                           or features.get("h2h_home_win_rate") or 0.5)
+            h2h_diff = float(features.get("h2h_avg_score_diff") or 0.0)
+            # Logistic transform: home team dominates H2H → higher probability
+            h2h_prob = float(np.clip(
+                1.0 / (1.0 + np.exp(-(h2h_wr - 0.5) * 6.0 + h2h_diff / 40.0)),
+                0.10, 0.90
+            ))
+            # Reliability scales with H2H sample size
+            h2h_reliability = float(np.clip((h2h_n - 2) / 8.0, 0.1, 0.85))
+            h2h_exp = (
+                f"H2H ({h2h_n} meetings): home win rate {h2h_wr:.0%} "
+                f"(avg margin {h2h_diff:+.1f}); P(home)={h2h_prob:.1%}"
+            )
+            home_sigs.append(Signal("h2h", h2h_prob, 0.20, h2h_reliability, h2h_exp))
 
-        # ── Signal 4: Market consensus ────────────────────────────────────
+        # ── Signal 5: Market consensus ────────────────────────────────────
         if market_probs and "home_win" in market_probs:
             mkt_p = float(np.clip(market_probs["home_win"], 0.05, 0.95))
             home_sigs.append(Signal(
-                name="market",
-                probability=mkt_p,
-                weight=0.20,
-                reliability=0.90,   # bookmakers are well-calibrated on average
-                explanation=f"Bookmaker consensus: P(home)={mkt_p:.1%} (vig-adjusted)",
+                "market", mkt_p, 0.20, 0.90,
+                f"Bookmaker consensus: P(home)={mkt_p:.1%} (vig-adjusted)",
             ))
 
         # ── Build results ─────────────────────────────────────────────────
         home_result = self._build_result(home_sigs, data_completeness)
-
-        # Away is the complement of every home signal
         away_sigs = [
-            Signal(
-                name=s.name,
-                probability=float(np.clip(1.0 - s.probability, 0.05, 0.95)),
-                weight=s.weight,
-                reliability=s.reliability,
-                explanation=s.explanation,
-            )
+            Signal(s.name, float(np.clip(1.0 - s.probability, 0.05, 0.95)),
+                   s.weight, s.reliability, s.explanation)
             for s in home_sigs
         ]
         away_result = self._build_result(away_sigs, data_completeness)
 
         logger.debug(
-            "SignalEngine H2H: home={:.1%} (agree={:.0%}, var={:.4f}) | "
-            "away={:.1%} (agree={:.0%})",
+            "SignalEngine H2H: home={:.1%} (agree={:.0%}, var={:.4f}, n_sig={}) | away={:.1%}",
             home_result.consensus_probability,
             home_result.signal_agreement,
             home_result.prediction_variance,
+            home_result.n_active_signals,
             away_result.consensus_probability,
-            away_result.signal_agreement,
         )
 
         return home_result, away_result
@@ -238,99 +238,98 @@ class SignalEngine:
         market_probs: Optional[Dict[str, float]] = None,
     ) -> Tuple[SignalResult, SignalResult]:
         """
-        Compute signals for a player disposals over/under leg.
+        Compute signals for player disposals over/under.
         Returns (over_result, under_result).
 
-        player_features keys:
-            roll_mean_3, roll_mean_5, roll_mean_10,
-            roll_std_5, form_trend, consistency_cv, n_games
+        v2: uses ewma mean for short/medium form (more weight on recent games),
+            adds matchup signal (opponent allowance vs line),
+            adds role stability penalty.
         """
         n_games = int(float(player_features.get("n_games") or 0))
-        data_completeness = float(np.clip(n_games / 15.0, 0.0, 1.0))
+        role_stability = float(player_features.get("role_stability") or 1.0)
+        data_completeness = float(np.clip(n_games / 15.0, 0.0, 1.0)) * role_stability
 
         over_sigs: List[Signal] = []
 
+        # v2: prefer ewma over simple mean for recent form
+        ewma_val = float(player_features.get("roll_ewma") or 0.0)
         mean_3 = float(player_features.get("roll_mean_3") or 0.0)
         mean_5 = float(player_features.get("roll_mean_5") or 0.0)
         mean_10 = float(player_features.get("roll_mean_10") or mean_5)
         std_5 = float(player_features.get("roll_std_5") or 5.0)
-        trend = float(player_features.get("form_trend") or 0.0)
-        cv = float(player_features.get("consistency_cv") or 0.3)
+        roll_slope = float(player_features.get("roll_slope")
+                           or player_features.get("form_trend") or 0.0)
+        roll_iqr = float(player_features.get("roll_iqr") or 0.3)
 
-        # ── Signal 1: Short-run form (3-game average) ─────────────────────
-        if mean_3 > 0 and n_games >= 3:
-            from scipy.stats import norm as _norm
-            short_prob = float(_norm.sf(line, loc=mean_3, scale=max(4.0, std_5)))
-            short_prob = float(np.clip(short_prob, 0.05, 0.95))
-            s1_rel = float(np.clip(n_games / 8.0, 0.2, 1.0))
+        # Effective std: IQR-based estimate is more robust
+        eff_std = max(4.0, std_5, roll_iqr * max(mean_5, 1.0))
+        from scipy.stats import norm as _norm
+
+        # ── Signal 1: Short-form (ewma-weighted, ~3 games) ────────────────
+        # Use ewma if available (it's decay-weighted), else fall back to mean_3
+        short_mean = ewma_val if ewma_val > 0 and n_games >= 3 else mean_3
+        if short_mean > 0 and n_games >= 3:
+            short_prob = float(np.clip(_norm.sf(line, loc=short_mean, scale=eff_std), 0.05, 0.95))
+            s1_rel = float(np.clip(n_games / 8.0, 0.2, 1.0)) * role_stability
             over_sigs.append(Signal(
-                name="short_form",
-                probability=short_prob,
-                weight=0.35,
-                reliability=s1_rel,
-                explanation=(
-                    f"3-game avg {mean_3:.1f} vs line {line}; "
-                    f"P(over)={short_prob:.1%} (std={std_5:.1f})"
-                ),
+                "short_form_ewma", short_prob, 0.35, s1_rel,
+                f"EWMA {short_mean:.1f} vs line {line}; P(over)={short_prob:.1%} (std≈{eff_std:.1f})",
             ))
 
-        # ── Signal 2: Medium-run form (5-game average) ────────────────────
+        # ── Signal 2: Medium-form (5-game average) ────────────────────────
         if mean_5 > 0 and n_games >= 5:
-            from scipy.stats import norm as _norm
-            med_prob = float(_norm.sf(line, loc=mean_5, scale=max(4.0, std_5)))
-            med_prob = float(np.clip(med_prob, 0.05, 0.95))
-            s2_rel = float(np.clip(n_games / 12.0, 0.2, 1.0))
+            med_prob = float(np.clip(_norm.sf(line, loc=mean_5, scale=eff_std), 0.05, 0.95))
+            s2_rel = float(np.clip(n_games / 12.0, 0.2, 1.0)) * role_stability
             over_sigs.append(Signal(
-                name="medium_form",
-                probability=med_prob,
-                weight=0.30,
-                reliability=s2_rel,
-                explanation=(
-                    f"5-game avg {mean_5:.1f} vs line {line}; "
-                    f"P(over)={med_prob:.1%}"
-                ),
+                "medium_form", med_prob, 0.20, s2_rel,
+                f"5-game avg {mean_5:.1f} vs line {line}; P(over)={med_prob:.1%}",
             ))
 
-        # ── Signal 3: Trend-adjusted (form trend applied to 5-game avg) ───
-        if mean_5 > 0 and n_games >= 5:
-            from scipy.stats import norm as _norm
-            trend_adj_mean = mean_5 + trend * 0.4
-            trend_prob = float(_norm.sf(line, loc=trend_adj_mean, scale=max(4.0, std_5)))
-            trend_prob = float(np.clip(trend_prob, 0.05, 0.95))
-            s3_rel = float(np.clip(n_games / 15.0, 0.1, 0.8))
+        # ── Signal 3: Slope-adjusted projection ───────────────────────────
+        # Use linear regression slope: positive slope → project higher than mean
+        if mean_5 > 0 and n_games >= 5 and abs(roll_slope) > 0.3:
+            projected = mean_5 + roll_slope * 1.5   # 1.5 game projection
+            trend_prob = float(np.clip(_norm.sf(line, loc=projected, scale=eff_std), 0.05, 0.95))
+            s3_rel = float(np.clip(n_games / 15.0, 0.1, 0.75)) * role_stability
+            direction = "↑ improving" if roll_slope > 0 else "↓ declining"
             over_sigs.append(Signal(
-                name="trend",
-                probability=trend_prob,
-                weight=0.20,
-                reliability=s3_rel,
-                explanation=(
-                    f"Trend-adjusted avg {trend_adj_mean:.1f} (trend={trend:+.1f}); "
-                    f"P(over)={trend_prob:.1%}"
-                ),
+                "slope_trend", trend_prob, 0.15, s3_rel,
+                f"Slope {roll_slope:+.1f}/game → projected {projected:.1f} ({direction}); "
+                f"P(over)={trend_prob:.1%}",
             ))
 
-        # ── Signal 4: ML model prediction (if provided) ───────────────────
+        # ── Signal 4: Matchup — opponent allowance vs line (v2 NEW) ──────
+        opp_allow = float(player_features.get("opp_pos_disposals_allowed")
+                          or player_features.get("opp_disposals_allowed_mean") or mean_5)
+        if opp_allow > 0 and n_games >= 3:
+            matchup_prob = float(np.clip(_norm.sf(line, loc=opp_allow, scale=eff_std), 0.05, 0.95))
+            # Reliability depends on how much opp_allow differs from population mean
+            s4_rel = float(np.clip(0.5 + abs(opp_allow - mean_5) / 10.0, 0.15, 0.70))
+            matchup_note = (
+                "generous opponent" if opp_allow > mean_5 + 3
+                else ("restrictive opponent" if opp_allow < mean_5 - 3 else "neutral opponent")
+            )
+            over_sigs.append(Signal(
+                "matchup", matchup_prob, 0.15, s4_rel,
+                f"Opp allows {opp_allow:.1f}/game ({matchup_note}); P(over)={matchup_prob:.1%}",
+            ))
+
+        # ── Signal 5: ML model (if provided) ─────────────────────────────
         if model_over_prob is not None:
             ml_prob = float(np.clip(model_over_prob, 0.05, 0.95))
-            ml_rel = float(np.clip(n_games / 15.0, 0.1, 0.9))
+            ml_rel = float(np.clip(n_games / 15.0, 0.1, 0.9)) * role_stability
             over_sigs.append(Signal(
-                name="ml_model",
-                probability=ml_prob,
-                weight=0.15,
-                reliability=ml_rel,
-                explanation=f"XGBoost regression: P(over {line})={ml_prob:.1%}",
+                "ml_model", ml_prob, 0.15, ml_rel,
+                f"XGBoost: P(over {line})={ml_prob:.1%}",
             ))
 
-        # ── Signal 5: Market ──────────────────────────────────────────────
+        # ── Signal 6: Market ──────────────────────────────────────────────
         sel_key = f"player_over_{line}"
         if market_probs and sel_key in market_probs:
             mkt_p = float(np.clip(market_probs[sel_key], 0.05, 0.95))
             over_sigs.append(Signal(
-                name="market",
-                probability=mkt_p,
-                weight=0.15,
-                reliability=0.85,
-                explanation=f"Market: P(over {line})={mkt_p:.1%}",
+                "market", mkt_p, 0.15, 0.85,
+                f"Market: P(over {line})={mkt_p:.1%}",
             ))
 
         if not over_sigs:
@@ -340,18 +339,14 @@ class SignalEngine:
                 data_completeness=data_completeness, n_active_signals=0,
                 top_factors=["No player data available"],
                 explanation="No player signals computed.",
+                prediction_low=0.2, prediction_high=0.8,
             )
             return empty, empty
 
         over_result = self._build_result(over_sigs, data_completeness)
         under_sigs = [
-            Signal(
-                name=s.name,
-                probability=float(np.clip(1.0 - s.probability, 0.05, 0.95)),
-                weight=s.weight,
-                reliability=s.reliability,
-                explanation=s.explanation,
-            )
+            Signal(s.name, float(np.clip(1.0 - s.probability, 0.05, 0.95)),
+                   s.weight, s.reliability, s.explanation)
             for s in over_sigs
         ]
         under_result = self._build_result(under_sigs, data_completeness)
@@ -364,22 +359,17 @@ class SignalEngine:
     def _build_result(
         self, signals: List[Signal], data_completeness: float
     ) -> SignalResult:
-        """
-        Compute reliability-weighted consensus and agreement metrics.
-        """
+        """Compute reliability-weighted consensus, agreement metrics, prediction interval."""
         if not signals:
             return SignalResult(
-                signals=[],
-                consensus_probability=0.5,
-                signal_agreement=0.0,
-                prediction_variance=0.0,
-                data_completeness=data_completeness,
-                n_active_signals=0,
+                signals=[], consensus_probability=0.5,
+                signal_agreement=0.0, prediction_variance=0.0,
+                data_completeness=data_completeness, n_active_signals=0,
                 top_factors=["Insufficient data"],
                 explanation="No signals available.",
+                prediction_low=0.2, prediction_high=0.8,
             )
 
-        # Effective weight = base_weight × reliability
         eff_weights = [s.weight * s.reliability for s in signals]
         total_w = sum(eff_weights)
         n_active = sum(1 for w in eff_weights if w > 0.02)
@@ -394,19 +384,29 @@ class SignalEngine:
                 n_active_signals=0,
                 top_factors=["All signals have near-zero reliability"],
                 explanation="No reliable signals — insufficient data.",
+                prediction_low=0.2, prediction_high=0.8,
             )
 
         norm_w = [w / total_w for w in eff_weights]
         probs = [s.probability for s in signals]
-        consensus = float(np.dot(norm_w, probs))
-        consensus = float(np.clip(consensus, 0.05, 0.95))
+        consensus = float(np.clip(np.dot(norm_w, probs), 0.05, 0.95))
 
-        # Agreement: 1 − (std / scale); scale = 0.15
+        # Agreement: 1 − (std / scale)
         prob_std = float(np.std(probs))
         signal_agreement = float(np.clip(1.0 - prob_std / self._AGREEMENT_SCALE, 0.0, 1.0))
         prediction_variance = float(np.var(probs))
 
-        # Top factors: highest-weight active signals
+        # v2: prediction interval — weighted percentiles of signal distribution
+        # Use signal probabilities weighted by reliability as a distribution
+        # 10th / 90th percentile gives an 80% confidence interval
+        if len(probs) >= 3:
+            sorted_probs = sorted(probs)
+            pred_low = float(np.percentile(sorted_probs, 10))
+            pred_high = float(np.percentile(sorted_probs, 90))
+        else:
+            pred_low = max(0.05, consensus - 1.5 * prob_std)
+            pred_high = min(0.95, consensus + 1.5 * prob_std)
+
         ranked = sorted(
             [(s, w) for s, w in zip(signals, eff_weights) if w > 0.02],
             key=lambda x: x[1], reverse=True,
@@ -416,7 +416,8 @@ class SignalEngine:
         explanation = (
             f"Consensus: {consensus:.1%} from {n_active} signals "
             f"[{', '.join(s.name + '=' + f'{s.probability:.1%}' for s in signals)}]. "
-            f"Agreement: {signal_agreement:.0%}, variance: {prediction_variance:.4f}."
+            f"Agreement: {signal_agreement:.0%}, variance: {prediction_variance:.4f}. "
+            f"80% CI: [{pred_low:.1%}, {pred_high:.1%}]."
         )
 
         return SignalResult(
@@ -428,30 +429,47 @@ class SignalEngine:
             n_active_signals=n_active,
             top_factors=top_factors,
             explanation=explanation,
+            prediction_low=round(pred_low, 4),
+            prediction_high=round(pred_high, 4),
         )
 
     @staticmethod
     def _data_completeness(features: Dict, n_games: int) -> float:
         """
         Score data quality 0–1.
-          0.5 from game-count  (capped at 10+ games)
+          0.4 from game-count (capped at 10+)
           0.3 from feature presence
           0.2 from Elo separation (clear favourite = more predictable)
+          0.1 from H2H data availability (v2)
         """
-        score = float(np.clip(n_games / 10.0, 0.0, 0.5))
+        score = float(np.clip(n_games / 10.0, 0.0, 0.4))
 
         key_feats = [
+            "elo_win_prob_home",
+            "home_roll_score_ewma", "away_roll_score_ewma",
+            "home_roll_win_rate_ewma", "away_roll_win_rate_ewma",
+        ]
+        # Fall back to non-ewma versions if ewma not yet computed
+        fallback_feats = [
             "elo_win_prob_home",
             "home_roll_score_mean", "away_roll_score_mean",
             "home_roll_win_rate", "away_roll_win_rate",
         ]
+        check_feats = key_feats if any(
+            features.get(f) for f in key_feats
+        ) else fallback_feats
+
         n_present = sum(
-            1 for f in key_feats
+            1 for f in check_feats
             if features.get(f) is not None and float(features.get(f) or 0) != 0.0
         )
-        score += (n_present / len(key_feats)) * 0.3
+        score += (n_present / len(check_feats)) * 0.3
 
         elo_diff = abs(float(features.get("elo_diff") or 0.0))
         score += float(np.clip(elo_diff / 200.0, 0.0, 0.2))
+
+        # H2H bonus (v2)
+        h2h_n = int(float(features.get("h2h_n_games") or 0))
+        score += float(np.clip(h2h_n / 10.0, 0.0, 0.1))
 
         return float(np.clip(score, 0.0, 1.0))

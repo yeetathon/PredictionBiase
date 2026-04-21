@@ -104,12 +104,15 @@ class GradientBoostingModel:
 
     def __init__(self, **params):
         default_params = {
-            "n_estimators": 100,
-            "max_depth": 4,
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "use_label_encoder": False,
+            "n_estimators": 300,        # more trees → lower variance
+            "max_depth": 5,             # slightly deeper → captures feature interactions
+            "learning_rate": 0.03,      # lower LR → better generalisation with more trees
+            "subsample": 0.75,          # row sampling → reduces overfitting
+            "colsample_bytree": 0.75,   # feature sampling per tree
+            "min_child_weight": 3,      # minimum leaf size → regularisation
+            "gamma": 0.1,               # minimum gain to split → regularisation
+            "reg_alpha": 0.05,          # L1 regularisation
+            "reg_lambda": 1.5,          # L2 regularisation
             "eval_metric": "logloss",
             "random_state": 42,
             "verbosity": 0,
@@ -172,9 +175,9 @@ class EnsembleModel:
 
     def __init__(
         self,
-        elo_weight: float = 0.25,
-        lr_weight: float = 0.35,
-        xgb_weight: float = 0.40,
+        elo_weight: float = 0.20,   # reduced: Elo now also in signal engine H2H signal
+        lr_weight: float = 0.30,    # linear baseline
+        xgb_weight: float = 0.50,   # XGBoost captures non-linear interactions; now deeper
     ):
         self.elo = EloModel()
         self.lr = LogisticRegressionModel()
@@ -238,17 +241,24 @@ class EnsembleModel:
 class PlayerDisposalsModel:
     """
     XGBoost regression model for player disposals prediction.
-    Converts point estimate to over/under probability using
-    a fitted normal distribution around the prediction.
+
+    v2: uses quantile-based residual estimation instead of a single std.
+    Fits the 25th/75th percentile of residuals to get an IQR-based spread,
+    then converts IQR → effective std using the normal approximation
+    (IQR ≈ 1.35 × σ). This is more robust than using raw std, which is
+    inflated by rare outlier games.
     """
     name = "player_disposals"
 
     def __init__(self, **params):
         default_params = {
-            "n_estimators": 100,
-            "max_depth": 3,
-            "learning_rate": 0.05,
+            "n_estimators": 200,
+            "max_depth": 4,
+            "learning_rate": 0.03,
             "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 3,
+            "reg_lambda": 1.0,
             "random_state": 42,
             "verbosity": 0,
         }
@@ -256,7 +266,8 @@ class PlayerDisposalsModel:
         self.model = XGBRegressor(**default_params)
         self._feature_names: List[str] = []
         self._is_fitted = False
-        self._residual_std = 5.0  # fitted on training data
+        self._residual_std = 5.0        # IQR-derived effective std
+        self._residual_std_raw = 5.0    # raw std (kept for comparison)
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> "PlayerDisposalsModel":
         self._feature_names = list(X.columns)
@@ -264,30 +275,31 @@ class PlayerDisposalsModel:
         self.model.fit(X_arr, y.values)
         preds = self.model.predict(X_arr)
         residuals = y.values - preds
-        self._residual_std = max(1.0, float(np.std(residuals)))
+        # v2: IQR-based std estimate (robust to outlier games)
+        q75, q25 = np.percentile(residuals, [75, 25])
+        iqr = float(q75 - q25)
+        self._residual_std = max(1.0, iqr / 1.3489)   # IQR ÷ 1.3489 ≈ σ for normal dist
+        self._residual_std_raw = max(1.0, float(np.std(residuals)))
         self._is_fitted = True
-        logger.info(f"PlayerDisposalsModel fitted. Residual std: {self._residual_std:.2f}")
+        logger.info(
+            "PlayerDisposalsModel fitted. Residual IQR-std: {:.2f} (raw std: {:.2f})",
+            self._residual_std, self._residual_std_raw,
+        )
         return self
 
     def predict_mean(self, X: pd.DataFrame) -> np.ndarray:
-        """Predict expected disposals."""
         if not self._is_fitted:
             return np.full(len(X), 20.0)
         X_arr = X[self._feature_names].fillna(0).values
         return self.model.predict(X_arr)
 
     def predict_over_prob(self, X: pd.DataFrame, line: float) -> np.ndarray:
-        """
-        Probability of going OVER the line.
-        Uses normal distribution approximation around predicted mean.
-        """
+        """P(disposals > line) using IQR-derived residual std."""
         from scipy.stats import norm
         means = self.predict_mean(X)
-        # P(X > line) = 1 - CDF(line | mean, std)
         return 1.0 - norm.cdf(line, loc=means, scale=self._residual_std)
 
     def predict_proba_over(self, X: pd.DataFrame, line: float) -> np.ndarray:
-        """Returns [[p_under, p_over], ...] array."""
         p_over = self.predict_over_prob(X, line)
         return np.column_stack([1 - p_over, p_over])
 

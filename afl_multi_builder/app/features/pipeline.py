@@ -2,6 +2,15 @@
 
 All features are computed strictly using data available BEFORE each fixture,
 preventing any look-ahead leakage.
+
+v2 upgrades:
+  - Exponentially weighted moving averages (halflife=3 games): recent AFL form
+    matters far more than games from 5+ rounds ago.
+  - Linear regression form slope: genuine trend direction replaces crude delta.
+  - H2H historical features: head-to-head win rate + avg score diff per matchup.
+  - IQR-based consistency: robust to outlier performances.
+  - Player role stability + decay-weighted usage trend.
+  - Opponent position-specific defensive allowance (not /18 population guess).
 """
 import numpy as np
 import pandas as pd
@@ -11,10 +20,54 @@ from loguru import logger
 from app.data_ingestion.loader import DataLoader
 
 
+# ── Module-level feature helpers ──────────────────────────────────────────────
+
+def _ewma(vals: np.ndarray, halflife: float = 3.0) -> float:
+    """Exponentially weighted mean. Recent games count more (halflife in games)."""
+    if len(vals) == 0:
+        return 0.0
+    n = len(vals)
+    alpha = 1.0 - np.exp(-np.log(2.0) / halflife)
+    weights = np.array([(1.0 - alpha) ** (n - 1 - i) for i in range(n)], dtype=float)
+    total = weights.sum()
+    return float(np.dot(weights, vals) / total) if total > 0 else float(np.mean(vals))
+
+
+def _form_slope(vals: np.ndarray) -> float:
+    """
+    Linear regression slope (units/game). Positive = improving trend.
+    Uses de-meaned x for numerical stability.
+    """
+    if len(vals) < 3:
+        return 0.0
+    x = np.arange(len(vals), dtype=float)
+    x -= x.mean()
+    ss_x = float(np.dot(x, x))
+    return float(np.dot(x, vals) / ss_x) if ss_x > 0 else 0.0
+
+
+def _iqr_spread(vals: np.ndarray) -> float:
+    """
+    IQR/median: consistency measure robust to outliers.
+    Lower = more consistent (0 = perfectly consistent).
+    Falls back to CV when n < 4.
+    """
+    if len(vals) < 2:
+        return 0.3
+    if len(vals) < 4:
+        mean = float(np.mean(vals))
+        return float(np.std(vals) / max(mean, 1.0))
+    q75, q25 = float(np.percentile(vals, 75)), float(np.percentile(vals, 25))
+    median = float(np.median(vals))
+    return float((q75 - q25) / max(median, 1.0))
+
+
+# ── Elo system ────────────────────────────────────────────────────────────────
+
 class EloRatingSystem:
     """
     Elo rating system for AFL team strength estimation.
-    Ratings are updated after each game, carry between seasons with regression to mean,
+    Ratings update after each game, carry between seasons with regression to mean,
     and include home ground advantage.
     """
 
@@ -31,26 +84,19 @@ class EloRatingSystem:
         self.season_carryover = season_carryover
 
     def expected_score(self, rating_a: float, rating_b: float) -> float:
-        """Logistic expected score for team A vs team B."""
         return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
 
-    def update(
-        self, rating_a: float, rating_b: float, score_a: float
-    ) -> Tuple[float, float]:
-        """Return updated ratings after a game. score_a is 1/0/0.5."""
+    def update(self, rating_a: float, rating_b: float, score_a: float) -> Tuple[float, float]:
         ea = self.expected_score(rating_a, rating_b)
-        eb = 1.0 - ea
         new_a = rating_a + self.k_factor * (score_a - ea)
-        new_b = rating_b + self.k_factor * ((1 - score_a) - eb)
+        new_b = rating_b + self.k_factor * ((1 - score_a) - (1.0 - ea))
         return new_a, new_b
 
-    def compute_ratings_history(
-        self, fixtures: pd.DataFrame
-    ) -> pd.DataFrame:
+    def compute_ratings_history(self, fixtures: pd.DataFrame) -> pd.DataFrame:
         """
         Compute pre-game Elo ratings for all fixtures.
         Returns fixtures DataFrame with added columns:
-            elo_home_pre, elo_away_pre, elo_win_prob_home
+            elo_home_pre, elo_away_pre, elo_win_prob_home, elo_diff
         """
         fixtures = fixtures.copy().sort_values(["season", "round", "fixture_id"])
         ratings: Dict[int, float] = {}
@@ -62,7 +108,6 @@ class EloRatingSystem:
             home_id = int(row["home_team_id"])
             away_id = int(row["away_team_id"])
 
-            # Season start: regress ratings to mean
             if season != prev_season and prev_season is not None:
                 for tid in list(ratings.keys()):
                     ratings[tid] = (
@@ -71,16 +116,11 @@ class EloRatingSystem:
                     )
             prev_season = season
 
-            # Initialise new teams
-            if home_id not in ratings:
-                ratings[home_id] = self.initial_rating
-            if away_id not in ratings:
-                ratings[away_id] = self.initial_rating
+            ratings.setdefault(home_id, self.initial_rating)
+            ratings.setdefault(away_id, self.initial_rating)
 
             home_rating = ratings[home_id]
             away_rating = ratings[away_id]
-
-            # Adjust home rating for home ground advantage
             adj_home = home_rating + self.home_advantage
             win_prob_home = self.expected_score(adj_home, away_rating)
 
@@ -92,7 +132,6 @@ class EloRatingSystem:
                 "elo_diff": round(home_rating - away_rating, 2),
             })
 
-            # Update if completed
             if row.get("status") == "completed" and pd.notna(row.get("home_win")):
                 result = float(row["home_win"])
                 new_home, new_away = self.update(home_rating, away_rating, result)
@@ -103,10 +142,12 @@ class EloRatingSystem:
         return fixtures.merge(elo_df, on="fixture_id", how="left")
 
 
+# ── Team feature engineering ──────────────────────────────────────────────────
+
 class TeamFeatureEngineer:
     """
     Computes team-level features from historical data.
-    Strictly no lookahead: rolling stats are computed only on prior games.
+    Strictly no lookahead: rolling stats use only prior games.
     """
 
     def __init__(self, loader: Optional[DataLoader] = None, rolling_window: int = 5):
@@ -115,10 +156,7 @@ class TeamFeatureEngineer:
         self.elo = EloRatingSystem()
 
     def build_features(self) -> pd.DataFrame:
-        """
-        Build the full team-level feature matrix.
-        Each row = one team's pre-game features for a fixture.
-        """
+        """Build the full team-level feature matrix. Each row = one fixture."""
         fixtures = self.loader.load_fixtures_df()
         team_stats = self.loader.load_team_stats_df()
         weather = self.loader.load_weather_df()
@@ -127,28 +165,23 @@ class TeamFeatureEngineer:
             logger.warning("No fixtures found for feature engineering.")
             return pd.DataFrame()
 
-        # Compute Elo ratings (uses all fixtures; only updates on completed ones)
         completed = fixtures[fixtures["status"] == "completed"].copy()
         all_fx = fixtures.sort_values(["season", "round", "fixture_id"]).copy()
         all_fx = self.elo.compute_ratings_history(all_fx)
 
-        # Build rolling team features (handles minimal team_stats gracefully)
         rolling_feats = self._compute_rolling_team_features(completed, team_stats)
 
-        # Elo ratings are already embedded in all_fx by compute_ratings_history.
-        # Start result from all_fx directly — no self-merge needed.
         result = all_fx.copy()
 
-        # Merge rolling features for home and away teams
         if not rolling_feats.empty:
             home_rf = rolling_feats.rename(
-                columns={c: f"home_{c}" for c in rolling_feats.columns if c not in ["fixture_id", "team_id"]}
-            )
-            home_rf = home_rf.rename(columns={"team_id": "home_team_id"})
+                columns={c: f"home_{c}" for c in rolling_feats.columns
+                         if c not in ["fixture_id", "team_id"]}
+            ).rename(columns={"team_id": "home_team_id"})
             away_rf = rolling_feats.rename(
-                columns={c: f"away_{c}" for c in rolling_feats.columns if c not in ["fixture_id", "team_id"]}
-            )
-            away_rf = away_rf.rename(columns={"team_id": "away_team_id"})
+                columns={c: f"away_{c}" for c in rolling_feats.columns
+                         if c not in ["fixture_id", "team_id"]}
+            ).rename(columns={"team_id": "away_team_id"})
 
             result = result.merge(
                 home_rf.drop(columns=["fixture_id"], errors="ignore"),
@@ -159,18 +192,28 @@ class TeamFeatureEngineer:
                 on="away_team_id", how="left"
             )
 
-        # Add weather features
+        # H2H historical features
+        h2h_feats = self._compute_h2h_features(completed)
+        if not h2h_feats.empty:
+            result = result.merge(h2h_feats, on="fixture_id", how="left")
+            result["h2h_n_games"] = result.get("h2h_n_games", pd.Series(0)).fillna(0)
+            result["h2h_home_win_rate"] = result.get("h2h_home_win_rate", pd.Series(0.5)).fillna(0.5)
+            result["h2h_avg_score_diff"] = result.get("h2h_avg_score_diff", pd.Series(0.0)).fillna(0.0)
+            result["h2h_home_win_rate_recent"] = result.get("h2h_home_win_rate_recent", pd.Series(0.5)).fillna(0.5)
+
+        # Weather features
         if not weather.empty:
             wx_cols = ["fixture_id", "temperature_c", "humidity_pct", "wind_speed_kmh", "conditions"]
             wx = weather[[c for c in wx_cols if c in weather.columns]].copy()
-            wx["is_rain"] = wx["conditions"].isin(["rain", "light_rain"]).astype(int)
-            wx["wind_category"] = pd.cut(
-                wx["wind_speed_kmh"], bins=[0, 10, 20, 35, 100],
-                labels=[0, 1, 2, 3]
-            ).astype(float)
+            if "conditions" in wx.columns:
+                wx["is_rain"] = wx["conditions"].isin(["rain", "light_rain"]).astype(int)
+                wx["wind_category"] = pd.cut(
+                    wx["wind_speed_kmh"], bins=[0, 10, 20, 35, 100],
+                    labels=[0, 1, 2, 3]
+                ).astype(float)
             result = result.merge(wx, on="fixture_id", how="left")
 
-        # Compute differential features for all paired home_/away_ roll columns
+        # Differential features
         numeric_home = [c for c in result.columns if c.startswith("home_roll_")]
         for hc in numeric_home:
             ac = hc.replace("home_", "away_")
@@ -178,40 +221,107 @@ class TeamFeatureEngineer:
                 diff_col = hc.replace("home_roll_", "diff_roll_")
                 result[diff_col] = result[hc].fillna(0) - result[ac].fillna(0)
 
-        # Rest-days differential
         if "home_rest_days" in result.columns and "away_rest_days" in result.columns:
-            result["diff_rest_days"] = result["home_rest_days"].fillna(7) - result["away_rest_days"].fillna(7)
+            result["diff_rest_days"] = (
+                result["home_rest_days"].fillna(7) - result["away_rest_days"].fillna(7)
+            )
 
-        result["elo_diff"] = result.get("elo_home_pre", 1500) - result.get("elo_away_pre", 1500)
+        result["elo_diff"] = (
+            result.get("elo_home_pre", 1500) - result.get("elo_away_pre", 1500)
+        )
 
         return result
+
+    def _compute_h2h_features(self, completed: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute pre-game head-to-head historical features for each fixture.
+        Strictly no lookahead: only uses games with fixture_id < current.
+
+        Returns DataFrame: fixture_id, h2h_n_games, h2h_home_win_rate,
+                           h2h_avg_score_diff, h2h_home_win_rate_recent
+        """
+        if completed.empty or "home_win" not in completed.columns:
+            return pd.DataFrame()
+
+        completed = completed.sort_values(
+            ["season", "round", "fixture_id"]
+        ).reset_index(drop=True)
+        records = []
+
+        for _, row in completed.iterrows():
+            fid = int(row["fixture_id"])
+            home_id = int(row["home_team_id"])
+            away_id = int(row["away_team_id"])
+
+            # All prior meetings between these two teams (any venue order)
+            mask = (
+                (completed["fixture_id"] < fid) &
+                (
+                    ((completed["home_team_id"] == home_id) & (completed["away_team_id"] == away_id)) |
+                    ((completed["home_team_id"] == away_id) & (completed["away_team_id"] == home_id))
+                )
+            )
+            prior = completed[mask].tail(10)
+            n_h2h = len(prior)
+
+            if n_h2h == 0:
+                records.append({
+                    "fixture_id": fid,
+                    "h2h_n_games": 0,
+                    "h2h_home_win_rate": 0.5,
+                    "h2h_avg_score_diff": 0.0,
+                    "h2h_home_win_rate_recent": 0.5,
+                })
+                continue
+
+            win_series = []
+            score_diffs = []
+            for _, pr in prior.iterrows():
+                hw = pr.get("home_win")
+                if pd.isna(hw):
+                    continue
+                is_same_home = int(pr["home_team_id"]) == home_id
+                won = (is_same_home and int(hw) == 1) or (not is_same_home and int(hw) == 0)
+                win_series.append(float(int(won)))
+
+                hs = pr.get("home_score") or 0.0
+                as_ = pr.get("away_score") or 0.0
+                if pd.notna(hs) and pd.notna(as_):
+                    diff = float(hs) - float(as_) if is_same_home else float(as_) - float(hs)
+                    score_diffs.append(diff)
+
+            denom = len(win_series) or 1
+            h2h_wr = sum(win_series) / denom
+            h2h_wr_recent = _ewma(np.array(win_series), halflife=3.0) if win_series else 0.5
+            h2h_diff = float(np.mean(score_diffs)) if score_diffs else 0.0
+
+            records.append({
+                "fixture_id": fid,
+                "h2h_n_games": n_h2h,
+                "h2h_home_win_rate": round(h2h_wr, 3),
+                "h2h_avg_score_diff": round(h2h_diff, 1),
+                "h2h_home_win_rate_recent": round(h2h_wr_recent, 3),
+            })
+
+        return pd.DataFrame(records) if records else pd.DataFrame()
 
     def _compute_rolling_team_features(
         self, completed_fixtures: pd.DataFrame, team_stats: pd.DataFrame
     ) -> pd.DataFrame:
         """
         Compute rolling team features from prior games only (no lookahead).
-
-        Works with both minimal team_stats_df (score + is_home only) and full
-        AFL Data Sports Group stats (disposals, marks, clearances, etc.).
-
-        Returns a DataFrame indexed by (fixture_id, team_id).
+        Includes exponential decay means, form slope, IQR consistency.
         """
         if completed_fixtures.empty:
             return pd.DataFrame()
 
-        # Build a date lookup for rest-days calculation
-        # Use 'date' column from completed_fixtures if available
         has_date = "date" in completed_fixtures.columns
-
-        # Join team_stats to fixture metadata
         fx_meta_cols = ["fixture_id", "season", "round", "home_team_id", "away_team_id"]
         if has_date:
             fx_meta_cols.append("date")
         fx_meta = completed_fixtures[fx_meta_cols].copy()
 
         if team_stats.empty:
-            # Build minimal team_stats from fixture score columns
             records_ts = []
             for _, row in completed_fixtures.iterrows():
                 fid = int(row["fixture_id"])
@@ -231,14 +341,11 @@ class TeamFeatureEngineer:
                     })
             if not records_ts:
                 return pd.DataFrame()
-            ts = pd.DataFrame(records_ts)
-            # Merge fixture metadata once
-            ts = ts.merge(fx_meta, on="fixture_id", how="left")
+            ts = pd.DataFrame(records_ts).merge(fx_meta, on="fixture_id", how="left")
         else:
-            # team_stats already has fixture_id; merge metadata columns only
             existing_cols = set(team_stats.columns)
-            meta_new_cols = [c for c in fx_meta_cols if c not in existing_cols or c == "fixture_id"]
-            ts = team_stats.merge(fx_meta[meta_new_cols], on="fixture_id", how="inner")
+            meta_new = [c for c in fx_meta_cols if c not in existing_cols or c == "fixture_id"]
+            ts = team_stats.merge(fx_meta[meta_new], on="fixture_id", how="inner")
 
         ts = ts.sort_values(["season", "round", "fixture_id"])
 
@@ -247,8 +354,7 @@ class TeamFeatureEngineer:
                      "metres_gained", "turnovers"]
         stat_cols = [c for c in stat_cols if c in ts.columns]
 
-        # Build win lookup: fixture_id → home_win (for completed games)
-        win_lookup = {}
+        win_lookup: Dict[int, int] = {}
         if "home_win" in completed_fixtures.columns:
             for _, row in completed_fixtures.iterrows():
                 hw = row.get("home_win")
@@ -256,9 +362,7 @@ class TeamFeatureEngineer:
                     win_lookup[int(row["fixture_id"])] = int(hw)
 
         records = []
-        teams = ts["team_id"].unique()
-
-        for tid in teams:
+        for tid in ts["team_id"].unique():
             team_games = ts[ts["team_id"] == tid].sort_values(
                 ["season", "round", "fixture_id"]
             ).reset_index(drop=True)
@@ -266,41 +370,44 @@ class TeamFeatureEngineer:
             for i in range(len(team_games)):
                 row = team_games.iloc[i]
                 prior = team_games.iloc[:i]
+                feat: Dict = {"fixture_id": int(row["fixture_id"]), "team_id": int(tid)}
 
-                feat = {"fixture_id": int(row["fixture_id"]), "team_id": int(tid)}
-
-                # Rolling stats (score + any other stat columns)
                 for sc in stat_cols:
                     if sc not in prior.columns:
                         continue
                     vals = prior[sc].dropna().values
                     pop_mean = float(ts[sc].mean()) if sc in ts.columns else 0.0
-                    if len(vals) >= 1:
-                        roll_mean = float(np.mean(vals[-self.window:]))
-                        roll_std = float(np.std(vals[-self.window:])) if len(vals) >= 2 else 0.0
-                        feat[f"roll_{sc}_mean"] = roll_mean
-                        feat[f"roll_{sc}_std"] = roll_std
 
-                        # Score-specific extra features
+                    if len(vals) >= 1:
+                        w_vals = vals[-self.window * 2:]   # up to 10 games for ewma
+                        feat[f"roll_{sc}_mean"] = float(np.mean(vals[-self.window:]))
+                        feat[f"roll_{sc}_std"] = float(np.std(vals[-self.window:])) if len(vals) >= 2 else 0.0
+                        feat[f"roll_{sc}_ewma"] = _ewma(w_vals, halflife=3.0)
+                        feat[f"roll_{sc}_slope"] = _form_slope(vals[-min(8, len(vals)):])
+                        feat[f"roll_{sc}_iqr"] = _iqr_spread(vals[-self.window:])
+
                         if sc == "score":
-                            # Coefficient of variation: lower = more consistent
                             feat["score_cv"] = (
-                                roll_std / roll_mean if roll_mean > 0 else 0.0
+                                feat["roll_score_std"] / feat["roll_score_mean"]
+                                if feat["roll_score_mean"] > 0 else 0.0
                             )
-                            # Form trend: last 2 games vs prior 3 games (momentum)
+                            # Legacy form trend (kept for backward compat)
                             if len(vals) >= 5:
-                                recent_avg = float(np.mean(vals[-2:]))
-                                prior_avg = float(np.mean(vals[-5:-2]))
-                                feat["form_trend_score"] = recent_avg - prior_avg
+                                feat["form_trend_score"] = (
+                                    float(np.mean(vals[-2:])) - float(np.mean(vals[-5:-2]))
+                                )
                             elif len(vals) >= 3:
-                                recent_avg = float(np.mean(vals[-1:]))
-                                prior_avg = float(np.mean(vals[:-1]))
-                                feat["form_trend_score"] = recent_avg - prior_avg
+                                feat["form_trend_score"] = (
+                                    float(np.mean(vals[-1:])) - float(np.mean(vals[:-1]))
+                                )
                             else:
                                 feat["form_trend_score"] = 0.0
                     else:
                         feat[f"roll_{sc}_mean"] = pop_mean
                         feat[f"roll_{sc}_std"] = 0.0
+                        feat[f"roll_{sc}_ewma"] = pop_mean
+                        feat[f"roll_{sc}_slope"] = 0.0
+                        feat[f"roll_{sc}_iqr"] = 0.3
                         if sc == "score":
                             feat["score_cv"] = 0.0
                             feat["form_trend_score"] = 0.0
@@ -308,15 +415,13 @@ class TeamFeatureEngineer:
                 n_games = len(prior)
                 feat["roll_n_games"] = n_games
 
-                # Win rate (overall, home, away) from prior games
+                # Win rates (overall, home, away) + ewma win rate
                 if n_games > 0 and win_lookup:
-                    prior_is_home = prior["is_home"].values if "is_home" in prior.columns else []
                     total_wins = 0
-                    home_wins = 0
-                    home_games = 0
-                    away_wins = 0
-                    away_games = 0
-                    for j, prow in prior.iterrows():
+                    home_wins = home_games = 0
+                    away_wins = away_games = 0
+                    win_seq: List[float] = []   # chronological 1/0 for ewma
+                    for _, prow in prior.iterrows():
                         pfid = int(prow["fixture_id"])
                         p_is_home = int(prow.get("is_home", 0))
                         hw = win_lookup.get(pfid)
@@ -324,6 +429,7 @@ class TeamFeatureEngineer:
                             continue
                         won = (p_is_home == 1 and hw == 1) or (p_is_home == 0 and hw == 0)
                         total_wins += int(won)
+                        win_seq.append(float(int(won)))
                         if p_is_home == 1:
                             home_games += 1
                             home_wins += int(won)
@@ -331,14 +437,16 @@ class TeamFeatureEngineer:
                             away_games += 1
                             away_wins += int(won)
                     feat["roll_win_rate"] = total_wins / n_games
+                    feat["roll_win_rate_ewma"] = _ewma(np.array(win_seq[-8:]), halflife=3.0) if win_seq else 0.5
                     feat["roll_home_win_rate"] = home_wins / home_games if home_games > 0 else 0.5
                     feat["roll_away_win_rate"] = away_wins / away_games if away_games > 0 else 0.5
                 else:
                     feat["roll_win_rate"] = 0.5
+                    feat["roll_win_rate_ewma"] = 0.5
                     feat["roll_home_win_rate"] = 0.5
                     feat["roll_away_win_rate"] = 0.5
 
-                # Rest days: days since last game (capped at 21)
+                # Rest days
                 if has_date and n_games > 0:
                     try:
                         last_date_str = str(prior.iloc[-1]["date"])
@@ -347,8 +455,7 @@ class TeamFeatureEngineer:
                             from datetime import datetime as _dt
                             last_dt = _dt.fromisoformat(last_date_str.split("T")[0])
                             cur_dt = _dt.fromisoformat(cur_date_str.split("T")[0])
-                            rest = max(0, min(21, (cur_dt - last_dt).days))
-                            feat["rest_days"] = float(rest)
+                            feat["rest_days"] = float(max(0, min(21, (cur_dt - last_dt).days)))
                         else:
                             feat["rest_days"] = 7.0
                     except Exception:
@@ -361,7 +468,6 @@ class TeamFeatureEngineer:
         return pd.DataFrame(records)
 
     def get_fixture_features(self, fixture_id: int) -> Optional[Dict]:
-        """Get pre-built features for a specific fixture."""
         features = self.build_features()
         row = features[features["fixture_id"] == fixture_id]
         if row.empty:
@@ -369,10 +475,12 @@ class TeamFeatureEngineer:
         return row.iloc[0].to_dict()
 
 
+# ── Player feature engineering ────────────────────────────────────────────────
+
 class PlayerFeatureEngineer:
     """
     Computes player-level features for disposals prediction.
-    Uses rolling averages, consistency, opponent allowance, and team context.
+    v2: adds decay-weighted usage, role stability, position-specific opponent allowance.
     """
 
     def __init__(self, loader: Optional[DataLoader] = None, rolling_window: int = 5):
@@ -393,29 +501,26 @@ class PlayerFeatureEngineer:
             return pd.DataFrame()
 
         completed = fixtures[fixtures["status"] == "completed"].copy()
-
-        # Join fixture metadata
         ps = player_stats.merge(
             completed[["fixture_id", "season", "round", "home_team_id", "away_team_id"]],
             on="fixture_id", how="inner"
         ).sort_values(["season", "round", "fixture_id"])
 
-        # Join player info
-        if not players.empty:
-            ps = ps.merge(
-                players[["player_id", "position"]],
-                on="player_id", how="left"
-            )
+        if not players.empty and "position" in players.columns:
+            ps = ps.merge(players[["player_id", "position"]], on="player_id", how="left")
+
+        pop_mean = float(ps[stat_col].mean()) if stat_col in ps.columns and not ps[stat_col].empty else 20.0
+
+        # Pre-compute opponent defensive strength per position
+        opp_pos_allowance = self._compute_opp_position_allowance(ps, stat_col)
 
         records = []
-        player_ids = ps["player_id"].unique()
-
-        for pid in player_ids:
+        for pid in ps["player_id"].unique():
             pg = ps[ps["player_id"] == pid].reset_index(drop=True)
             for i, row in pg.iterrows():
                 prior = pg.iloc[:i]
                 vals = prior[stat_col].dropna().values if stat_col in prior.columns else np.array([])
-                feat = {
+                feat: Dict = {
                     "fixture_id": int(row["fixture_id"]),
                     "player_id": int(pid),
                     "team_id": int(row["team_id"]),
@@ -423,6 +528,7 @@ class PlayerFeatureEngineer:
                     "position": str(row.get("position", "Unknown")),
                 }
                 n = len(vals)
+
                 if n >= 1:
                     feat["roll_mean_3"] = float(np.mean(vals[-3:])) if n >= 3 else float(np.mean(vals))
                     feat["roll_mean_5"] = float(np.mean(vals[-5:])) if n >= 5 else float(np.mean(vals))
@@ -430,45 +536,49 @@ class PlayerFeatureEngineer:
                     feat["roll_std_5"] = float(np.std(vals[-5:])) if n >= 3 else 0.0
                     feat["roll_max_5"] = float(np.max(vals[-5:])) if n >= 1 else 0.0
                     feat["roll_min_5"] = float(np.min(vals[-5:])) if n >= 1 else 0.0
-                    # Consistency: CV (lower = more consistent)
+                    # Exponential decay mean: more weight on recent games
+                    feat["roll_ewma"] = _ewma(vals[-10:], halflife=3.0)
+                    # Linear regression slope: genuine trend direction
+                    feat["roll_slope"] = _form_slope(vals[-min(8, n):])
+                    # IQR consistency
+                    feat["roll_iqr"] = _iqr_spread(vals[-self.window:])
                     mean5 = feat["roll_mean_5"]
-                    feat["consistency_cv"] = (feat["roll_std_5"] / mean5) if mean5 > 0 else 1.0
-                    # Form trend: difference of recent means
-                    if n >= 4:
-                        feat["form_trend"] = float(np.mean(vals[-2:])) - float(np.mean(vals[-4:-2]))
-                    else:
-                        feat["form_trend"] = 0.0
+                    feat["consistency_cv"] = feat["roll_std_5"] / mean5 if mean5 > 0 else 1.0
+                    # Legacy form trend (kept for compat)
+                    feat["form_trend"] = (
+                        float(np.mean(vals[-2:])) - float(np.mean(vals[-4:-2])) if n >= 4 else 0.0
+                    )
                     feat["n_games"] = n
+
+                    # Role stability: fraction of recent 5 games at same position
+                    if "position" in prior.columns and n >= 2:
+                        cur_pos = str(row.get("position", "Unknown"))
+                        recent_pos = prior.iloc[-min(5, n):]["position"].fillna("Unknown").values
+                        same = sum(1 for p in recent_pos if str(p) == cur_pos)
+                        feat["role_stability"] = same / len(recent_pos) if len(recent_pos) > 0 else 1.0
+                    else:
+                        feat["role_stability"] = 1.0
                 else:
-                    # Population mean for cold start
-                    pop_mean = float(ps[stat_col].mean()) if stat_col in ps.columns and not ps[stat_col].empty else 20.0
                     feat.update({
                         "roll_mean_3": pop_mean, "roll_mean_5": pop_mean,
                         "roll_mean_10": pop_mean, "roll_std_5": 5.0,
-                        "roll_max_5": pop_mean + 5, "roll_min_5": pop_mean - 5,
+                        "roll_max_5": pop_mean + 5, "roll_min_5": max(0.0, pop_mean - 5),
+                        "roll_ewma": pop_mean, "roll_slope": 0.0, "roll_iqr": 0.3,
                         "consistency_cv": 0.25, "form_trend": 0.0, "n_games": 0,
+                        "role_stability": 0.5,
                     })
 
-                # Opponent allowance: avg stat conceded by opponent team
+                # Opponent defensive strength — position-specific
                 home_id = int(row["home_team_id"])
                 away_id = int(row["away_team_id"])
                 opp_id = away_id if int(row["team_id"]) == home_id else home_id
-                # Use team_stats to approximate opponent defensive strength
-                if not team_stats.empty:
-                    opp_games = completed[
-                        (completed["home_team_id"] == opp_id) | (completed["away_team_id"] == opp_id)
-                    ]["fixture_id"].tolist()
-                    opp_ts = team_stats[
-                        (team_stats["fixture_id"].isin(opp_games)) &
-                        (team_stats["team_id"] != opp_id)
-                    ]
-                    if "disposals" in opp_ts.columns and not opp_ts.empty:
-                        opp_allow = float(opp_ts["disposals"].mean())
-                        feat["opp_disposals_allowed_mean"] = round(opp_allow / 18, 2)  # per player approx
-                    else:
-                        feat["opp_disposals_allowed_mean"] = 20.0
-                else:
-                    feat["opp_disposals_allowed_mean"] = 20.0
+                pos = str(row.get("position", "Unknown"))
+
+                key_pos = (opp_id, pos)
+                key_all = (opp_id, "all")
+                opp_allow_pos = opp_pos_allowance.get(key_pos, opp_pos_allowance.get(key_all, pop_mean))
+                feat["opp_disposals_allowed_mean"] = round(float(opp_allow_pos), 2)
+                feat["opp_pos_disposals_allowed"] = round(float(opp_allow_pos), 2)
 
                 records.append(feat)
 
@@ -484,13 +594,53 @@ class PlayerFeatureEngineer:
 
         return df
 
+    def _compute_opp_position_allowance(
+        self, ps: pd.DataFrame, stat_col: str
+    ) -> Dict:
+        """
+        Compute how many disposals each team allows to each position on average.
+        Returns dict: {(team_id, position): mean_disposals_allowed}
+        Also includes {(team_id, "all"): overall_mean} as fallback.
+        """
+        if stat_col not in ps.columns or ps.empty:
+            return {}
+
+        result: Dict = {}
+        fixtures_grouped = ps.groupby("fixture_id")
+
+        # Iterate through games, compute opponent-team allowance
+        team_pos_stats: Dict = {}   # (opp_team_id, position) -> list of values
+        team_all_stats: Dict = {}   # (opp_team_id, "all") -> list of values
+
+        # For each player's stat, the "opposing team" is whichever team the player is NOT on
+        for fid, group in ps.groupby("fixture_id"):
+            home_id = group["home_team_id"].iloc[0] if "home_team_id" in group.columns else None
+            away_id = group["away_team_id"].iloc[0] if "away_team_id" in group.columns else None
+            if home_id is None or away_id is None:
+                continue
+            for _, prow in group.iterrows():
+                val = prow.get(stat_col)
+                if pd.isna(val):
+                    continue
+                # Opposing team (the team that "allowed" this stat)
+                opp = away_id if int(prow["team_id"]) == int(home_id) else home_id
+                pos = str(prow.get("position", "Unknown"))
+                key_pos = (int(opp), pos)
+                key_all = (int(opp), "all")
+                team_pos_stats.setdefault(key_pos, []).append(float(val))
+                team_all_stats.setdefault(key_all, []).append(float(val))
+
+        for key, vals in team_pos_stats.items():
+            result[key] = float(np.median(vals))   # median more robust than mean
+        for key, vals in team_all_stats.items():
+            result[key] = float(np.median(vals))
+
+        return result
+
     def get_player_prediction_features(
         self, player_id: int, fixture_id: int
     ) -> Optional[Dict]:
-        """
-        Get features for a player's upcoming fixture prediction.
-        Uses the most recent available rolling stats.
-        """
+        """Get features for a player's upcoming fixture using most recent rolling stats."""
         player_stats = self.loader.load_player_stats_df()
         players = self.loader.load_players_df()
 
@@ -503,8 +653,7 @@ class PlayerFeatureEngineer:
 
         fixtures = self.loader.load_fixtures_df()
         pg = pg.merge(
-            fixtures[["fixture_id", "season", "round"]],
-            on="fixture_id", how="left"
+            fixtures[["fixture_id", "season", "round"]], on="fixture_id", how="left"
         ).sort_values(["season", "round"])
 
         vals = pg["disposals"].dropna().values
@@ -512,13 +661,9 @@ class PlayerFeatureEngineer:
 
         player_info = players[players["player_id"] == player_id]
         position = str(player_info["position"].iloc[0]) if not player_info.empty else "Unknown"
-
-        feat = {
-            "fixture_id": fixture_id,
-            "player_id": player_id,
-            "position": position,
-        }
         pop_mean = float(player_stats["disposals"].mean()) if "disposals" in player_stats.columns else 20.0
+
+        feat: Dict = {"fixture_id": fixture_id, "player_id": player_id, "position": position}
 
         if n >= 1:
             feat["roll_mean_3"] = float(np.mean(vals[-3:])) if n >= 3 else float(np.mean(vals))
@@ -527,32 +672,38 @@ class PlayerFeatureEngineer:
             feat["roll_std_5"] = float(np.std(vals[-5:])) if n >= 3 else 3.0
             feat["roll_max_5"] = float(np.max(vals[-5:]))
             feat["roll_min_5"] = float(np.min(vals[-5:]))
+            feat["roll_ewma"] = _ewma(vals[-10:], halflife=3.0)
+            feat["roll_slope"] = _form_slope(vals[-min(8, n):])
+            feat["roll_iqr"] = _iqr_spread(vals[-self.window:])
             mean5 = feat["roll_mean_5"]
-            feat["consistency_cv"] = (feat["roll_std_5"] / mean5) if mean5 > 0 else 0.25
+            feat["consistency_cv"] = feat["roll_std_5"] / mean5 if mean5 > 0 else 0.25
             feat["form_trend"] = float(np.mean(vals[-2:])) - float(np.mean(vals[-4:-2])) if n >= 4 else 0.0
             feat["n_games"] = n
+            feat["role_stability"] = 1.0
         else:
             feat.update({
                 "roll_mean_3": pop_mean, "roll_mean_5": pop_mean,
                 "roll_mean_10": pop_mean, "roll_std_5": 5.0,
-                "roll_max_5": pop_mean + 5, "roll_min_5": pop_mean - 5,
+                "roll_max_5": pop_mean + 5, "roll_min_5": max(0.0, pop_mean - 5),
+                "roll_ewma": pop_mean, "roll_slope": 0.0, "roll_iqr": 0.3,
                 "consistency_cv": 0.25, "form_trend": 0.0, "n_games": 0,
+                "role_stability": 0.5,
             })
 
         feat["pos_midfielder"] = int(position == "Midfielder")
         feat["pos_forward"] = int(position == "Forward")
         feat["pos_defender"] = int(position == "Defender")
         feat["pos_ruckman"] = int(position == "Ruckman")
-        feat["opp_disposals_allowed_mean"] = 20.0
+        feat["opp_disposals_allowed_mean"] = pop_mean
+        feat["opp_pos_disposals_allowed"] = pop_mean
 
         return feat
 
 
+# ── Feature pipeline orchestrator ─────────────────────────────────────────────
+
 class FeaturePipeline:
-    """
-    Orchestrates team and player feature engineering.
-    Central entry point for the modelling pipeline.
-    """
+    """Orchestrates team and player feature engineering."""
 
     def __init__(self, loader: Optional[DataLoader] = None):
         self.loader = loader or DataLoader()
@@ -562,7 +713,6 @@ class FeaturePipeline:
         self._player_features: Optional[pd.DataFrame] = None
 
     def get_team_features(self, force_rebuild: bool = False) -> pd.DataFrame:
-        """Get team features, building from scratch or returning cache."""
         if self._team_features is None or force_rebuild:
             logger.info("Building team feature matrix...")
             self._team_features = self.team_engineer.build_features()
@@ -572,7 +722,6 @@ class FeaturePipeline:
     def get_player_features(
         self, stat_col: str = "disposals", force_rebuild: bool = False
     ) -> pd.DataFrame:
-        """Get player features for a given stat target."""
         if self._player_features is None or force_rebuild:
             logger.info(f"Building player feature matrix for '{stat_col}'...")
             self._player_features = self.player_engineer.build_player_features(stat_col)
@@ -580,10 +729,7 @@ class FeaturePipeline:
         return self._player_features
 
     def get_model_ready_match_data(self) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
-        """
-        Return (X, y, feature_names) for match win probability model.
-        Only includes completed fixtures with valid labels.
-        """
+        """Return (X, y, feature_names) for match win probability model."""
         features = self.get_team_features()
         completed = features[
             (features["status"] == "completed") & features["home_win"].notna()
@@ -594,9 +740,12 @@ class FeaturePipeline:
 
         feature_cols = [
             c for c in completed.columns
-            if c.startswith(("elo_", "home_roll_", "away_roll_", "diff_roll_",
-                             "home_rest_days", "away_rest_days", "diff_rest_days",
-                             "temperature_c", "wind_speed_kmh", "is_rain", "wind_category"))
+            if c.startswith((
+                "elo_", "home_roll_", "away_roll_", "diff_roll_",
+                "home_rest_days", "away_rest_days", "diff_rest_days",
+                "h2h_",                  # H2H historical features
+                "temperature_c", "wind_speed_kmh", "is_rain", "wind_category",
+            ))
             and completed[c].dtype in [np.float64, np.int64, float, int]
         ]
 
@@ -607,10 +756,7 @@ class FeaturePipeline:
     def get_model_ready_player_data(
         self, line: float, stat_col: str = "disposals"
     ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
-        """
-        Return (X, y, feature_names) for player over/under model.
-        y = 1 if player went OVER the line, 0 otherwise.
-        """
+        """Return (X, y, feature_names) for player over/under model."""
         features = self.get_player_features(stat_col)
         valid = features[features["target"].notna()].copy()
 
@@ -623,9 +769,12 @@ class FeaturePipeline:
             c for c in valid.columns
             if c in [
                 "roll_mean_3", "roll_mean_5", "roll_mean_10", "roll_std_5",
-                "roll_max_5", "roll_min_5", "consistency_cv", "form_trend",
-                "n_games", "opp_disposals_allowed_mean",
+                "roll_max_5", "roll_min_5",
+                "roll_ewma", "roll_slope", "roll_iqr",   # v2 additions
+                "consistency_cv", "form_trend", "n_games",
+                "opp_disposals_allowed_mean", "opp_pos_disposals_allowed",
                 "pos_midfielder", "pos_forward", "pos_defender", "pos_ruckman",
+                "role_stability",                         # v2 addition
             ]
         ]
 

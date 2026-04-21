@@ -38,6 +38,8 @@ class Leg:
     prediction_variance: float = 0.0    # variance of probabilities across signals
     data_completeness: float = 0.0      # 0–1; quality of underlying data
     n_active_signals: int = 0           # number of signals with meaningful reliability
+    prediction_low: float = 0.0         # 10th-percentile probability (prediction interval lower bound)
+    prediction_high: float = 1.0        # 90th-percentile probability (prediction interval upper bound)
 
 
 @dataclass
