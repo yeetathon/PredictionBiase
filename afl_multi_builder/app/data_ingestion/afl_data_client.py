@@ -128,8 +128,8 @@ class DSGClient:
     def get(self, endpoint: str, params: Optional[Dict] = None,
             ttl: int = 3600) -> dict:
         """
-        GET /clients/{client}/australian_football/{endpoint}
-        with auth + json params injected automatically.
+        GET /{sport}/{endpoint}?client=&authkey=&ftype=json
+        DSG URL format: https://dsg-api.com/australian_football/{endpoint}
         """
         params = dict(params or {})
         params.update({
@@ -145,7 +145,7 @@ class DSGClient:
             cached["_source"] = "cache"
             return cached
 
-        url = f"{self._base}/clients/{self._client}/{self._SPORT}/{endpoint}"
+        url = f"{self._base}/{self._SPORT}/{endpoint}"
         last_exc: Optional[Exception] = None
 
         for attempt in range(self._MAX_RETRIES):
