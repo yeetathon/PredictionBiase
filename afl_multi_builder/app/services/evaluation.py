@@ -13,6 +13,7 @@ import numpy as np
 from loguru import logger
 from sqlalchemy.orm import Session
 
+from app.core.adaptive_config import get_adaptive_config
 from app.db.database import SessionLocal
 from app.db.models import LegSettlement, MultiSettlement, ResearchCycleLog
 
@@ -168,7 +169,59 @@ class EvaluationService:
             report["overall"]["roi"],
             len(legs),
         )
+
+        # Update adaptive thresholds based on this evaluation
+        try:
+            adaptive_cfg = get_adaptive_config()
+            adaptive_cfg.update_from_evaluation(report)
+            report["adaptive_thresholds_updated"] = True
+        except Exception as e:
+            logger.warning("Could not update adaptive thresholds: {}", e)
+            report["adaptive_thresholds_updated"] = False
+
+        # Attach market health summary
+        report["market_health"] = self.generate_market_health_report(report)
+
         return report
+
+    def generate_market_health_report(self, eval_report: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Structured market health report: healthy / watch / degraded / insufficient_data.
+        Fed into adaptive threshold updates and the nightly report email.
+        """
+        by_market = eval_report.get("by_market_type", {})
+        health: Dict[str, Any] = {}
+        for market, metrics in by_market.items():
+            n = metrics.get("n", 0)
+            brier = metrics.get("brier_score", 0.25)
+            roi = metrics.get("roi", 0.0)
+            hit_rate = metrics.get("hit_rate", 0.5)
+
+            if n < 5:
+                status = "insufficient_data"
+            elif brier > 0.25:
+                status = "degraded_worse_than_baseline"
+            elif roi < -0.15:
+                status = "degraded_negative_roi"
+            elif brier < 0.20 and roi >= 0.0:
+                status = "healthy"
+            else:
+                status = "watch"
+
+            health[market] = {
+                "status": status,
+                "n_bets": n,
+                "brier_score": round(brier, 4),
+                "roi": round(roi, 4),
+                "hit_rate": round(hit_rate, 4),
+                "recommendation": (
+                    "Continue" if status == "healthy" else
+                    "Tighten thresholds" if status == "watch" else
+                    "Review urgently" if "degraded" in status else
+                    "Collect more data"
+                ),
+            }
+        return health
 
     # ------------------------------------------------------------------
     # Private helpers

@@ -22,6 +22,90 @@ from app.core.config import settings
 from app.core.metrics import compute_ev
 
 
+# ── Monte Carlo robustness checker ────────────────────────────────────────────
+
+class MonteCarloRobustnessChecker:
+    """
+    Simulate multi outcomes via Monte Carlo to assess fragility.
+
+    For a given combination of legs with probabilities p_i and
+    pairwise correlations r_ij, simulate N outcomes and compute:
+      - mean EV across simulations
+      - EV standard deviation (spread of outcomes)
+      - fragility: P(0 legs win) — worst-case scenario
+      - hit_rate: P(all legs win)
+
+    Uses Gaussian copula to simulate correlated Bernoulli outcomes.
+    """
+
+    def __init__(self, n_simulations: int = 5000):
+        self.n = n_simulations
+
+    def check(
+        self,
+        probs: List[float],
+        odds: List[float],
+        correlation_matrix: np.ndarray,
+    ) -> Dict[str, float]:
+        """
+        Run Monte Carlo simulation.
+        Returns: mean_ev, ev_std, fragility, hit_rate, robustness_score
+        """
+        n_legs = len(probs)
+        if n_legs == 0:
+            return {"mean_ev": 0.0, "ev_std": 0.0, "fragility": 1.0, "hit_rate": 0.0, "robustness_score": 0.0}
+
+        try:
+            # Build correlation matrix — clip to be positive definite
+            corr = np.array(correlation_matrix, dtype=float)
+            np.fill_diagonal(corr, 1.0)
+
+            # Add small diagonal to ensure PD
+            min_eig = np.linalg.eigvalsh(corr).min()
+            if min_eig < 1e-6:
+                corr += np.eye(n_legs) * (abs(min_eig) + 1e-4)
+
+            # Simulate from multivariate normal → transform via normal CDF
+            L = np.linalg.cholesky(corr)
+            z = np.random.standard_normal((self.n, n_legs))
+            corr_z = z @ L.T  # shape: (n_sims, n_legs)
+
+            # Convert to uniform via standard normal CDF, then to Bernoulli
+            from scipy.stats import norm
+            u = norm.cdf(corr_z)  # (n_sims, n_legs), uniform marginals with correlations
+
+            p_arr = np.array(probs)
+            outcomes = (u < p_arr[None, :]).astype(float)  # (n_sims, n_legs)
+
+            # Compute multi EV per simulation
+            all_win = outcomes.prod(axis=1)  # 1 if all legs win
+            combined_odds = float(np.prod(odds))
+            sim_ev = all_win * (combined_odds - 1.0) - (1.0 - all_win)
+
+            hit_rate = float(all_win.mean())
+            mean_ev = float(sim_ev.mean())
+            ev_std = float(sim_ev.std())
+            fragility = float((outcomes.sum(axis=1) == 0).mean())  # P(0 legs win)
+
+            # Robustness score: high hit_rate, low ev_std, low fragility
+            robustness = float(np.clip(
+                hit_rate * (1.0 - fragility) / max(ev_std + 0.01, 0.01),
+                0.0, 10.0
+            ))
+
+            return {
+                "mean_ev": round(mean_ev, 5),
+                "ev_std": round(ev_std, 5),
+                "fragility": round(fragility, 4),
+                "hit_rate": round(hit_rate, 4),
+                "robustness_score": round(robustness, 4),
+            }
+        except Exception as e:
+            from loguru import logger
+            logger.debug(f"Monte Carlo failed: {e}")
+            return {"mean_ev": 0.0, "ev_std": 0.5, "fragility": 0.5, "hit_rate": 0.0, "robustness_score": 0.0}
+
+
 # ── Rejection tracking ────────────────────────────────────────────────────────
 
 @dataclass
@@ -59,6 +143,9 @@ class Multi:
     volatility_score: float = 0.0   # v2: sum of leg prediction variances
     conflict_detected: bool = False
     leg_ids: List[str] = field(default_factory=list)
+    robustness_score: float = 0.0    # from Monte Carlo; higher = more robust
+    fragility: float = 0.0           # P(0 legs win) from Monte Carlo
+    mc_hit_rate: float = 0.0         # simulated hit rate
 
 
 # ── Multi builder ─────────────────────────────────────────────────────────────
@@ -97,6 +184,7 @@ class MultiBuilder:
         self.max_correlation = max_correlation or settings.max_correlation_score
         self.min_ev = min_ev or settings.min_ev_threshold
         self.correlation_engine = CorrelationEngine()
+        self.mc_checker = MonteCarloRobustnessChecker(n_simulations=3000)
 
     def build(
         self,
@@ -254,15 +342,64 @@ class MultiBuilder:
             volatility_score * 10.0                # prediction variance stacking (max ~10)
         ))
 
-        # v2: objective score — balance EV and adj_prob
+        # Monte Carlo robustness check
+        probs = [leg.calibrated_probability for leg in legs]
+        odds_list = [leg.decimal_odds for leg in legs]
+        corr_matrix = np.eye(n)
+        for i in range(n):
+            for j in range(i + 1, n):
+                from app.correlation.engine import _get_pair_correlation
+                c = _get_pair_correlation(legs[i], legs[j])
+                corr_matrix[i, j] = c
+                corr_matrix[j, i] = c
+
+        mc_result = self.mc_checker.check(probs, odds_list, corr_matrix)
+
+        # Fragility gate: reject if P(0 legs win) > 70%
+        if mc_result["fragility"] > 0.70:
+            logger.debug(
+                "Multi rejected by MC fragility gate: fragility={:.2%}",
+                mc_result["fragility"],
+            )
+            # Return a sentinel Multi with ev below min_ev so the caller rejects it
+            # We signal rejection via a very negative ev
+            import hashlib
+            leg_key = "_".join(sorted(leg.leg_id for leg in legs))
+            multi_id = "M_" + hashlib.md5(leg_key.encode()).hexdigest()[:8]
+            return Multi(
+                multi_id=multi_id,
+                legs=legs,
+                n_legs=n,
+                multi_type=multi_type,
+                combined_odds=round(combined_odds, 2),
+                raw_probability=corr.raw_probability,
+                adjusted_probability=round(adj_prob, 6),
+                ev=-999.0,   # sentinel: will be filtered by min_ev gate in build()
+                correlation_score=corr.composite_score,
+                correlation_label=corr.correlation_label,
+                risk_score=round(risk, 1),
+                penalty_factor=corr.penalty_factor,
+                explanation=f"REJECTED: fragility={mc_result['fragility']:.2%} > 0.70",
+                objective_score=0.0,
+                volatility_score=round(volatility_score, 4),
+                conflict_detected=corr.conflict_detected,
+                leg_ids=[leg.leg_id for leg in legs],
+                robustness_score=round(mc_result["robustness_score"], 4),
+                fragility=round(mc_result["fragility"], 4),
+                mc_hit_rate=round(mc_result["hit_rate"], 4),
+            )
+
+        # v2: objective score — balance EV and adj_prob, boosted by MC robustness
         # sqrt(adj_prob) penalizes very low probability multis even if high EV
-        objective_score = float(ev * np.sqrt(max(0, adj_prob)))
+        objective_score = float(ev * np.sqrt(max(0, adj_prob)) * (1 + 0.1 * mc_result["robustness_score"]))
 
         leg_summaries = [f"{leg.selection}@{leg.decimal_odds:.2f}" for leg in legs]
         explanation = (
             f"{n}-leg {multi_type} multi: {', '.join(leg_summaries)}. "
             f"Adj. prob: {adj_prob:.1%}, EV: {ev:+.1%}, Risk: {risk:.0f}/100. "
-            f"Volatility: {volatility_score:.3f}. {corr.explanation}"
+            f"Volatility: {volatility_score:.3f}. MC hit_rate: {mc_result['hit_rate']:.1%}, "
+            f"fragility: {mc_result['fragility']:.1%}, robustness: {mc_result['robustness_score']:.3f}. "
+            f"{corr.explanation}"
         )
 
         import hashlib
@@ -287,6 +424,9 @@ class MultiBuilder:
             volatility_score=round(volatility_score, 4),
             conflict_detected=corr.conflict_detected,
             leg_ids=[leg.leg_id for leg in legs],
+            robustness_score=round(mc_result["robustness_score"], 4),
+            fragility=round(mc_result["fragility"], 4),
+            mc_hit_rate=round(mc_result["hit_rate"], 4),
         )
 
     def _rank(self, multis: List[Multi], mode: str) -> List[Multi]:

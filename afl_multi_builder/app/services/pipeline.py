@@ -31,6 +31,8 @@ from app.core.metrics import (
 )
 from app.pricing.signal_engine import SignalEngine
 from app.core.config import settings
+from app.core.trust import compute_trust_score, trust_label, compute_market_calibration_quality
+from app.core.adaptive_config import get_adaptive_config
 from app.services.preflight import PreflightService, PreflightError
 
 
@@ -107,7 +109,16 @@ class PredictionPipeline:
         self.leg_ranker = LegRanker()
         self.multi_builder = MultiBuilder()
         self.signal_engine = SignalEngine()
+        self.adaptive_cfg = get_adaptive_config()
         self.run_id = str(uuid.uuid4())[:8]
+
+        # Latest evaluation report for market calibration quality (best-effort)
+        self._latest_eval_report: Dict = {}
+        try:
+            from app.services.evaluation import EvaluationService
+            self._latest_eval_report = EvaluationService().evaluate(lookback_days=60)
+        except Exception:
+            pass
 
         # Name lookups — populated in run()
         self._team_names: Dict[int, str] = {}
@@ -440,6 +451,11 @@ class PredictionPipeline:
         legs = []
         meta = {}
 
+        # Adaptive gate: skip entire market if evaluation has disabled it
+        if not self.adaptive_cfg.is_market_enabled("head_to_head"):
+            logger.warning("head_to_head market disabled by adaptive config — skipping fixture {}", fixture_id)
+            return [], {}
+
         fx_features = team_features[team_features["fixture_id"] == fixture_id]
 
         # ── Step 1: ML ensemble probability ───────────────────────────────
@@ -563,10 +579,49 @@ class PredictionPipeline:
             )
             conf_label = _confidence_label(confidence)
 
+            # ── Trust score: how reliable is this estimate? ───────────────
+            n_hist = int(float(features_dict.get("home_roll_n_games", 0) or 0))
+            market_cal_quality = compute_market_calibration_quality(
+                "head_to_head", self._latest_eval_report
+            )
+            data_freshness_days = float(
+                1.0 / max(features_dict.get("data_freshness_score", 0.1), 0.01) * 14.0
+                if features_dict.get("data_freshness_score") else 7.0
+            )
+            trust = compute_trust_score(
+                n_games=n_hist,
+                data_completeness=sig_result.data_completeness,
+                signal_agreement=sig_result.signal_agreement,
+                n_active_signals=sig_result.n_active_signals,
+                prediction_variance=sig_result.prediction_variance,
+                prediction_low=sig_result.prediction_low,
+                prediction_high=sig_result.prediction_high,
+                market_calibration_quality=market_cal_quality,
+                data_freshness_days=data_freshness_days,
+            )
+            t_label = trust_label(trust)
+
+            # Adaptive trust gate: reject low-trust legs even if EV looks good
+            min_trust = self.adaptive_cfg.get("head_to_head", "min_trust", 30.0)
+            if trust < min_trust:
+                logger.debug(
+                    "H2H leg rejected (trust={:.1f} < {:.1f}): {} fixture={}",
+                    trust, min_trust, selection, fixture_id,
+                )
+                continue
+
+            # Adaptive odds gate
+            max_odds_adaptive = self.adaptive_cfg.get("head_to_head", "max_odds", settings.max_leg_odds)
+            if decimal_odds > max_odds_adaptive:
+                logger.debug(
+                    "H2H leg rejected (odds={:.2f} > adaptive max {:.2f}): {} fixture={}",
+                    decimal_odds, max_odds_adaptive, selection, fixture_id,
+                )
+                continue
+
             # ── Explanation ────────────────────────────────────────────────
             opponent = away_name if selection == "home_win" else home_name
             synth_note = " [SYNTHETIC ODDS — no real market data]" if is_synthetic else ""
-            n_hist = int(float(features_dict.get("home_roll_n_games", 0) or 0))
             data_note = (
                 f"Based on {n_hist} prior games."
                 if n_hist >= 5
@@ -586,7 +641,7 @@ class PredictionPipeline:
                 f"Consensus: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | "
                 f"Edge: {edge:+.1%} | EV: {ev:+.1%}. "
                 f"Signal agreement: {sig_result.signal_agreement:.0%} "
-                f"({sig_result.n_active_signals} signals). "
+                f"({sig_result.n_active_signals} signals). Trust: {trust:.0f}/100 ({t_label}). "
                 f"Signals: [{sig_detail}]. {ml_detail}. "
                 f"{data_note}{synth_note}"
             )
@@ -627,6 +682,8 @@ class PredictionPipeline:
                 "vig_adj_prob": vig_adj_prob,
                 "edge": edge,
                 "confidence_label": conf_label,
+                "trust_score": trust,
+                "trust_label_str": t_label,
                 "signal_agreement": sig_result.signal_agreement,
                 "signal_breakdown": {s.name: round(s.probability, 4) for s in sig_result.signals},
                 "top_factors": top_factors,
@@ -906,6 +963,8 @@ class PredictionPipeline:
             "prediction_low": round(leg.prediction_low, 4),
             "prediction_high": round(leg.prediction_high, 4),
             "prediction_interval_width": round(leg.prediction_high - leg.prediction_low, 4),
+            "trust_score": round(m.get("trust_score", 0.0), 1),
+            "trust_label": m.get("trust_label_str", "Unknown"),
 
             # Explanation
             "explanation": leg.explanation,

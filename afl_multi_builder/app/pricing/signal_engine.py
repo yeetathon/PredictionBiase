@@ -84,6 +84,23 @@ class SignalEngine:
     # std above this → agreement → 0
     _AGREEMENT_SCALE = 0.15
 
+    def __init__(self):
+        try:
+            from app.pricing.signal_weights import get_signal_weight_store
+            self._weight_store = get_signal_weight_store()
+        except Exception:
+            self._weight_store = None
+
+    def _get_signal_weight(self, market_type: str, signal_name: str, default: float) -> float:
+        """Get learned weight for a signal, falling back to hardcoded default."""
+        if self._weight_store is None:
+            return default
+        try:
+            weights = self._weight_store.get_weights(market_type)
+            return float(weights.get(signal_name, default))
+        except Exception:
+            return default
+
     def compute_h2h_signals(
         self,
         features: Dict,
@@ -115,10 +132,11 @@ class SignalEngine:
                 f"Elo: {stronger} stronger by {abs(elo_diff):.0f} pts "
                 f"({elo_home:.0f} vs {elo_away:.0f}), P(home)={elo_prob:.1%}"
             )
-        home_sigs.append(Signal("elo", elo_prob, 0.25, elo_reliability, elo_exp))
+        home_sigs.append(Signal("elo", elo_prob,
+                                self._get_signal_weight("head_to_head", "elo", 0.25),
+                                elo_reliability, elo_exp))
 
-        # ── Signal 2: Form (ewma win-rate, venue-adjusted) ────────────────
-        # v2: prefer ewma win rate (decay-weighted) over simple rolling rate
+        # ── Signal 2: Form (ewma win-rate, venue-adjusted, rest-adjusted) ──
         home_wr = float(features.get("home_roll_win_rate_ewma")
                         or features.get("home_roll_win_rate") or 0.5)
         away_wr = float(features.get("away_roll_win_rate_ewma")
@@ -129,13 +147,20 @@ class SignalEngine:
         home_form = 0.60 * home_wr + 0.40 * home_home_wr
         away_form = 0.60 * away_wr + 0.40 * away_away_wr
         form_diff = home_form - away_form
-        form_prob = float(np.clip(1.0 / (1.0 + np.exp(-form_diff * 5.0)), 0.10, 0.90))
+        # Rest advantage: clip to ±0.08 boost (±2.4 days advantage = ±0.08)
+        rest_diff = float(features.get("rest_advantage", 0.0))
+        rest_adj = float(np.clip(rest_diff / 30.0, -0.08, 0.08))
+        form_diff_adj = form_diff + rest_adj
+        form_prob = float(np.clip(1.0 / (1.0 + np.exp(-form_diff_adj * 5.0)), 0.10, 0.90))
         form_reliability = float(np.clip(n_games / 12.0, 0.05, 1.0))
+        rest_note = f" | rest adv {rest_diff:+.1f}d" if abs(rest_diff) >= 2 else ""
         form_exp = (
             f"Form (ewma): home {home_wr:.0%} WR (at-home {home_home_wr:.0%}) "
-            f"vs away {away_wr:.0%} WR (away {away_away_wr:.0%}); P(home)={form_prob:.1%}"
+            f"vs away {away_wr:.0%} WR (away {away_away_wr:.0%}){rest_note}; P(home)={form_prob:.1%}"
         )
-        home_sigs.append(Signal("form", form_prob, 0.20, form_reliability, form_exp))
+        home_sigs.append(Signal("form", form_prob,
+                                self._get_signal_weight("head_to_head", "form", 0.20),
+                                form_reliability, form_exp))
 
         # ── Signal 3: Scoring power + slope (v2: ewma not simple mean) ────
         # Use ewma scores if available, fall back to simple mean
@@ -176,7 +201,9 @@ class SignalEngine:
                 f"vs away {away_sc:.1f} (slope {away_slope:+.1f}); "
                 f"P(home)={scoring_prob:.1%}.{trend_note}"
             )
-        home_sigs.append(Signal("scoring", scoring_prob, 0.25, scoring_reliability, scoring_exp))
+        home_sigs.append(Signal("scoring", scoring_prob,
+                                self._get_signal_weight("head_to_head", "scoring", 0.25),
+                                scoring_reliability, scoring_exp))
 
         # ── Signal 4: H2H historical record (v2 NEW) ──────────────────────
         h2h_n = int(float(features.get("h2h_n_games") or 0))
@@ -196,13 +223,17 @@ class SignalEngine:
                 f"H2H ({h2h_n} meetings): home win rate {h2h_wr:.0%} "
                 f"(avg margin {h2h_diff:+.1f}); P(home)={h2h_prob:.1%}"
             )
-            home_sigs.append(Signal("h2h", h2h_prob, 0.20, h2h_reliability, h2h_exp))
+            home_sigs.append(Signal("h2h", h2h_prob,
+                                    self._get_signal_weight("head_to_head", "h2h", 0.20),
+                                    h2h_reliability, h2h_exp))
 
         # ── Signal 5: Market consensus ────────────────────────────────────
         if market_probs and "home_win" in market_probs:
             mkt_p = float(np.clip(market_probs["home_win"], 0.05, 0.95))
             home_sigs.append(Signal(
-                "market", mkt_p, 0.20, 0.90,
+                "market", mkt_p,
+                self._get_signal_weight("head_to_head", "market", 0.20),
+                0.90,
                 f"Bookmaker consensus: P(home)={mkt_p:.1%} (vig-adjusted)",
             ))
 
@@ -356,10 +387,47 @@ class SignalEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Known inter-signal correlations (not true independence — penalise redundancy)
+    _SIGNAL_CORRELATIONS = {
+        ("elo", "form"): 0.40,
+        ("form", "scoring"): 0.30,
+        ("h2h", "elo"): 0.30,
+        ("market", "elo"): 0.25,
+        ("market", "form"): 0.20,
+    }
+
+    def _compute_effective_weights(self, signals: List[Signal]) -> List[float]:
+        """
+        Reduce weights for signals that share information with others.
+        For each correlated pair (i, j) with correlation r, subtract
+        r * min(w_i, w_j) * 0.3 from both — penalises redundancy without
+        eliminating signals. Result is re-normalised.
+        """
+        names = [s.name for s in signals]
+        weights = [s.weight * s.reliability for s in signals]
+        total = sum(weights)
+        if total < 1e-6:
+            return weights
+
+        effective = list(weights)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                pair = tuple(sorted([names[i], names[j]]))
+                r = self._SIGNAL_CORRELATIONS.get(pair, 0.0)
+                if r > 0:
+                    penalty = r * min(effective[i], effective[j]) * 0.3
+                    effective[i] = max(0.0, effective[i] - penalty)
+                    effective[j] = max(0.0, effective[j] - penalty)
+
+        total_eff = sum(effective)
+        if total_eff > 1e-6:
+            effective = [e / total_eff for e in effective]
+        return effective
+
     def _build_result(
         self, signals: List[Signal], data_completeness: float
     ) -> SignalResult:
-        """Compute reliability-weighted consensus, agreement metrics, prediction interval."""
+        """Compute correlation-penalised consensus, agreement metrics, prediction interval."""
         if not signals:
             return SignalResult(
                 signals=[], consensus_probability=0.5,
@@ -370,7 +438,7 @@ class SignalEngine:
                 prediction_low=0.2, prediction_high=0.8,
             )
 
-        eff_weights = [s.weight * s.reliability for s in signals]
+        eff_weights = self._compute_effective_weights(signals)
         total_w = sum(eff_weights)
         n_active = sum(1 for w in eff_weights if w > 0.02)
 
@@ -471,5 +539,9 @@ class SignalEngine:
         # H2H bonus (v2)
         h2h_n = int(float(features.get("h2h_n_games") or 0))
         score += float(np.clip(h2h_n / 10.0, 0.0, 0.1))
+
+        # Data freshness: stale data reduces confidence in rolling features
+        freshness = float(features.get("data_freshness_score", 1.0) or 1.0)
+        score = score * (0.70 + 0.30 * freshness)
 
         return float(np.clip(score, 0.0, 1.0))

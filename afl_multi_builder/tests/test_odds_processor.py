@@ -1,26 +1,34 @@
 """Tests for odds processing layer."""
 import pytest
 import pandas as pd
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 from app.pricing.odds_processor import OddsProcessor, ProcessedOdds
 from app.core.metrics import implied_probability, remove_vig
 
-DEMO_DATA = Path(__file__).parent / "demo_data"
-
 
 def _make_loader():
-    from app.data_ingestion.demo_loader import (
-        DemoAFLDataProvider, DemoOddsProvider,
-        DemoWeatherProvider, DemoInjuryProvider,
-    )
+    """Build a minimal DataLoader with in-memory data (no API calls)."""
     from app.data_ingestion.loader import DataLoader
-    return DataLoader(
-        afl_provider=DemoAFLDataProvider(DEMO_DATA),
-        odds_provider=DemoOddsProvider(DEMO_DATA),
-        weather_provider=DemoWeatherProvider(DEMO_DATA),
-        injury_provider=DemoInjuryProvider(DEMO_DATA),
-    )
+
+    class _Provider:
+        @property
+        def fixtures_df(self):      return pd.DataFrame()
+        @property
+        def teams_df(self):         return pd.DataFrame()
+        @property
+        def players_df(self):       return pd.DataFrame()
+        @property
+        def team_stats_df(self):    return pd.DataFrame()
+        @property
+        def player_stats_df(self):  return pd.DataFrame()
+        def load_upcoming_fixtures_df(self):
+            return pd.DataFrame()
+
+    class _NullOdds:
+        @property
+        def odds_df(self): return pd.DataFrame()
+
+    return DataLoader(afl_provider=_Provider(), odds_provider=_NullOdds())
 
 
 class TestOddsProcessor:

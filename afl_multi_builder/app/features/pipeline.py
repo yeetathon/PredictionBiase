@@ -192,6 +192,12 @@ class TeamFeatureEngineer:
                 on="away_team_id", how="left"
             )
 
+        # Matchup style interaction features
+        if "home_roll_pace_score" in result.columns and "away_roll_pace_score" in result.columns:
+            result["pace_mismatch"] = abs(
+                result["home_roll_pace_score"].fillna(0) - result["away_roll_pace_score"].fillna(0)
+            )
+
         # H2H historical features
         h2h_feats = self._compute_h2h_features(completed)
         if not h2h_feats.empty:
@@ -221,6 +227,11 @@ class TeamFeatureEngineer:
                 diff_col = hc.replace("home_roll_", "diff_roll_")
                 result[diff_col] = result[hc].fillna(0) - result[ac].fillna(0)
 
+        # Travel & rest fatigue features
+        travel_rest = self._compute_travel_rest_features(all_fx)
+        if not travel_rest.empty:
+            result = result.merge(travel_rest, on="fixture_id", how="left")
+
         if "home_rest_days" in result.columns and "away_rest_days" in result.columns:
             result["diff_rest_days"] = (
                 result["home_rest_days"].fillna(7) - result["away_rest_days"].fillna(7)
@@ -229,6 +240,9 @@ class TeamFeatureEngineer:
         result["elo_diff"] = (
             result.get("elo_home_pre", 1500) - result.get("elo_away_pre", 1500)
         )
+
+        # Data freshness score
+        result["data_freshness_score"] = self._compute_data_freshness(all_fx, completed)
 
         return result
 
@@ -446,6 +460,49 @@ class TeamFeatureEngineer:
                     feat["roll_home_win_rate"] = 0.5
                     feat["roll_away_win_rate"] = 0.5
 
+                # Game script / style features
+                if n_games > 0 and win_lookup:
+                    blowout_wins = 0
+                    close_losses = 0
+                    n_wins = 0
+                    n_losses = 0
+                    pace_scores: List[float] = []
+                    for _, prow in prior.iterrows():
+                        pfid = int(prow["fixture_id"])
+                        p_is_home = int(prow.get("is_home", 0))
+                        hw = win_lookup.get(pfid)
+                        if hw is None:
+                            continue
+                        won = (p_is_home == 1 and hw == 1) or (p_is_home == 0 and hw == 0)
+                        # Margin calculation from fixture scores
+                        hs = completed_fixtures.loc[
+                            completed_fixtures["fixture_id"] == pfid, "home_score"
+                        ]
+                        as_ = completed_fixtures.loc[
+                            completed_fixtures["fixture_id"] == pfid, "away_score"
+                        ]
+                        if not hs.empty and not as_.empty and pd.notna(hs.iloc[0]) and pd.notna(as_.iloc[0]):
+                            h_sc = float(hs.iloc[0])
+                            a_sc = float(as_.iloc[0])
+                            total_score = h_sc + a_sc
+                            margin = abs(h_sc - a_sc)
+                            pace_scores.append(total_score)
+                            if won:
+                                n_wins += 1
+                                if margin > 30:
+                                    blowout_wins += 1
+                            else:
+                                n_losses += 1
+                                if margin < 12:
+                                    close_losses += 1
+                    feat["roll_blowout_rate"] = blowout_wins / n_wins if n_wins > 0 else 0.0
+                    feat["roll_close_loss_rate"] = close_losses / n_losses if n_losses > 0 else 0.0
+                    feat["roll_pace_score"] = float(np.mean(pace_scores)) if pace_scores else 0.0
+                else:
+                    feat["roll_blowout_rate"] = 0.0
+                    feat["roll_close_loss_rate"] = 0.0
+                    feat["roll_pace_score"] = 0.0
+
                 # Rest days
                 if has_date and n_games > 0:
                     try:
@@ -466,6 +523,98 @@ class TeamFeatureEngineer:
                 records.append(feat)
 
         return pd.DataFrame(records)
+
+    def _compute_travel_rest_features(self, fixtures: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute travel burden and rest/recovery features.
+
+        For each fixture, using only info available before kickoff:
+          - home_rest_days: days since home team's last game (default 7 if no prior game)
+          - away_rest_days: days since away team's last game (default 7 if no prior game)
+          - turnaround_flag: 1 if either team has < 6 days rest
+          - rest_advantage: home_rest_days - away_rest_days (positive = home better rested)
+
+        Uses the 'date' column to compute rest days. Sorts by date, for each team tracks
+        their previous game's date. Uses pd.to_datetime for date parsing.
+        """
+        if fixtures.empty or "date" not in fixtures.columns:
+            return pd.DataFrame()
+
+        fx = fixtures.copy()
+        fx["date_dt"] = pd.to_datetime(fx["date"], errors="coerce")
+        fx = fx.sort_values("date_dt").reset_index(drop=True)
+
+        last_game_date: Dict[int, pd.Timestamp] = {}
+        records = []
+
+        for _, row in fx.iterrows():
+            fid = int(row["fixture_id"])
+            home_id = int(row["home_team_id"])
+            away_id = int(row["away_team_id"])
+            game_date = row["date_dt"]
+
+            if pd.isna(game_date):
+                records.append({
+                    "fixture_id": fid,
+                    "home_rest_days": 7.0,
+                    "away_rest_days": 7.0,
+                    "turnaround_flag": 0,
+                    "rest_advantage": 0.0,
+                })
+                continue
+
+            home_last = last_game_date.get(home_id)
+            away_last = last_game_date.get(away_id)
+
+            home_rest = float((game_date - home_last).days) if home_last else 7.0
+            away_rest = float((game_date - away_last).days) if away_last else 7.0
+            home_rest = float(np.clip(home_rest, 2.0, 21.0))
+            away_rest = float(np.clip(away_rest, 2.0, 21.0))
+
+            records.append({
+                "fixture_id": fid,
+                "home_rest_days": round(home_rest, 1),
+                "away_rest_days": round(away_rest, 1),
+                "turnaround_flag": int(home_rest < 6 or away_rest < 6),
+                "rest_advantage": round(home_rest - away_rest, 1),
+            })
+
+            # Update last game date for both teams AFTER recording pre-game values
+            last_game_date[home_id] = game_date
+            last_game_date[away_id] = game_date
+
+        return pd.DataFrame(records)
+
+    def _compute_data_freshness(
+        self, fixtures: pd.DataFrame, completed: pd.DataFrame
+    ) -> pd.Series:
+        """
+        Compute a data_freshness_score per fixture row.
+
+        Days from the most recent completed fixture data point to the current fixture date.
+        Fresh data (< 7 days old) ≈ 1.0; staleness decays exponentially with
+        half-decay at 14 days: score = exp(-lag_days / 14).
+        """
+        fixtures = fixtures.copy()
+        fixtures["date_dt"] = pd.to_datetime(fixtures["date"], errors="coerce")
+
+        if completed.empty or "date" not in completed.columns:
+            return pd.Series(0.5, index=fixtures.index)
+
+        comp_copy = completed.copy()
+        comp_copy["date_dt"] = pd.to_datetime(comp_copy["date"], errors="coerce")
+        last_data_date = comp_copy["date_dt"].max()
+
+        if pd.isna(last_data_date):
+            return pd.Series(0.5, index=fixtures.index)
+
+        def freshness(row_date):
+            if pd.isna(row_date):
+                return 0.5
+            days_lag = max(0.0, float((row_date - last_data_date).days))
+            return float(np.exp(-days_lag / 14.0))  # half-decay at 14 days
+
+        return fixtures["date_dt"].apply(freshness)
 
     def get_fixture_features(self, fixture_id: int) -> Optional[Dict]:
         features = self.build_features()
@@ -731,6 +880,8 @@ class FeaturePipeline:
     def get_model_ready_match_data(self) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
         """Return (X, y, feature_names) for match win probability model."""
         features = self.get_team_features()
+        if "home_win" not in features.columns:
+            return pd.DataFrame(), pd.Series(dtype=float), []
         completed = features[
             (features["status"] == "completed") & features["home_win"].notna()
         ].copy()
@@ -738,14 +889,22 @@ class FeaturePipeline:
         if completed.empty:
             return pd.DataFrame(), pd.Series(dtype=float), []
 
+        # Exact-match columns to always include if present (new context-aware features)
+        _extra_cols = {
+            "rest_advantage", "turnaround_flag", "home_rest_days", "away_rest_days",
+            "diff_rest_days", "data_freshness_score", "pace_mismatch",
+        }
         feature_cols = [
             c for c in completed.columns
-            if c.startswith((
-                "elo_", "home_roll_", "away_roll_", "diff_roll_",
-                "home_rest_days", "away_rest_days", "diff_rest_days",
-                "h2h_",                  # H2H historical features
-                "temperature_c", "wind_speed_kmh", "is_rain", "wind_category",
-            ))
+            if (
+                c.startswith((
+                    "elo_", "home_roll_", "away_roll_", "diff_roll_",
+                    "home_rest_days", "away_rest_days", "diff_rest_days",
+                    "h2h_",                  # H2H historical features
+                    "temperature_c", "wind_speed_kmh", "is_rain", "wind_category",
+                ))
+                or c in _extra_cols
+            )
             and completed[c].dtype in [np.float64, np.int64, float, int]
         ]
 

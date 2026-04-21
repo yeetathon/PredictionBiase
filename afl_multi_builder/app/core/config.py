@@ -121,6 +121,16 @@ class Settings(BaseSettings):
     # Set to 0.0 to disable (not recommended).
     min_signal_agreement: float = 0.30
 
+    # ── Betting profile (controls adaptive threshold adjustments) ─────────
+    # conservative: 50% stricter edge/EV, +3pp prob, +10pt trust — fewer, stronger bets
+    # balanced    : defaults — standard precision/recall tradeoff
+    # research    : looser gates — for data collection and signal calibration
+    betting_profile: Literal["conservative", "balanced", "research"] = "balanced"
+
+    # ── Trust scoring (min trust_score 0-100 before a leg is accepted) ───
+    # Overrides the adaptive per-market setting if set higher
+    min_trust_score: float = 30.0
+
     # ── Training / Retraining ─────────────────────────────────────────────
     retrain_min_new_games: int = 10
     retrain_brier_degradation_threshold: float = 0.02

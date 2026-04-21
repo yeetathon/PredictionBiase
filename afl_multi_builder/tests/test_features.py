@@ -2,25 +2,86 @@
 import pytest
 import pandas as pd
 import numpy as np
-from pathlib import Path
 from app.features.pipeline import EloRatingSystem, FeaturePipeline
-
-DEMO_DATA = Path(__file__).parent / "demo_data"
 
 
 def _make_loader():
-    from app.data_ingestion.demo_loader import (
-        DemoAFLDataProvider,
-        DemoOddsProvider,
-        DemoWeatherProvider,
-        DemoInjuryProvider,
-    )
+    """Build a DataLoader backed by in-memory DataFrames (no API calls)."""
     from app.data_ingestion.loader import DataLoader
+
+    fixtures = pd.DataFrame([
+        {
+            "fixture_id": i, "season": 2024, "round": i,
+            "home_team_id": 1, "away_team_id": 2,
+            "home_team_name": "Melbourne", "away_team_name": "Collingwood",
+            "venue_id": 10, "date": f"2024-0{(i % 9) + 1}-{10 + i:02d}",
+            "time": "19:30", "status": "completed",
+            "result_home_score": (90 + i * 2) if i % 2 == 0 else (70 + i),
+            "result_away_score": (70 + i) if i % 2 == 0 else (90 + i * 2),
+            "home_score": float((90 + i * 2) if i % 2 == 0 else (70 + i)),
+            "away_score": float((70 + i) if i % 2 == 0 else (90 + i * 2)),
+            "home_win": int(i % 2 == 0),
+        }
+        for i in range(1, 11)
+    ])
+
+    teams = pd.DataFrame([
+        {"team_id": 1, "name": "Melbourne",   "abbreviation": "MEL"},
+        {"team_id": 2, "name": "Collingwood", "abbreviation": "COL"},
+    ])
+
+    players = pd.DataFrame([
+        {"player_id": 101, "team_id": 1, "first_name": "Alice", "last_name": "Smith",
+         "position": "midfielder", "jumper_number": 7},
+        {"player_id": 102, "team_id": 2, "first_name": "Bob",   "last_name": "Jones",
+         "position": "forward",    "jumper_number": 10},
+    ])
+
+    team_stats = pd.DataFrame([
+        {
+            "fixture_id": i, "team_id": 1 if j == 0 else 2,
+            "is_home": j == 0,
+            "kicks": 100 + i, "handballs": 80 + i, "disposals": 180 + i,
+            "goals": 12 + i % 3, "behinds": 8,
+            "score": 90 + i * 2 if j == 0 else 80 + i,
+        }
+        for i in range(1, 11)
+        for j in range(2)
+    ])
+
+    player_stats = pd.DataFrame([
+        {
+            "fixture_id": i, "player_id": 101 if j == 0 else 102,
+            "team_id": 1 if j == 0 else 2,
+            "disposals": 25 + i % 5, "kicks": 15 + i % 3,
+            "handballs": 10, "goals": 1, "marks": 5,
+        }
+        for i in range(1, 11)
+        for j in range(2)
+    ])
+
+    class _Provider:
+        @property
+        def fixtures_df(self):      return fixtures
+        @property
+        def teams_df(self):         return teams
+        @property
+        def players_df(self):       return players
+        @property
+        def team_stats_df(self):    return team_stats
+        @property
+        def player_stats_df(self):  return player_stats
+
+        def load_upcoming_fixtures_df(self):
+            return fixtures[fixtures["status"] == "upcoming"]
+
+    class _NullOdds:
+        @property
+        def odds_df(self): return pd.DataFrame()
+
     return DataLoader(
-        afl_provider=DemoAFLDataProvider(DEMO_DATA),
-        odds_provider=DemoOddsProvider(DEMO_DATA),
-        weather_provider=DemoWeatherProvider(DEMO_DATA),
-        injury_provider=DemoInjuryProvider(DEMO_DATA),
+        afl_provider=_Provider(),
+        odds_provider=_NullOdds(),
     )
 
 

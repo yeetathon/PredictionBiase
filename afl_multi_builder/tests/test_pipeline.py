@@ -58,8 +58,8 @@ def _make_minimal_loader(
         {"team_id": 2, "name": "Collingwood", "abbreviation": "COL"},
     ]
 
-    fx_df        = _df(fixtures    or default_fixtures)
-    teams_df     = _df(teams       or default_teams)
+    fx_df        = _df(default_fixtures if fixtures is None else fixtures)
+    teams_df     = _df(default_teams   if teams    is None else teams)
     players_df   = _df(players     or [])   # empty = player markets disabled
     ts_df        = _df(team_stats  or [])
     ps_df        = _df(player_stats or [])

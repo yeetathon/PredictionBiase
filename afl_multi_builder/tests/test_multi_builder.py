@@ -111,12 +111,12 @@ class TestLegRanker:
             make_leg("L1", ev=-0.05),
             make_leg("L2", ev=0.10),
         ]
-        ranked = ranker.rank(legs)
+        ranked, _ = ranker.rank(legs)
         assert all(l.ev >= 0.05 for l in ranked)
 
     def test_ranking_by_ev(self):
         legs = [make_leg(f"L{i}", ev=float(i)/20) for i in range(1, 6)]
-        ranked = self.ranker.rank(legs)
+        ranked, _ = self.ranker.rank(legs)
         evs = [l.ev for l in ranked]
         assert evs == sorted(evs, reverse=True)
 
@@ -130,5 +130,5 @@ class TestLegRanker:
             make_leg("L1", decimal_odds=1000.0, ev=50.0),  # Too extreme
             make_leg("L2", decimal_odds=1.95, ev=0.05),
         ]
-        ranked = self.ranker.rank(legs)
+        ranked, _ = self.ranker.rank(legs)
         assert all(1.01 <= l.decimal_odds <= 50.0 for l in ranked)
