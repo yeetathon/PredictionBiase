@@ -19,8 +19,12 @@ afl_multi_builder/data/logs/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
 
 # IDE
 .DS_Store
