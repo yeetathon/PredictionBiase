@@ -1,13 +1,15 @@
 """
 Data Sports Group (DSG) API client for AFL data.
 
-Endpoint pattern:
-    https://dsg-api.com/clients/{client}/australian_football/{endpoint}
-    ?client={client}&authkey={authkey}&ftype=json
+Correct URL pattern (confirmed by DSG):
+    https://dsg-api.com/clients/{client_name}/australian_football/{endpoint}
+    ?type={type}&id={id}&client={client_name}&authkey={client_authkey}
 
-Authentication: client + authkey as query parameters on every request.
-No quota limits — unlimited call rate.
-Responses cached to file to avoid redundant calls.
+Authentication: HTTP Basic Auth (client_name, authkey) PLUS the same
+credentials repeated as query params — both are required.
+
+All stats (team + player box score) come from get_matches?type=match&id={match_id}.
+There is no separate get_match endpoint.
 """
 from __future__ import annotations
 
@@ -85,21 +87,21 @@ class DSGClient:
     """
     HTTP client for the Data Sports Group (DSG) API — Australian Football.
 
-    Every request is authenticated with `client` + `authkey` query parameters
-    and requests JSON responses via `ftype=json`.
+    URL structure:
+        https://dsg-api.com/clients/{client}/australian_football/{endpoint}
+        ?type={type}&id={id}&client={client}&authkey={authkey}
 
-    AFL Advanced Pack endpoints used:
-        get_competitions  — league list
-        get_seasons       — season IDs for a competition
-        get_rounds        — rounds in a season
-        get_matches       — fixtures + results (all rounds)
-        get_matches_day   — fixtures for a specific date
-        get_matches_updates — live in-progress match updates
-        get_teams         — team master list
-        get_squad         — team roster / squad
-        get_people        — player profiles
-        get_tables        — ladder / standings
-        get_head2head     — head-to-head historical record
+    Authentication: HTTP Basic Auth (client, authkey) + same values as query params.
+
+    Available AFL endpoints (confirmed by DSG):
+        get_areas, get_competitions, get_contestants, get_deleted,
+        get_disciplines, get_drafts, get_head2head, get_matches,
+        get_matches_day, get_matches_updates, get_medals, get_news,
+        get_odds, get_peoples, get_peoples_updates, get_player_rankings,
+        get_rankings, get_rounds, get_seasons, get_season_venue, get_squad,
+        get_tables, get_team, get_trophies, get_venue
+
+    All match data including box scores use get_matches with type=match.
     """
 
     _SPORT = "australian_football"
@@ -114,7 +116,7 @@ class DSGClient:
         self._session = requests.Session()
         self._session.headers.update({
             "Accept": "application/json",
-            "User-Agent": "AFL-Multi-Builder/2.0",
+            "User-Agent": "AFL-Multi-Builder/3.0",
         })
 
     def is_configured(self) -> bool:
@@ -128,14 +130,15 @@ class DSGClient:
     def get(self, endpoint: str, params: Optional[Dict] = None,
             ttl: int = 3600) -> dict:
         """
-        GET /{sport}/{endpoint}?client=&authkey=&ftype=json
-        DSG URL format: https://dsg-api.com/australian_football/{endpoint}
+        GET /clients/{client}/australian_football/{endpoint}
+
+        Correct URL: https://dsg-api.com/clients/{client}/australian_football/{endpoint}
+        Auth: HTTP Basic Auth (client, authkey) + both as query params.
         """
         params = dict(params or {})
         params.update({
             "client": self._client,
             "authkey": self._authkey,
-            "ftype": "json",
         })
 
         cache_key = _FileCache.make_key(endpoint, params)
@@ -145,12 +148,18 @@ class DSGClient:
             cached["_source"] = "cache"
             return cached
 
-        url = f"{self._base}/{self._SPORT}/{endpoint}"
+        # Correct path: /clients/{client_name}/australian_football/{endpoint}
+        url = f"{self._base}/clients/{self._client}/{self._SPORT}/{endpoint}"
         last_exc: Optional[Exception] = None
 
         for attempt in range(self._MAX_RETRIES):
             try:
-                resp = self._session.get(url, params=params, timeout=30)
+                resp = self._session.get(
+                    url,
+                    params=params,
+                    auth=(self._client, self._authkey),  # HTTP Basic Auth required
+                    timeout=30,
+                )
 
                 if resp.status_code in (429, 500, 502, 503, 504):
                     wait = self._BACKOFF ** attempt
@@ -171,12 +180,9 @@ class DSGClient:
 
                 resp.raise_for_status()
 
-                # DSG may return XML even when ftype=json is set on some endpoints —
-                # detect and handle gracefully.
                 content_type = resp.headers.get("Content-Type", "")
                 if "xml" in content_type and "json" not in content_type:
-                    logger.warning("DSG {} returned XML instead of JSON — "
-                                   "endpoint may not support JSON format", endpoint)
+                    logger.warning("DSG {} returned XML instead of JSON", endpoint)
                     data = {"_xml_response": resp.text, "_source": "api_live"}
                 else:
                     data = resp.json()
@@ -204,18 +210,22 @@ class DSGClient:
     # ------------------------------------------------------------------
 
     def get_competitions(self, ttl: int = 86400 * 7) -> dict:
-        """List all competitions (used to find AFL competition ID)."""
+        """List all competitions."""
         return self.get("get_competitions", ttl=ttl)
 
     def get_seasons(self, competition_id: str, ttl: int = 86400) -> dict:
         """List seasons for a competition."""
         return self.get("get_seasons",
-                        params={"competition_id": competition_id}, ttl=ttl)
+                        params={"type": "competition", "id": competition_id}, ttl=ttl)
 
     def get_rounds(self, season_id: str, ttl: int = 3600) -> dict:
         """List rounds in a season."""
         return self.get("get_rounds",
-                        params={"season_id": season_id}, ttl=ttl)
+                        params={"type": "season", "id": season_id}, ttl=ttl)
+
+    def get_areas(self, ttl: int = 86400 * 7) -> dict:
+        """Geographic areas."""
+        return self.get("get_areas", ttl=ttl)
 
     # ------------------------------------------------------------------
     # Matches / fixtures
@@ -224,74 +234,161 @@ class DSGClient:
     def get_matches(self, season_id: str, ttl: int = 1800) -> dict:
         """All fixtures + results for a season."""
         return self.get("get_matches",
-                        params={"season_id": season_id}, ttl=ttl)
+                        params={"type": "season", "id": season_id}, ttl=ttl)
 
-    def get_matches_by_round(self, season_id: str, round_id: str,
-                             ttl: int = 1800) -> dict:
+    def get_matches_by_round(self, round_id: str, ttl: int = 1800) -> dict:
         """Fixtures for a specific round."""
         return self.get("get_matches",
-                        params={"season_id": season_id, "round_id": round_id},
-                        ttl=ttl)
+                        params={"type": "round", "id": round_id}, ttl=ttl)
+
+    def get_match(self, match_id: str, ttl: int = 86400) -> dict:
+        """
+        Full match details including box score, team stats, and player stats.
+        Uses get_matches?type=match&id={match_id} — confirmed correct endpoint.
+        There is no separate get_match endpoint in the DSG API.
+        """
+        return self.get("get_matches",
+                        params={"type": "match", "id": match_id}, ttl=ttl)
 
     def get_matches_day(self, date: str, ttl: int = 900) -> dict:
         """Fixtures for a specific date (YYYY-MM-DD)."""
-        return self.get("get_matches_day", params={"date": date}, ttl=ttl)
+        return self.get("get_matches_day",
+                        params={"type": "date", "id": date}, ttl=ttl)
 
     def get_matches_updates(self, ttl: int = 60) -> dict:
-        """Live in-progress match updates (very short TTL)."""
+        """Live in-progress match updates."""
         return self.get("get_matches_updates", ttl=ttl)
 
-    def get_match(self, match_id: str, ttl: int = 86400) -> dict:
-        """Full details for a single match (box score, events)."""
-        return self.get("get_match", params={"match_id": match_id}, ttl=ttl)
-
     # ------------------------------------------------------------------
-    # Teams / players
+    # Teams / contestants
     # ------------------------------------------------------------------
 
-    def get_teams(self, season_id: str, ttl: int = 86400 * 7) -> dict:
-        """Team master list for a season."""
-        return self.get("get_teams", params={"season_id": season_id}, ttl=ttl)
+    def get_contestants(self, season_id: str, ttl: int = 86400 * 7) -> dict:
+        """Team/contestant list for a season (replaces get_teams)."""
+        return self.get("get_contestants",
+                        params={"type": "season", "id": season_id}, ttl=ttl)
 
     def get_team(self, team_id: str, ttl: int = 86400) -> dict:
         """Single team profile."""
-        return self.get("get_team", params={"team_id": team_id}, ttl=ttl)
+        return self.get("get_team",
+                        params={"type": "team", "id": team_id}, ttl=ttl)
 
     def get_squad(self, team_id: str, season_id: str = "", ttl: int = 86400) -> dict:
         """Team roster / squad."""
-        params: Dict[str, Any] = {"team_id": team_id}
+        params: Dict[str, Any] = {"type": "team", "id": team_id}
         if season_id:
             params["season_id"] = season_id
         return self.get("get_squad", params=params, ttl=ttl)
 
+    def get_season_venue(self, season_id: str, ttl: int = 86400) -> dict:
+        """Venues used in a season."""
+        return self.get("get_season_venue",
+                        params={"type": "season", "id": season_id}, ttl=ttl)
+
+    def get_venue(self, venue_id: str, ttl: int = 86400 * 7) -> dict:
+        """Single venue profile."""
+        return self.get("get_venue",
+                        params={"type": "venue", "id": venue_id}, ttl=ttl)
+
+    # ------------------------------------------------------------------
+    # Players / people
+    # ------------------------------------------------------------------
+
     def get_people(self, person_id: str, ttl: int = 86400 * 7) -> dict:
         """Player/person profile."""
-        return self.get("get_people", params={"person_id": person_id}, ttl=ttl)
+        return self.get("get_peoples",
+                        params={"type": "person", "id": person_id}, ttl=ttl)
 
     def get_peoples(self, team_id: str = "", season_id: str = "",
                     ttl: int = 86400) -> dict:
         """List of players (optionally filtered by team/season)."""
         params: Dict[str, Any] = {}
         if team_id:
-            params["team_id"] = team_id
-        if season_id:
-            params["season_id"] = season_id
+            params["type"] = "team"
+            params["id"] = team_id
+        elif season_id:
+            params["type"] = "season"
+            params["id"] = season_id
         return self.get("get_peoples", params=params, ttl=ttl)
 
+    def get_peoples_updates(self, ttl: int = 300) -> dict:
+        """Live player availability / injury updates."""
+        return self.get("get_peoples_updates", ttl=ttl)
+
     # ------------------------------------------------------------------
-    # Standings / H2H
+    # Rankings
     # ------------------------------------------------------------------
+
+    def get_rankings(self, season_id: str, ttl: int = 3600) -> dict:
+        """Team rankings / ladder for a season."""
+        return self.get("get_rankings",
+                        params={"type": "season", "id": season_id}, ttl=ttl)
+
+    def get_player_rankings(self, season_id: str, ttl: int = 3600) -> dict:
+        """Player statistical rankings for a season."""
+        return self.get("get_player_rankings",
+                        params={"type": "season", "id": season_id}, ttl=ttl)
 
     def get_tables(self, season_id: str, ttl: int = 3600) -> dict:
         """Ladder / standings for a season."""
-        return self.get("get_tables", params={"season_id": season_id}, ttl=ttl)
+        return self.get("get_tables",
+                        params={"type": "season", "id": season_id}, ttl=ttl)
+
+    # ------------------------------------------------------------------
+    # Odds / news / misc
+    # ------------------------------------------------------------------
+
+    def get_odds(self, match_id: str, ttl: int = 300) -> dict:
+        """Bookmaker odds for a match."""
+        return self.get("get_odds",
+                        params={"type": "match", "id": match_id}, ttl=ttl)
+
+    def get_news(self, team_id: str = "", ttl: int = 1800) -> dict:
+        """News items, optionally filtered by team."""
+        params: Dict[str, Any] = {}
+        if team_id:
+            params["type"] = "team"
+            params["id"] = team_id
+        return self.get("get_news", params=params, ttl=ttl)
 
     def get_head2head(self, team1_id: str, team2_id: str,
                       ttl: int = 86400) -> dict:
         """Head-to-head historical record between two teams."""
         return self.get("get_head2head",
-                        params={"team_id": team1_id, "team2_id": team2_id},
-                        ttl=ttl)
+                        params={"type": "team", "id": team1_id,
+                                "team2_id": team2_id}, ttl=ttl)
+
+    def get_trophies(self, season_id: str = "", ttl: int = 86400 * 7) -> dict:
+        """Trophy / awards data."""
+        params: Dict[str, Any] = {}
+        if season_id:
+            params["type"] = "season"
+            params["id"] = season_id
+        return self.get("get_trophies", params=params, ttl=ttl)
+
+    def get_disciplines(self, ttl: int = 86400) -> dict:
+        """Disciplinary records."""
+        return self.get("get_disciplines", ttl=ttl)
+
+    def get_drafts(self, season_id: str = "", ttl: int = 86400) -> dict:
+        """Draft picks / history."""
+        params: Dict[str, Any] = {}
+        if season_id:
+            params["type"] = "season"
+            params["id"] = season_id
+        return self.get("get_drafts", params=params, ttl=ttl)
+
+    def get_deleted(self, ttl: int = 3600) -> dict:
+        """Deleted / voided records."""
+        return self.get("get_deleted", ttl=ttl)
+
+    def get_medals(self, season_id: str = "", ttl: int = 86400) -> dict:
+        """Medal / award records."""
+        params: Dict[str, Any] = {}
+        if season_id:
+            params["type"] = "season"
+            params["id"] = season_id
+        return self.get("get_medals", params=params, ttl=ttl)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -342,7 +439,6 @@ class DSGClient:
                 seasons = [seasons]
             if not seasons:
                 return None
-            # Sort by year descending, pick the most recent
             def _year(s):
                 return int(s.get("year") or s.get("name") or "0")
             seasons_sorted = sorted(seasons, key=_year, reverse=True)

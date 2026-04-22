@@ -461,8 +461,9 @@ class AFLDataLoader:
         if not self._season_id:
             return pd.DataFrame()
         try:
-            data = self._client.get_teams(season_id=self._season_id)
-            teams = self._extract_list(data, "teams", "team")
+            # get_teams does not exist in DSG — correct endpoint is get_contestants
+            data = self._client.get_contestants(season_id=self._season_id)
+            teams = self._extract_list(data, "contestants", "contestant", "teams", "team")
             for t in teams:
                 rows.append({
                     "team_id": _safe_int(t.get("id") or t.get("team_id")),

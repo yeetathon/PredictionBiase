@@ -204,10 +204,10 @@ class TestDSGClientMocked:
 
     def test_cache_hit_skips_http(self, client):
         cached_data = {"teams": [{"id": 1, "name": "Richmond"}]}
-        # Cache key excludes authkey — need params with authkey + ftype for key gen
+        # Cache key must match what get() generates (no ftype=json in new client)
         key = client._cache.make_key(
             "get_teams",
-            {"client": "testuser", "authkey": "TEST_KEY_AFL", "ftype": "json",
+            {"client": "testuser", "authkey": "TEST_KEY_AFL",
              "competitionId": 1, "year": 2024},
         )
         client._cache.set(key, cached_data)
