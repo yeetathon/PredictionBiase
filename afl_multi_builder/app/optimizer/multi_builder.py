@@ -319,26 +319,56 @@ class MultiBuilder:
         else:
             multi_type = "mixed"
 
-        # v2: volatility stacking — sum of prediction variances across legs
-        # High total variance = legs with uncertain predictions stacked together
+        # Prediction interval width gate: reject if combined CI is too wide
+        # Width > 0.55 on average means legs are individually too uncertain to stack
+        ci_widths = [
+            (leg.prediction_high - leg.prediction_low)
+            for leg in legs
+            if leg.prediction_high > 0.0 or leg.prediction_low > 0.0
+        ]
+        if ci_widths:
+            avg_ci_width = float(np.mean(ci_widths))
+            if avg_ci_width > 0.55:
+                logger.debug(
+                    "Multi rejected by CI-width gate: avg_width={:.3f} > 0.55",
+                    avg_ci_width,
+                )
+                import hashlib as _hl
+                leg_key = "_".join(sorted(leg.leg_id for leg in legs))
+                return Multi(
+                    multi_id="M_" + _hl.md5(leg_key.encode()).hexdigest()[:8],
+                    legs=legs, n_legs=n, multi_type=multi_type,
+                    combined_odds=round(combined_odds, 2),
+                    raw_probability=corr.raw_probability, adjusted_probability=round(adj_prob, 6),
+                    ev=-999.0, correlation_score=corr.composite_score,
+                    correlation_label=corr.correlation_label, risk_score=100.0,
+                    penalty_factor=corr.penalty_factor,
+                    explanation=f"REJECTED: avg CI width={avg_ci_width:.3f} > 0.55",
+                    objective_score=0.0, volatility_score=0.0,
+                    conflict_detected=corr.conflict_detected, leg_ids=[l.leg_id for l in legs],
+                    robustness_score=0.0, fragility=1.0, mc_hit_rate=0.0,
+                )
+
+        # Volatility stacking — sum of prediction variances across legs
         volatility_score = float(sum(leg.prediction_variance for leg in legs))
-        volatility_penalty = min(0.30, volatility_score * 5.0)  # cap at 30% penalty
 
-        # Signal disagreement average
-        avg_disagree = 0.0
-        n_with_signals = sum(1 for l in legs if l.signal_agreement > 0.0)
-        if n_with_signals > 0:
-            avg_disagree = sum(
-                1.0 - l.signal_agreement for l in legs if l.signal_agreement > 0.0
-            ) / n_with_signals
+        # Signal disagreement — weighted by market type (player props count more)
+        _market_weights = {"head_to_head": 0.9, "player_disposals": 1.2, "line": 1.0, "total": 1.0}
+        weighted_disagree_sum = 0.0
+        weight_total = 0.0
+        for l in legs:
+            if l.signal_agreement > 0.0:
+                mw = _market_weights.get(l.market_type, 1.0)
+                weighted_disagree_sum += mw * (1.0 - l.signal_agreement)
+                weight_total += mw
+        avg_disagree = weighted_disagree_sum / weight_total if weight_total > 0 else 0.0
 
-        # v2: risk score — more principled formula
-        # Components: low adj_prob, high correlation, more legs, signal uncertainty, volatility
+        # Risk score — more principled formula
         risk = min(100.0, (
             (1.0 - adj_prob) * 35.0 +            # probability risk (max 35)
             corr.composite_score * 25.0 +          # correlation risk (max 25)
             (n - 2) * 5.0 +                        # leg count risk (max ~10 for 4-leg)
-            avg_disagree * 20.0 +                  # signal uncertainty (max 20)
+            avg_disagree * 20.0 +                  # weighted signal uncertainty (max 20)
             volatility_score * 10.0                # prediction variance stacking (max ~10)
         ))
 
@@ -389,9 +419,15 @@ class MultiBuilder:
                 mc_hit_rate=round(mc_result["hit_rate"], 4),
             )
 
-        # v2: objective score — balance EV and adj_prob, boosted by MC robustness
-        # sqrt(adj_prob) penalizes very low probability multis even if high EV
-        objective_score = float(ev * np.sqrt(max(0, adj_prob)) * (1 + 0.1 * mc_result["robustness_score"]))
+        # Objective score: EV × sqrt(adj_prob) × robustness bonus × signal quality
+        # Signal quality = 1 - weighted_avg_disagreement, rewards high-agreement legs
+        signal_quality = max(0.0, 1.0 - avg_disagree)
+        objective_score = float(
+            ev
+            * np.sqrt(max(0, adj_prob))
+            * (1 + 0.10 * mc_result["robustness_score"])
+            * (0.70 + 0.30 * signal_quality)
+        )
 
         leg_summaries = [f"{leg.selection}@{leg.decimal_odds:.2f}" for leg in legs]
         explanation = (

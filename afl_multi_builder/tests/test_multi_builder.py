@@ -5,7 +5,9 @@ from app.correlation.engine import Leg
 
 
 def make_leg(leg_id, fixture_id=1, market_type="head_to_head", selection="home_win",
-             decimal_odds=1.90, prob=0.60, ev=0.14, conf=65.0, player_id=None, team_id=1):
+             decimal_odds=1.90, prob=0.60, ev=0.14, conf=65.0, player_id=None, team_id=1,
+             prediction_low=0.0, prediction_high=0.0, signal_agreement=0.0,
+             prediction_variance=0.0):
     return Leg(
         leg_id=leg_id,
         fixture_id=fixture_id,
@@ -18,6 +20,10 @@ def make_leg(leg_id, fixture_id=1, market_type="head_to_head", selection="home_w
         ev=ev,
         confidence_score=conf,
         explanation="Test leg",
+        prediction_low=prediction_low,
+        prediction_high=prediction_high,
+        signal_agreement=signal_agreement,
+        prediction_variance=prediction_variance,
     )
 
 
@@ -99,6 +105,107 @@ class TestMultiBuilder:
         multis = self.builder.build(legs, mode="safe", max_results=10)
         if len(multis) >= 2:
             assert multis[0].adjusted_probability >= multis[1].adjusted_probability
+
+
+class TestCIWidthGate:
+    """Stage 3: multi is rejected when avg prediction interval width > 0.55."""
+
+    def setup_method(self):
+        self.builder = MultiBuilder(min_legs=2, max_legs=4, max_correlation=0.9, min_ev=-0.5)
+
+    def _wide_leg(self, leg_id, fixture_id):
+        """Leg with very wide CI (width = 0.80 > 0.55)."""
+        return make_leg(
+            leg_id, fixture_id=fixture_id, decimal_odds=2.0, prob=0.55, ev=0.10,
+            prediction_low=0.10, prediction_high=0.90,  # width = 0.80
+        )
+
+    def _tight_leg(self, leg_id, fixture_id):
+        """Leg with tight CI (width = 0.10 < 0.55)."""
+        return make_leg(
+            leg_id, fixture_id=fixture_id, decimal_odds=2.0, prob=0.58, ev=0.12,
+            prediction_low=0.53, prediction_high=0.63,  # width = 0.10
+        )
+
+    def test_wide_ci_legs_rejected_by_sentinel_ev(self):
+        """Multis built from wide-CI legs should have ev=-999 (CI gate sentinel)."""
+        legs = [self._wide_leg(f"W{i}", i) for i in range(3)]
+        multis = self.builder.build(legs, n_legs=2, max_results=20)
+        # All should be rejected (ev=-999) or filtered (len=0)
+        for m in multis:
+            assert m.ev == pytest.approx(-999.0) or "REJECTED" in m.explanation
+
+    def test_tight_ci_legs_not_rejected_by_ci_gate(self):
+        """Multis from tight-CI legs should NOT be rejected by the CI gate."""
+        legs = [self._tight_leg(f"T{i}", i) for i in range(4)]
+        multis = self.builder.build(legs, max_results=20)
+        # At least some should survive (not all -999)
+        non_rejected = [m for m in multis if m.ev != pytest.approx(-999.0)]
+        assert len(non_rejected) > 0
+
+    def test_zero_ci_legs_not_rejected(self):
+        """Legs with prediction_low=prediction_high=0.0 are excluded from CI calc (no gate)."""
+        legs = [
+            make_leg(f"L{i}", fixture_id=i, decimal_odds=1.9, prob=0.58, ev=0.10,
+                     prediction_low=0.0, prediction_high=0.0)
+            for i in range(3)
+        ]
+        multis = self.builder.build(legs, n_legs=2, max_results=10)
+        # Should build normally (no CI widths to compute → gate not triggered)
+        non_rejected = [m for m in multis if "REJECTED: avg CI width" not in (m.explanation or "")]
+        assert len(non_rejected) > 0
+
+    def test_mixed_ci_average_below_threshold_passes(self):
+        """One wide + one tight leg where average CI width < 0.55 should pass."""
+        legs = [
+            make_leg("A", fixture_id=1, decimal_odds=2.0, prob=0.55, ev=0.10,
+                     prediction_low=0.40, prediction_high=0.70),  # width=0.30
+            make_leg("B", fixture_id=2, decimal_odds=2.0, prob=0.57, ev=0.12,
+                     prediction_low=0.48, prediction_high=0.66),  # width=0.18
+        ]
+        # avg width = (0.30+0.18)/2 = 0.24 < 0.55 → should NOT trigger CI gate
+        multis = self.builder.build(legs, n_legs=2, max_results=5)
+        ci_rejected = [m for m in multis if "REJECTED: avg CI width" in (m.explanation or "")]
+        assert len(ci_rejected) == 0
+
+
+class TestMarketWeightedSignalQuality:
+    """Stage 3: signal disagreement weighted by market type in objective score."""
+
+    def setup_method(self):
+        self.builder = MultiBuilder(min_legs=2, max_legs=4, max_correlation=0.9, min_ev=-0.5)
+
+    def test_high_signal_agreement_yields_higher_objective(self):
+        """Legs with high signal_agreement should rank above low-agreement legs."""
+        legs_agree = [
+            make_leg(f"A{i}", fixture_id=i, decimal_odds=2.0, prob=0.60, ev=0.20,
+                     signal_agreement=0.95, prediction_low=0.55, prediction_high=0.65)
+            for i in range(3)
+        ]
+        legs_disagree = [
+            make_leg(f"D{i}", fixture_id=i+10, decimal_odds=2.0, prob=0.60, ev=0.20,
+                     signal_agreement=0.10, prediction_low=0.55, prediction_high=0.65)
+            for i in range(3)
+        ]
+        multis_agree = self.builder.build(legs_agree, n_legs=2, max_results=5)
+        multis_disagree = self.builder.build(legs_disagree, n_legs=2, max_results=5)
+
+        if multis_agree and multis_disagree:
+            best_agree = max(m.objective_score for m in multis_agree)
+            best_disagree = max(m.objective_score for m in multis_disagree)
+            assert best_agree > best_disagree
+
+    def test_objective_score_positive_for_positive_ev(self):
+        """Multis with positive EV should have positive objective_score."""
+        legs = [
+            make_leg(f"L{i}", fixture_id=i, decimal_odds=2.0, prob=0.62, ev=0.24,
+                     signal_agreement=0.80, prediction_low=0.57, prediction_high=0.67)
+            for i in range(3)
+        ]
+        multis = self.builder.build(legs, n_legs=2, max_results=5)
+        valid = [m for m in multis if m.ev != pytest.approx(-999.0) and m.ev > 0]
+        for m in valid:
+            assert m.objective_score > 0.0
 
 
 class TestLegRanker:

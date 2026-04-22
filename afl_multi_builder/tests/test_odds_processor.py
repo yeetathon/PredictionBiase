@@ -106,3 +106,141 @@ class TestOddsProcessor:
         consensus = processor.get_market_consensus(64, "head_to_head")
         assert consensus is not None
         assert abs(sum(consensus.values()) - 1.0) < 0.01
+
+
+class TestPlayerDisposalsIndependentVig:
+    """Stage 3: player_disposals market uses independent over/under vig."""
+
+    def _make_player_odds_both_sides(self):
+        """Both over and under present for one player at a given line."""
+        return pd.DataFrame([
+            {
+                "odds_id": 10, "fixture_id": 1, "market_type": "player_disposals",
+                "selection": "player_42_over_25.5", "bookmaker": "Sportsbet",
+                "decimal_odds": 1.90, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+            {
+                "odds_id": 11, "fixture_id": 1, "market_type": "player_disposals",
+                "selection": "player_42_under_25.5", "bookmaker": "Sportsbet",
+                "decimal_odds": 1.95, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+        ])
+
+    def _make_player_odds_one_side_only(self):
+        """Only over is available (no under) for this player/line."""
+        return pd.DataFrame([
+            {
+                "odds_id": 12, "fixture_id": 1, "market_type": "player_disposals",
+                "selection": "player_99_over_18.5", "bookmaker": "TAB",
+                "decimal_odds": 2.10, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+        ])
+
+    def _make_player_odds_multi_bookmakers(self):
+        """Both sides present from two bookmakers — best odds selected."""
+        return pd.DataFrame([
+            {
+                "odds_id": 20, "fixture_id": 2, "market_type": "player_disposals",
+                "selection": "player_7_over_30.5", "bookmaker": "Sportsbet",
+                "decimal_odds": 1.80, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+            {
+                "odds_id": 21, "fixture_id": 2, "market_type": "player_disposals",
+                "selection": "player_7_over_30.5", "bookmaker": "TAB",
+                "decimal_odds": 1.85, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+            {
+                "odds_id": 22, "fixture_id": 2, "market_type": "player_disposals",
+                "selection": "player_7_under_30.5", "bookmaker": "Sportsbet",
+                "decimal_odds": 2.00, "timestamp": "2024-04-01T10:00:00", "status": "active",
+            },
+        ])
+
+    def test_both_sides_vig_adjusted_sum_to_one(self):
+        """When both over and under are present, vig-adj probs sum to 1."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(return_value=self._make_player_odds_both_sides())
+        result = processor.process_fixture_odds(1)
+        assert "player_disposals" in result
+        entries = result["player_disposals"]
+        assert len(entries) == 2
+        total_vig_adj = sum(e.vig_adjusted_prob for e in entries)
+        assert total_vig_adj == pytest.approx(1.0, abs=0.002)
+
+    def test_both_sides_overround_positive(self):
+        """Overround should be positive when both sides are present."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(return_value=self._make_player_odds_both_sides())
+        result = processor.process_fixture_odds(1)
+        for entry in result["player_disposals"]:
+            assert entry.overround > 0.0
+
+    def test_one_side_uses_raw_implied_no_normalisation(self):
+        """When only one side is available, vig_adjusted_prob == raw_implied_prob."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(return_value=self._make_player_odds_one_side_only())
+        result = processor.process_fixture_odds(1)
+        assert "player_disposals" in result
+        entries = result["player_disposals"]
+        assert len(entries) == 1
+        entry = entries[0]
+        # No normalisation — vig_adjusted = raw (best estimate with one side)
+        assert entry.vig_adjusted_prob == pytest.approx(entry.raw_implied_prob, abs=1e-6)
+        # Overround is 0 (unknown, single-sided)
+        assert entry.overround == 0.0
+
+    def test_one_side_raw_implied_correct(self):
+        """raw_implied_prob should equal 1/decimal_odds for one-sided market."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(return_value=self._make_player_odds_one_side_only())
+        result = processor.process_fixture_odds(1)
+        entry = result["player_disposals"][0]
+        expected = 1.0 / 2.10
+        assert entry.raw_implied_prob == pytest.approx(expected, abs=0.001)
+
+    def test_best_odds_selected_per_direction(self):
+        """When two bookmakers price the over, the higher odds wins."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(
+            return_value=self._make_player_odds_multi_bookmakers()
+        )
+        result = processor.process_fixture_odds(2)
+        entries = {e.selection: e for e in result["player_disposals"]}
+        over_entry = entries["player_7_over_30.5"]
+        # TAB offers 1.85 for over — should be selected over Sportsbet's 1.80
+        assert over_entry.decimal_odds == pytest.approx(1.85)
+
+    def test_multi_bookmaker_vig_adj_sums_to_one(self):
+        """Best-odds selected from multi-bookmaker player market still sums to 1."""
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(
+            return_value=self._make_player_odds_multi_bookmakers()
+        )
+        result = processor.process_fixture_odds(2)
+        total = sum(e.vig_adjusted_prob for e in result["player_disposals"])
+        assert total == pytest.approx(1.0, abs=0.002)
+
+    def test_player_market_routed_separately_from_h2h(self):
+        """player_disposals market is processed independently of head_to_head."""
+        both = pd.concat([
+            pd.DataFrame([
+                {"odds_id": 1, "fixture_id": 5, "market_type": "head_to_head",
+                 "selection": "home_win", "bookmaker": "TAB", "decimal_odds": 1.80,
+                 "timestamp": "", "status": "active"},
+                {"odds_id": 2, "fixture_id": 5, "market_type": "head_to_head",
+                 "selection": "away_win", "bookmaker": "TAB", "decimal_odds": 2.10,
+                 "timestamp": "", "status": "active"},
+            ]),
+            self._make_player_odds_both_sides().assign(fixture_id=5),
+        ], ignore_index=True)
+        processor = OddsProcessor(loader=_make_loader())
+        processor.loader.load_odds_df = MagicMock(return_value=both)
+        result = processor.process_fixture_odds(5)
+        assert "head_to_head" in result
+        assert "player_disposals" in result
+        # H2H vig-adj sums to 1
+        h2h_total = sum(e.vig_adjusted_prob for e in result["head_to_head"])
+        assert h2h_total == pytest.approx(1.0, abs=0.01)
+        # Player vig-adj also sums to 1 (independent)
+        pd_total = sum(e.vig_adjusted_prob for e in result["player_disposals"])
+        assert pd_total == pytest.approx(1.0, abs=0.002)

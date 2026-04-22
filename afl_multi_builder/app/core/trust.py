@@ -202,6 +202,127 @@ def trust_label(score: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def compute_player_trust_score(
+    n_games: int,
+    data_completeness: float,
+    signal_agreement: float,
+    n_active_signals: int,
+    prediction_variance: float,
+    prediction_low: float,
+    prediction_high: float,
+    role_stability: float = 1.0,
+    position_baseline_z: float = 0.0,
+    market_calibration_quality: float = 0.5,
+    data_freshness_days: float = 7.0,
+    lineup_certainty: float = 1.0,
+) -> float:
+    """
+    Player-prop-specific trust score in [0, 100].
+
+    Uses the same geometric-mean structure as ``compute_trust_score`` but with
+    parameters tuned for player disposals:
+
+    * Sigmoid midpoint at **8 games** (not 12) — players establish baselines faster.
+    * ``role_stability`` is a dedicated factor: unstable role = low trust even with
+      adequate sample size.
+    * ``position_baseline_z`` penalises predictions that are extreme outliers vs the
+      player's position population — high |z| → model may be mis-specified.
+
+    Parameters
+    ----------
+    n_games:
+        Completed games with disposals data for this player.
+    data_completeness:
+        Fraction of expected features present (0–1).
+    signal_agreement:
+        Agreement across independent prediction signals (0–1).
+    n_active_signals:
+        Signals with reliability > 0.1.
+    prediction_variance:
+        Variance of predicted probabilities across signals.
+    prediction_low / prediction_high:
+        80% prediction interval bounds.
+    role_stability:
+        Fraction of recent 5 games the player played the same position (0–1).
+        0.5 = alternating roles; 1.0 = rock-solid role.
+    position_baseline_z:
+        |z-score| of player's expected mean vs position-population mean.
+        Large values (>2) suggest the model may be using an outlier baseline.
+    market_calibration_quality:
+        Derived from recent Brier score for player_disposals market (0–1).
+    data_freshness_days:
+        Age of most recent underlying data in days.
+    lineup_certainty:
+        Confirmation that player is named / expected to play (0–1).
+        0.5 = late scratching risk; 1.0 = confirmed starter.
+    """
+    # ── Factor 1: Sample sufficiency (midpoint 8 games for players) ──────────
+    sample_factor: float = _sigmoid(float(n_games), midpoint=8.0, scale=3.0)
+
+    # ── Factor 2: Data completeness ───────────────────────────────────────────
+    completeness_factor: float = _clip(float(data_completeness), 0.0, 1.0)
+
+    # ── Factor 3: Signal coherence ────────────────────────────────────────────
+    signal_richness: float = _clip((n_active_signals - 1) / 3.0, 0.0, 1.0)
+    coherence_factor: float = (
+        0.7 * _clip(float(signal_agreement), 0.0, 1.0) + 0.3 * signal_richness
+    )
+
+    # ── Factor 4: Prediction interval tightness ───────────────────────────────
+    interval_width: float = float(prediction_high) - float(prediction_low)
+    tightness_factor: float = _clip(1.0 - interval_width / 0.60, 0.0, 1.0)
+
+    # ── Factor 5: Role stability (player-specific, weighted heavily) ──────────
+    # Unstable role → output is speculative. Below 0.6 stability, trust drops sharply.
+    role_factor: float = _clip(float(role_stability), 0.0, 1.0) ** 0.7
+
+    # ── Factor 6: Position baseline plausibility ──────────────────────────────
+    # |z| = 0 → factor = 1.0; |z| = 2 → factor ≈ 0.6; |z| > 3 → factor ≈ 0.4
+    z = _clip(abs(float(position_baseline_z)), 0.0, 4.0)
+    baseline_factor: float = _clip(1.0 / (1.0 + 0.3 * z), 0.3, 1.0)
+
+    # ── Factor 7: Lineup certainty ────────────────────────────────────────────
+    lineup_factor: float = _clip(float(lineup_certainty), 0.0, 1.0)
+
+    # ── Factor 8: Market calibration quality ──────────────────────────────────
+    calibration_factor: float = _clip(float(market_calibration_quality), 0.1, 1.0)
+
+    # ── Factor 9: Data freshness ──────────────────────────────────────────────
+    freshness_factor: float = _clip(
+        math.exp(-float(data_freshness_days) / 14.0), 0.1, 1.0
+    )
+
+    factors = [
+        sample_factor,
+        completeness_factor,
+        coherence_factor,
+        tightness_factor,
+        role_factor,
+        baseline_factor,
+        lineup_factor,
+        calibration_factor,
+        freshness_factor,
+    ]
+
+    if any(f <= 0.0 for f in factors):
+        score = 0.0
+    else:
+        log_mean = sum(math.log(max(f, 1e-12)) for f in factors) / len(factors)
+        geo_mean = math.exp(log_mean)
+        score = _clip(geo_mean * 100.0, 0.0, 100.0)
+
+    logger.debug(
+        "compute_player_trust_score: sample={:.3f} complete={:.3f} coherence={:.3f} "
+        "tight={:.3f} role={:.3f} baseline={:.3f} lineup={:.3f} calib={:.3f} "
+        "fresh={:.3f} → {:.1f}",
+        sample_factor, completeness_factor, coherence_factor, tightness_factor,
+        role_factor, baseline_factor, lineup_factor, calibration_factor,
+        freshness_factor, score,
+    )
+
+    return round(score, 2)
+
+
 def compute_market_calibration_quality(
     market_type: str,
     eval_report: Optional[dict] = None,

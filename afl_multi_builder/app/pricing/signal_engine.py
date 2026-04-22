@@ -238,13 +238,13 @@ class SignalEngine:
             ))
 
         # ── Build results ─────────────────────────────────────────────────
-        home_result = self._build_result(home_sigs, data_completeness)
+        home_result = self._build_result(home_sigs, data_completeness, corr_table=self._SIGNAL_CORRELATIONS)
         away_sigs = [
             Signal(s.name, float(np.clip(1.0 - s.probability, 0.05, 0.95)),
                    s.weight, s.reliability, s.explanation)
             for s in home_sigs
         ]
-        away_result = self._build_result(away_sigs, data_completeness)
+        away_result = self._build_result(away_sigs, data_completeness, corr_table=self._SIGNAL_CORRELATIONS)
 
         logger.debug(
             "SignalEngine H2H: home={:.1%} (agree={:.0%}, var={:.4f}, n_sig={}) | away={:.1%}",
@@ -261,6 +261,17 @@ class SignalEngine:
     # Player disposals signals
     # ------------------------------------------------------------------
 
+    # Player signal correlations: short/medium form share underlying data
+    _PLAYER_SIGNAL_CORRELATIONS = {
+        ("short_form_ewma", "medium_form"): 0.55,   # both from same rolling window
+        ("short_form_ewma", "slope_trend"): 0.35,   # slope derived from same vals
+        ("medium_form", "slope_trend"): 0.30,
+        ("venue_split", "short_form_ewma"): 0.20,   # venue split from same games
+        ("matchup", "short_form_ewma"): 0.10,       # partially correlated environment
+        ("ml_model", "medium_form"): 0.25,          # ML trained on same features
+        ("ml_model", "short_form_ewma"): 0.20,
+    }
+
     def compute_player_disposal_signals(
         self,
         player_features: Dict,
@@ -269,98 +280,150 @@ class SignalEngine:
         market_probs: Optional[Dict[str, float]] = None,
     ) -> Tuple[SignalResult, SignalResult]:
         """
-        Compute signals for player disposals over/under.
-        Returns (over_result, under_result).
+        Multi-signal consensus for player disposals over/under.
 
-        v2: uses ewma mean for short/medium form (more weight on recent games),
-            adds matchup signal (opponent allowance vs line),
-            adds role stability penalty.
+        v3 additions:
+          - Venue split signal (home/away ewma)
+          - Position baseline signal (vs position population)
+          - Matchup advantage signal (recency-weighted opp allowance)
+          - Learned signal weights from SignalWeightStore
+          - Player-specific correlation penalties
+          - Role-stability reduces all signal reliabilities uniformly
         """
         n_games = int(float(player_features.get("n_games") or 0))
         role_stability = float(player_features.get("role_stability") or 1.0)
-        data_completeness = float(np.clip(n_games / 15.0, 0.0, 1.0)) * role_stability
+        role_transition = int(player_features.get("role_transition_flag") or 0)
+        # Transition flag → immediate reliability penalty on top of stability
+        transition_penalty = 0.70 if role_transition else 1.0
+        data_completeness = (
+            float(np.clip(n_games / 15.0, 0.0, 1.0)) * role_stability * transition_penalty
+        )
 
         over_sigs: List[Signal] = []
 
-        # v2: prefer ewma over simple mean for recent form
         ewma_val = float(player_features.get("roll_ewma") or 0.0)
         mean_3 = float(player_features.get("roll_mean_3") or 0.0)
         mean_5 = float(player_features.get("roll_mean_5") or 0.0)
-        mean_10 = float(player_features.get("roll_mean_10") or mean_5)
         std_5 = float(player_features.get("roll_std_5") or 5.0)
         roll_slope = float(player_features.get("roll_slope")
                            or player_features.get("form_trend") or 0.0)
         roll_iqr = float(player_features.get("roll_iqr") or 0.3)
+        ewma_venue = float(player_features.get("roll_ewma_venue") or ewma_val or mean_5)
+        home_away_split = float(player_features.get("home_away_split") or 0.0)
+        pos_baseline_z = float(player_features.get("position_baseline_z") or 0.0)
+        pos_mean_allow = float(player_features.get("position_mean_allowance") or mean_5 or 20.0)
+        matchup_adv = float(player_features.get("matchup_advantage") or 0.0)
 
-        # Effective std: IQR-based estimate is more robust
-        eff_std = max(4.0, std_5, roll_iqr * max(mean_5, 1.0))
+        # Effective std: IQR-based is more robust; blend with rolling std
+        roll_iqr_std = roll_iqr * max(mean_5, 1.0)
+        eff_std = max(4.0, 0.5 * std_5 + 0.5 * roll_iqr_std)
         from scipy.stats import norm as _norm
 
-        # ── Signal 1: Short-form (ewma-weighted, ~3 games) ────────────────
-        # Use ewma if available (it's decay-weighted), else fall back to mean_3
+        # ── Signal 1: Short-form EWMA (~3 games, decay-weighted) ──────────
         short_mean = ewma_val if ewma_val > 0 and n_games >= 3 else mean_3
         if short_mean > 0 and n_games >= 3:
             short_prob = float(np.clip(_norm.sf(line, loc=short_mean, scale=eff_std), 0.05, 0.95))
-            s1_rel = float(np.clip(n_games / 8.0, 0.2, 1.0)) * role_stability
+            s1_rel = float(np.clip(n_games / 8.0, 0.2, 1.0)) * role_stability * transition_penalty
             over_sigs.append(Signal(
-                "short_form_ewma", short_prob, 0.35, s1_rel,
+                "short_form_ewma", short_prob,
+                self._get_signal_weight("player_disposals", "short_form", 0.30),
+                s1_rel,
                 f"EWMA {short_mean:.1f} vs line {line}; P(over)={short_prob:.1%} (std≈{eff_std:.1f})",
             ))
 
-        # ── Signal 2: Medium-form (5-game average) ────────────────────────
+        # ── Signal 2: Medium-form (5-game mean) ───────────────────────────
         if mean_5 > 0 and n_games >= 5:
             med_prob = float(np.clip(_norm.sf(line, loc=mean_5, scale=eff_std), 0.05, 0.95))
-            s2_rel = float(np.clip(n_games / 12.0, 0.2, 1.0)) * role_stability
+            s2_rel = float(np.clip(n_games / 12.0, 0.2, 1.0)) * role_stability * transition_penalty
             over_sigs.append(Signal(
-                "medium_form", med_prob, 0.20, s2_rel,
+                "medium_form", med_prob,
+                self._get_signal_weight("player_disposals", "medium_form", 0.20),
+                s2_rel,
                 f"5-game avg {mean_5:.1f} vs line {line}; P(over)={med_prob:.1%}",
             ))
 
-        # ── Signal 3: Slope-adjusted projection ───────────────────────────
-        # Use linear regression slope: positive slope → project higher than mean
+        # ── Signal 3: Slope-adjusted trend ────────────────────────────────
         if mean_5 > 0 and n_games >= 5 and abs(roll_slope) > 0.3:
-            projected = mean_5 + roll_slope * 1.5   # 1.5 game projection
+            projected = mean_5 + roll_slope * 1.5
             trend_prob = float(np.clip(_norm.sf(line, loc=projected, scale=eff_std), 0.05, 0.95))
-            s3_rel = float(np.clip(n_games / 15.0, 0.1, 0.75)) * role_stability
+            s3_rel = float(np.clip(n_games / 15.0, 0.1, 0.75)) * role_stability * transition_penalty
             direction = "↑ improving" if roll_slope > 0 else "↓ declining"
             over_sigs.append(Signal(
-                "slope_trend", trend_prob, 0.15, s3_rel,
+                "slope_trend", trend_prob,
+                self._get_signal_weight("player_disposals", "trend", 0.12),
+                s3_rel,
                 f"Slope {roll_slope:+.1f}/game → projected {projected:.1f} ({direction}); "
                 f"P(over)={trend_prob:.1%}",
             ))
 
-        # ── Signal 4: Matchup — opponent allowance vs line (v2 NEW) ──────
+        # ── Signal 4: Venue split (home vs away historical ewma) ──────────
+        if abs(home_away_split) > 1.5 and n_games >= 4:
+            venue_prob = float(np.clip(_norm.sf(line, loc=ewma_venue, scale=eff_std), 0.05, 0.95))
+            # Reliability scales with |split| — strong splits are informative
+            s4_rel = float(np.clip(abs(home_away_split) / 5.0, 0.15, 0.65)) * role_stability
+            venue_note = "at home" if home_away_split > 0 and player_features.get("is_home_game") else "away"
+            over_sigs.append(Signal(
+                "venue_split", venue_prob,
+                self._get_signal_weight("player_disposals", "venue_split", 0.12),
+                s4_rel,
+                f"Venue ({venue_note}) ewma {ewma_venue:.1f} vs line {line}; "
+                f"split={home_away_split:+.1f}; P(over)={venue_prob:.1%}",
+            ))
+
+        # ── Signal 5: Matchup vs opponent position-specific allowance ─────
         opp_allow = float(player_features.get("opp_pos_disposals_allowed")
                           or player_features.get("opp_disposals_allowed_mean") or mean_5)
         if opp_allow > 0 and n_games >= 3:
             matchup_prob = float(np.clip(_norm.sf(line, loc=opp_allow, scale=eff_std), 0.05, 0.95))
-            # Reliability depends on how much opp_allow differs from population mean
-            s4_rel = float(np.clip(0.5 + abs(opp_allow - mean_5) / 10.0, 0.15, 0.70))
+            # Reliability: higher when opp allowance is clearly generous/restrictive
+            s5_rel = float(np.clip(0.40 + abs(matchup_adv) / 8.0, 0.15, 0.70))
             matchup_note = (
-                "generous opponent" if opp_allow > mean_5 + 3
-                else ("restrictive opponent" if opp_allow < mean_5 - 3 else "neutral opponent")
+                f"generous (+{matchup_adv:.1f})" if matchup_adv > 2
+                else (f"restrictive ({matchup_adv:.1f})" if matchup_adv < -2 else "neutral")
             )
             over_sigs.append(Signal(
-                "matchup", matchup_prob, 0.15, s4_rel,
-                f"Opp allows {opp_allow:.1f}/game ({matchup_note}); P(over)={matchup_prob:.1%}",
+                "matchup", matchup_prob,
+                self._get_signal_weight("player_disposals", "matchup", 0.15),
+                s5_rel,
+                f"Opp allows {opp_allow:.1f} ({matchup_note}); P(over)={matchup_prob:.1%}",
             ))
 
-        # ── Signal 5: ML model (if provided) ─────────────────────────────
+        # ── Signal 6: Position baseline plausibility ──────────────────────
+        # Low |z| → player is well-anchored to position norms → reliable signal
+        # High |z| → outlier player or unusual prediction → lower weight
+        if pos_mean_allow > 0 and n_games >= 3:
+            baseline_prob = float(np.clip(_norm.sf(line, loc=pos_mean_allow, scale=eff_std), 0.05, 0.95))
+            # Weight diminishes for extreme outliers (|z| > 1.5 player)
+            z_pen = float(np.clip(1.0 - abs(pos_baseline_z) / 3.0, 0.20, 0.80))
+            s6_rel = float(np.clip(n_games / 20.0, 0.1, 0.60)) * z_pen
+            over_sigs.append(Signal(
+                "position_baseline", baseline_prob,
+                self._get_signal_weight("player_disposals", "position_baseline", 0.08),
+                s6_rel,
+                f"Position avg {pos_mean_allow:.1f} vs line {line} (z={pos_baseline_z:+.2f}); "
+                f"P(over)={baseline_prob:.1%}",
+            ))
+
+        # ── Signal 7: ML model ────────────────────────────────────────────
         if model_over_prob is not None:
             ml_prob = float(np.clip(model_over_prob, 0.05, 0.95))
-            ml_rel = float(np.clip(n_games / 15.0, 0.1, 0.9)) * role_stability
+            ml_rel = float(np.clip(n_games / 15.0, 0.1, 0.9)) * role_stability * transition_penalty
             over_sigs.append(Signal(
-                "ml_model", ml_prob, 0.15, ml_rel,
+                "ml_model", ml_prob,
+                self._get_signal_weight("player_disposals", "ml", 0.10),
+                ml_rel,
                 f"XGBoost: P(over {line})={ml_prob:.1%}",
             ))
 
-        # ── Signal 6: Market ──────────────────────────────────────────────
+        # ── Signal 8: Market consensus ────────────────────────────────────
         sel_key = f"player_over_{line}"
         if market_probs and sel_key in market_probs:
             mkt_p = float(np.clip(market_probs[sel_key], 0.05, 0.95))
             over_sigs.append(Signal(
-                "market", mkt_p, 0.15, 0.85,
-                f"Market: P(over {line})={mkt_p:.1%}",
+                "market", mkt_p,
+                self._get_signal_weight("player_disposals", "market", 0.10),
+                0.85,
+                f"Market: P(over {line})={mkt_p:.1%} (vig-adjusted)",
             ))
 
         if not over_sigs:
@@ -374,13 +437,19 @@ class SignalEngine:
             )
             return empty, empty
 
-        over_result = self._build_result(over_sigs, data_completeness)
+        over_result = self._build_result(
+            over_sigs, data_completeness,
+            corr_table=self._PLAYER_SIGNAL_CORRELATIONS,
+        )
         under_sigs = [
             Signal(s.name, float(np.clip(1.0 - s.probability, 0.05, 0.95)),
                    s.weight, s.reliability, s.explanation)
             for s in over_sigs
         ]
-        under_result = self._build_result(under_sigs, data_completeness)
+        under_result = self._build_result(
+            under_sigs, data_completeness,
+            corr_table=self._PLAYER_SIGNAL_CORRELATIONS,
+        )
         return over_result, under_result
 
     # ------------------------------------------------------------------
@@ -396,13 +465,17 @@ class SignalEngine:
         ("market", "form"): 0.20,
     }
 
-    def _compute_effective_weights(self, signals: List[Signal]) -> List[float]:
+    def _compute_effective_weights(
+        self,
+        signals: List[Signal],
+        corr_table: Optional[Dict] = None,
+    ) -> List[float]:
         """
         Reduce weights for signals that share information with others.
-        For each correlated pair (i, j) with correlation r, subtract
-        r * min(w_i, w_j) * 0.3 from both — penalises redundancy without
-        eliminating signals. Result is re-normalised.
+        corr_table: override the default H2H correlation table (e.g. for player signals).
         """
+        if corr_table is None:
+            corr_table = self._SIGNAL_CORRELATIONS
         names = [s.name for s in signals]
         weights = [s.weight * s.reliability for s in signals]
         total = sum(weights)
@@ -413,7 +486,7 @@ class SignalEngine:
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
                 pair = tuple(sorted([names[i], names[j]]))
-                r = self._SIGNAL_CORRELATIONS.get(pair, 0.0)
+                r = corr_table.get(pair, 0.0)
                 if r > 0:
                     penalty = r * min(effective[i], effective[j]) * 0.3
                     effective[i] = max(0.0, effective[i] - penalty)
@@ -425,7 +498,10 @@ class SignalEngine:
         return effective
 
     def _build_result(
-        self, signals: List[Signal], data_completeness: float
+        self,
+        signals: List[Signal],
+        data_completeness: float,
+        corr_table: Optional[Dict] = None,
     ) -> SignalResult:
         """Compute correlation-penalised consensus, agreement metrics, prediction interval."""
         if not signals:
@@ -438,7 +514,7 @@ class SignalEngine:
                 prediction_low=0.2, prediction_high=0.8,
             )
 
-        eff_weights = self._compute_effective_weights(signals)
+        eff_weights = self._compute_effective_weights(signals, corr_table=corr_table)
         total_w = sum(eff_weights)
         n_active = sum(1 for w in eff_weights if w > 0.02)
 

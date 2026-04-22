@@ -659,9 +659,18 @@ class PlayerFeatureEngineer:
             ps = ps.merge(players[["player_id", "position"]], on="player_id", how="left")
 
         pop_mean = float(ps[stat_col].mean()) if stat_col in ps.columns and not ps[stat_col].empty else 20.0
+        pop_std = float(ps[stat_col].std()) if stat_col in ps.columns and not ps[stat_col].empty else 5.0
 
-        # Pre-compute opponent defensive strength per position
+        # Pre-compute opponent defensive strength per position (recency-weighted)
         opp_pos_allowance = self._compute_opp_position_allowance(ps, stat_col)
+        # Position-population stats for baseline z-score
+        pos_pop_stats = self._compute_position_population_stats(ps, stat_col)
+
+        # Home/away split: pre-group player-stats by home/away
+        ps["is_home_game"] = ps.apply(
+            lambda r: int(r["team_id"]) == int(r["home_team_id"]) if "home_team_id" in r else 0,
+            axis=1
+        )
 
         records = []
         for pid in ps["player_id"].unique():
@@ -685,15 +694,11 @@ class PlayerFeatureEngineer:
                     feat["roll_std_5"] = float(np.std(vals[-5:])) if n >= 3 else 0.0
                     feat["roll_max_5"] = float(np.max(vals[-5:])) if n >= 1 else 0.0
                     feat["roll_min_5"] = float(np.min(vals[-5:])) if n >= 1 else 0.0
-                    # Exponential decay mean: more weight on recent games
                     feat["roll_ewma"] = _ewma(vals[-10:], halflife=3.0)
-                    # Linear regression slope: genuine trend direction
                     feat["roll_slope"] = _form_slope(vals[-min(8, n):])
-                    # IQR consistency
                     feat["roll_iqr"] = _iqr_spread(vals[-self.window:])
                     mean5 = feat["roll_mean_5"]
                     feat["consistency_cv"] = feat["roll_std_5"] / mean5 if mean5 > 0 else 1.0
-                    # Legacy form trend (kept for compat)
                     feat["form_trend"] = (
                         float(np.mean(vals[-2:])) - float(np.mean(vals[-4:-2])) if n >= 4 else 0.0
                     )
@@ -707,6 +712,56 @@ class PlayerFeatureEngineer:
                         feat["role_stability"] = same / len(recent_pos) if len(recent_pos) > 0 else 1.0
                     else:
                         feat["role_stability"] = 1.0
+
+                    # Role transition score: did position change in last 3 games?
+                    if "position" in prior.columns and n >= 3:
+                        recent_3 = prior.iloc[-3:]["position"].fillna("Unknown").values
+                        n_unique = len(set(str(p) for p in recent_3))
+                        feat["role_transition_flag"] = int(n_unique > 1)
+                    else:
+                        feat["role_transition_flag"] = 0
+
+                    # Home/away split: separate ewma for home vs away games
+                    if "is_home_game" in prior.columns:
+                        is_home_this = int(row.get("is_home_game", 0))
+                        home_vals = prior[prior["is_home_game"] == 1][stat_col].dropna().values
+                        away_vals = prior[prior["is_home_game"] == 0][stat_col].dropna().values
+                        if len(home_vals) >= 2:
+                            feat["roll_ewma_home"] = _ewma(home_vals[-6:], halflife=3.0)
+                        else:
+                            feat["roll_ewma_home"] = feat["roll_ewma"]
+                        if len(away_vals) >= 2:
+                            feat["roll_ewma_away"] = _ewma(away_vals[-6:], halflife=3.0)
+                        else:
+                            feat["roll_ewma_away"] = feat["roll_ewma"]
+                        # Contextual form: use venue-specific average
+                        feat["roll_ewma_venue"] = (
+                            feat["roll_ewma_home"] if is_home_this else feat["roll_ewma_away"]
+                        )
+                        feat["home_away_split"] = (
+                            feat["roll_ewma_home"] - feat["roll_ewma_away"]
+                        )
+                        feat["is_home_game"] = is_home_this
+                    else:
+                        feat["roll_ewma_home"] = feat["roll_ewma"]
+                        feat["roll_ewma_away"] = feat["roll_ewma"]
+                        feat["roll_ewma_venue"] = feat["roll_ewma"]
+                        feat["home_away_split"] = 0.0
+                        feat["is_home_game"] = 0
+
+                    # Position baseline z-score
+                    cur_pos = str(row.get("position", "Unknown"))
+                    pos_stats = pos_pop_stats.get(cur_pos, {})
+                    if pos_stats:
+                        pos_mean = pos_stats["mean"]
+                        pos_std_val = pos_stats["std"]
+                        player_exp = feat["roll_ewma"]
+                        feat["position_baseline_z"] = (player_exp - pos_mean) / pos_std_val
+                        feat["position_mean_allowance"] = pos_mean
+                    else:
+                        feat["position_baseline_z"] = 0.0
+                        feat["position_mean_allowance"] = pop_mean
+
                 else:
                     feat.update({
                         "roll_mean_3": pop_mean, "roll_mean_5": pop_mean,
@@ -714,10 +769,14 @@ class PlayerFeatureEngineer:
                         "roll_max_5": pop_mean + 5, "roll_min_5": max(0.0, pop_mean - 5),
                         "roll_ewma": pop_mean, "roll_slope": 0.0, "roll_iqr": 0.3,
                         "consistency_cv": 0.25, "form_trend": 0.0, "n_games": 0,
-                        "role_stability": 0.5,
+                        "role_stability": 0.5, "role_transition_flag": 0,
+                        "roll_ewma_home": pop_mean, "roll_ewma_away": pop_mean,
+                        "roll_ewma_venue": pop_mean, "home_away_split": 0.0,
+                        "is_home_game": 0, "position_baseline_z": 0.0,
+                        "position_mean_allowance": pop_mean,
                     })
 
-                # Opponent defensive strength — position-specific
+                # Opponent defensive strength — position-specific (recency-weighted)
                 home_id = int(row["home_team_id"])
                 away_id = int(row["away_team_id"])
                 opp_id = away_id if int(row["team_id"]) == home_id else home_id
@@ -728,6 +787,8 @@ class PlayerFeatureEngineer:
                 opp_allow_pos = opp_pos_allowance.get(key_pos, opp_pos_allowance.get(key_all, pop_mean))
                 feat["opp_disposals_allowed_mean"] = round(float(opp_allow_pos), 2)
                 feat["opp_pos_disposals_allowed"] = round(float(opp_allow_pos), 2)
+                # Matchup advantage: how much does this opponent allow vs population?
+                feat["matchup_advantage"] = round(float(opp_allow_pos) - pop_mean, 2)
 
                 records.append(feat)
 
@@ -747,43 +808,65 @@ class PlayerFeatureEngineer:
         self, ps: pd.DataFrame, stat_col: str
     ) -> Dict:
         """
-        Compute how many disposals each team allows to each position on average.
-        Returns dict: {(team_id, position): mean_disposals_allowed}
-        Also includes {(team_id, "all"): overall_mean} as fallback.
+        Compute recency-weighted opponent allowance per (team_id, position).
+
+        Uses exponential decay (halflife=5 games per opponent) so that recent
+        defensive performance is weighted more than games from months ago.
+        Returns dict: {(team_id, position): ewma_mean_allowed}
+                    + {(team_id, "all"): overall_ewma} as fallback.
         """
         if stat_col not in ps.columns or ps.empty:
             return {}
 
-        result: Dict = {}
-        fixtures_grouped = ps.groupby("fixture_id")
+        team_pos_games: Dict = {}  # (opp_team_id, position) -> [(round, val)]
+        team_all_games: Dict = {}  # (opp_team_id, "all") -> [(round, val)]
 
-        # Iterate through games, compute opponent-team allowance
-        team_pos_stats: Dict = {}   # (opp_team_id, position) -> list of values
-        team_all_stats: Dict = {}   # (opp_team_id, "all") -> list of values
+        ordered = ps.sort_values(["season", "round", "fixture_id"])
 
-        # For each player's stat, the "opposing team" is whichever team the player is NOT on
-        for fid, group in ps.groupby("fixture_id"):
-            home_id = group["home_team_id"].iloc[0] if "home_team_id" in group.columns else None
-            away_id = group["away_team_id"].iloc[0] if "away_team_id" in group.columns else None
+        for _, prow in ordered.iterrows():
+            val = prow.get(stat_col)
+            if pd.isna(val):
+                continue
+            home_id = prow.get("home_team_id")
+            away_id = prow.get("away_team_id")
             if home_id is None or away_id is None:
                 continue
-            for _, prow in group.iterrows():
-                val = prow.get(stat_col)
-                if pd.isna(val):
-                    continue
-                # Opposing team (the team that "allowed" this stat)
-                opp = away_id if int(prow["team_id"]) == int(home_id) else home_id
-                pos = str(prow.get("position", "Unknown"))
-                key_pos = (int(opp), pos)
-                key_all = (int(opp), "all")
-                team_pos_stats.setdefault(key_pos, []).append(float(val))
-                team_all_stats.setdefault(key_all, []).append(float(val))
+            opp = int(away_id) if int(prow["team_id"]) == int(home_id) else int(home_id)
+            pos = str(prow.get("position", "Unknown"))
+            seq = int(prow.get("round", 0)) + int(prow.get("season", 0)) * 100
+            team_pos_games.setdefault((opp, pos), []).append((seq, float(val)))
+            team_all_games.setdefault((opp, "all"), []).append((seq, float(val)))
 
-        for key, vals in team_pos_stats.items():
-            result[key] = float(np.median(vals))   # median more robust than mean
-        for key, vals in team_all_stats.items():
-            result[key] = float(np.median(vals))
+        result: Dict = {}
+        for key, entries in team_pos_games.items():
+            entries.sort(key=lambda x: x[0])
+            vals = np.array([v for _, v in entries])
+            result[key] = _ewma(vals, halflife=5.0)
+        for key, entries in team_all_games.items():
+            entries.sort(key=lambda x: x[0])
+            vals = np.array([v for _, v in entries])
+            result[key] = _ewma(vals, halflife=5.0)
 
+        return result
+
+    def _compute_position_population_stats(
+        self, ps: pd.DataFrame, stat_col: str
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Return per-position population statistics used to compute baseline z-scores.
+        Dict: { position: {"mean": float, "std": float} }
+        """
+        if stat_col not in ps.columns or ps.empty:
+            return {}
+        result = {}
+        for pos, grp in ps.groupby("position"):
+            vals = grp[stat_col].dropna().values
+            if len(vals) < 5:
+                continue
+            result[str(pos)] = {
+                "mean": float(np.mean(vals)),
+                "std": float(max(np.std(vals), 1.0)),
+            }
         return result
 
     def get_player_prediction_features(
@@ -814,6 +897,14 @@ class PlayerFeatureEngineer:
 
         feat: Dict = {"fixture_id": fixture_id, "player_id": player_id, "position": position}
 
+        pop_std = float(player_stats["disposals"].std()) if "disposals" in player_stats.columns else 5.0
+
+        # Position population stats for baseline z-score
+        ps_all = player_stats.copy()
+        if not players.empty and "position" in players.columns:
+            ps_all = ps_all.merge(players[["player_id", "position"]], on="player_id", how="left")
+        pos_pop_stats = self._compute_position_population_stats(ps_all, "disposals")
+
         if n >= 1:
             feat["roll_mean_3"] = float(np.mean(vals[-3:])) if n >= 3 else float(np.mean(vals))
             feat["roll_mean_5"] = float(np.mean(vals[-5:])) if n >= 5 else float(np.mean(vals))
@@ -828,7 +919,45 @@ class PlayerFeatureEngineer:
             feat["consistency_cv"] = feat["roll_std_5"] / mean5 if mean5 > 0 else 0.25
             feat["form_trend"] = float(np.mean(vals[-2:])) - float(np.mean(vals[-4:-2])) if n >= 4 else 0.0
             feat["n_games"] = n
-            feat["role_stability"] = 1.0
+
+            # Role stability from recent position data
+            if "position" in pg.columns and n >= 2:
+                recent_pos = pg.iloc[-min(5, n):]["position"].fillna("Unknown").values if hasattr(pg, "columns") else []
+                same = sum(1 for p in recent_pos if str(p) == position)
+                feat["role_stability"] = same / len(recent_pos) if recent_pos.size > 0 else 1.0
+            else:
+                feat["role_stability"] = 1.0
+
+            # Role transition flag (last 3 games)
+            if "position" in pg.columns and n >= 3:
+                recent_3 = pg.iloc[-3:]["position"].fillna("Unknown").values
+                feat["role_transition_flag"] = int(len(set(str(p) for p in recent_3)) > 1)
+            else:
+                feat["role_transition_flag"] = 0
+
+            # Home/away splits (use all available games)
+            if "is_home" in pg.columns:
+                home_vals = pg[pg["is_home"] == 1]["disposals"].dropna().values
+                away_vals = pg[pg["is_home"] == 0]["disposals"].dropna().values
+                feat["roll_ewma_home"] = _ewma(home_vals[-6:], halflife=3.0) if len(home_vals) >= 2 else feat["roll_ewma"]
+                feat["roll_ewma_away"] = _ewma(away_vals[-6:], halflife=3.0) if len(away_vals) >= 2 else feat["roll_ewma"]
+                feat["home_away_split"] = feat["roll_ewma_home"] - feat["roll_ewma_away"]
+            else:
+                feat["roll_ewma_home"] = feat["roll_ewma"]
+                feat["roll_ewma_away"] = feat["roll_ewma"]
+                feat["home_away_split"] = 0.0
+
+            # Position baseline z-score
+            pos_stats = pos_pop_stats.get(position, {})
+            if pos_stats:
+                pos_mean = pos_stats["mean"]
+                pos_std_val = pos_stats["std"]
+                feat["position_baseline_z"] = (feat["roll_ewma"] - pos_mean) / pos_std_val
+                feat["position_mean_allowance"] = pos_mean
+            else:
+                feat["position_baseline_z"] = 0.0
+                feat["position_mean_allowance"] = pop_mean
+
         else:
             feat.update({
                 "roll_mean_3": pop_mean, "roll_mean_5": pop_mean,
@@ -836,7 +965,10 @@ class PlayerFeatureEngineer:
                 "roll_max_5": pop_mean + 5, "roll_min_5": max(0.0, pop_mean - 5),
                 "roll_ewma": pop_mean, "roll_slope": 0.0, "roll_iqr": 0.3,
                 "consistency_cv": 0.25, "form_trend": 0.0, "n_games": 0,
-                "role_stability": 0.5,
+                "role_stability": 0.5, "role_transition_flag": 0,
+                "roll_ewma_home": pop_mean, "roll_ewma_away": pop_mean,
+                "home_away_split": 0.0, "position_baseline_z": 0.0,
+                "position_mean_allowance": pop_mean,
             })
 
         feat["pos_midfielder"] = int(position == "Midfielder")
@@ -845,6 +977,7 @@ class PlayerFeatureEngineer:
         feat["pos_ruckman"] = int(position == "Ruckman")
         feat["opp_disposals_allowed_mean"] = pop_mean
         feat["opp_pos_disposals_allowed"] = pop_mean
+        feat["matchup_advantage"] = 0.0
 
         return feat
 

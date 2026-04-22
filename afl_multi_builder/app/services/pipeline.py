@@ -31,7 +31,10 @@ from app.core.metrics import (
 )
 from app.pricing.signal_engine import SignalEngine
 from app.core.config import settings
-from app.core.trust import compute_trust_score, trust_label, compute_market_calibration_quality
+from app.core.trust import (
+    compute_trust_score, trust_label, compute_market_calibration_quality,
+    compute_player_trust_score,
+)
 from app.core.adaptive_config import get_adaptive_config
 from app.services.preflight import PreflightService, PreflightError
 
@@ -742,6 +745,11 @@ class PredictionPipeline:
 
         players = self.loader.load_players_df()
 
+        # Market calibration quality for player_disposals trust component
+        player_market_cal = compute_market_calibration_quality(
+            "player_disposals", self._latest_eval_report
+        )
+
         for (pid, line), directions in processed.items():
             player_info = players[players["player_id"] == pid]
             team_id = int(player_info["team_id"].iloc[0]) if not player_info.empty else None
@@ -754,6 +762,19 @@ class PredictionPipeline:
             if feat is None:
                 continue
 
+            n_games = int(feat.get("n_games", 0))
+            role_stability = float(feat.get("role_stability", 1.0))
+            role_transition = int(feat.get("role_transition_flag", 0))
+
+            # Reject immediately if role is completely unstable (no reliable baseline)
+            if role_stability < 0.40 or (role_transition and n_games < 5):
+                logger.debug(
+                    "Player leg skipped (role unstable: stability={:.2f} transition={}) "
+                    "player={} fixture={}",
+                    role_stability, role_transition, pid, fixture_id,
+                )
+                continue
+
             feat_df = pd.DataFrame([feat])
             feature_cols = [
                 "roll_mean_3", "roll_mean_5", "roll_mean_10", "roll_std_5",
@@ -763,52 +784,153 @@ class PredictionPipeline:
             ]
             feat_df = feat_df.reindex(columns=feature_cols, fill_value=0)
 
+            # ── ML model probability ───────────────────────────────────────
             try:
                 raw_over_prob = float(player_model.predict_over_prob(feat_df, line)[0])
                 cal_over_prob = float(player_calibrator.calibrate(np.array([raw_over_prob]))[0])
             except Exception:
-                roll_mean = feat.get("roll_mean_5", 20.0)
-                from scipy.stats import norm
-                raw_over_prob = float(1.0 - norm.cdf(line, loc=roll_mean, scale=5.0))
-                cal_over_prob = raw_over_prob
+                roll_mean_fb = float(feat.get("roll_ewma") or feat.get("roll_mean_5", 20.0))
+                from scipy.stats import norm as _norm_fb
+                eff_std_fb = float(max(4.0, feat.get("roll_std_5", 5.0)))
+                cal_over_prob = float(_norm_fb.sf(line, loc=roll_mean_fb, scale=eff_std_fb))
 
             cal_over_prob = float(np.clip(cal_over_prob, 0.05, 0.95))
-            cal_under_prob = 1.0 - cal_over_prob
-            roll_mean = feat.get("roll_mean_5", 20.0)
-            n_games = feat.get("n_games", 0)
-            form_trend = feat.get("form_trend", 0.0)
-            trend_note = "trending up" if form_trend > 1 else ("trending down" if form_trend < -1 else "stable form")
 
-            for direction, model_prob in [("over", cal_over_prob), ("under", cal_under_prob)]:
+            # ── Vig-adjusted market probability ────────────────────────────
+            # Build market_probs dict for signal engine
+            market_probs_player: Dict[str, float] = {}
+            if "over" in directions and "under" in directions:
+                raw_over = 1.0 / directions["over"]["decimal_odds"]
+                raw_under = 1.0 / directions["under"]["decimal_odds"]
+                total_raw = raw_over + raw_under
+                if total_raw > 0:
+                    market_probs_player[f"player_over_{line}"] = raw_over / total_raw
+                    market_probs_player[f"player_under_{line}"] = raw_under / total_raw
+            elif "over" in directions:
+                # Only one side available: use raw implied as best estimate
+                market_probs_player[f"player_over_{line}"] = float(np.clip(
+                    1.0 / directions["over"]["decimal_odds"], 0.05, 0.95
+                ))
+            elif "under" in directions:
+                market_probs_player[f"player_under_{line}"] = float(np.clip(
+                    1.0 / directions["under"]["decimal_odds"], 0.05, 0.95
+                ))
+
+            # ── Full signal engine for player disposals ────────────────────
+            over_sig, under_sig = self.signal_engine.compute_player_disposal_signals(
+                player_features=feat,
+                line=line,
+                model_over_prob=cal_over_prob,
+                market_probs=market_probs_player,
+            )
+
+            roll_mean = float(feat.get("roll_ewma") or feat.get("roll_mean_5", 20.0))
+            form_trend = float(feat.get("form_trend", 0.0))
+            trend_note = (
+                "trending up" if form_trend > 1 else
+                ("trending down" if form_trend < -1 else "stable form")
+            )
+            pos_baseline_z = float(feat.get("position_baseline_z", 0.0))
+            freshness_days = float(feat.get("data_freshness_days", 7.0) if "data_freshness_days" in feat else 7.0)
+
+            for direction, sig_result in [("over", over_sig), ("under", under_sig)]:
                 if direction not in directions:
                     continue
                 d = directions[direction]
                 decimal_odds = d["decimal_odds"]
                 selection = d["selection"]
 
-                opp_sel = directions.get("under" if direction == "over" else "over", {})
-                if opp_sel:
-                    raw_imp = 1.0 / decimal_odds
-                    raw_opp_imp = 1.0 / opp_sel.get("decimal_odds", decimal_odds)
-                    total_imp = raw_imp + raw_opp_imp
-                    vig_adj_prob = raw_imp / total_imp if total_imp > 0 else 0.5
+                # Vig-adjusted probability for this direction
+                sel_key = f"player_{direction}_{line}"
+                if sel_key in market_probs_player:
+                    vig_adj_prob = market_probs_player[sel_key]
+                elif "over" in directions and "under" in directions:
+                    raw_this = 1.0 / decimal_odds
+                    raw_opp = 1.0 / directions["under" if direction == "over" else "over"]["decimal_odds"]
+                    total_raw = raw_this + raw_opp
+                    vig_adj_prob = raw_this / total_raw if total_raw > 0 else 0.5
                 else:
-                    vig_adj_prob = 1.0 / decimal_odds
+                    vig_adj_prob = float(np.clip(1.0 / decimal_odds, 0.05, 0.95))
+
+                # Blended model probability: 60% signal consensus + 40% ML
+                # (signal consensus already incorporates ML as one signal)
+                model_prob = float(np.clip(
+                    0.60 * sig_result.consensus_probability + 0.40 * (
+                        cal_over_prob if direction == "over" else (1.0 - cal_over_prob)
+                    ), 0.05, 0.95
+                ))
 
                 edge = compute_edge(model_prob, vig_adj_prob)
                 ev = compute_ev(model_prob, decimal_odds)
-                confidence = compute_confidence_score(model_prob, vig_adj_prob, edge, n_historical_games=n_games)
+
+                # Signal-aware confidence for player props
+                confidence = compute_signal_aware_confidence(
+                    signal_agreement=sig_result.signal_agreement,
+                    edge=edge,
+                    data_completeness=sig_result.data_completeness,
+                    prediction_variance=sig_result.prediction_variance,
+                    n_active_signals=sig_result.n_active_signals,
+                )
                 conf_label = _confidence_label(confidence)
 
-                selection_label = _make_selection_label(selection, player_name=player_name)
-                avg_note = f"5-game avg: {roll_mean:.1f}"
-                vs_line = "above" if direction == "over" else "below"
-                explanation = (
-                    f"{player_name} ({team_name}) {direction} {line} disposals in {match_label} (Rnd {round_no}). "
-                    f"{avg_note} — consistently {vs_line} this line. "
-                    f"Model: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | Edge: {edge:+.1%}. "
-                    f"Based on {int(n_games)} games, {trend_note}. Confidence: {conf_label}."
+                # ── Player-specific trust score ────────────────────────────
+                trust = compute_player_trust_score(
+                    n_games=n_games,
+                    data_completeness=sig_result.data_completeness,
+                    signal_agreement=sig_result.signal_agreement,
+                    n_active_signals=sig_result.n_active_signals,
+                    prediction_variance=sig_result.prediction_variance,
+                    prediction_low=sig_result.prediction_low,
+                    prediction_high=sig_result.prediction_high,
+                    role_stability=role_stability,
+                    position_baseline_z=pos_baseline_z,
+                    market_calibration_quality=player_market_cal,
+                    data_freshness_days=freshness_days,
+                    lineup_certainty=1.0,
                 )
+                t_label = trust_label(trust)
+
+                # Trust gate (player props use adaptive player_disposals config)
+                min_trust_player = self.adaptive_cfg.get("player_disposals", "min_trust", 35.0)
+                if trust < min_trust_player:
+                    logger.debug(
+                        "Player leg rejected (trust={:.1f} < {:.1f}): {} {} {:.1f} fixture={}",
+                        trust, min_trust_player, player_name, direction, line, fixture_id,
+                    )
+                    continue
+
+                # Adaptive odds gate
+                max_odds_player = self.adaptive_cfg.get("player_disposals", "max_odds", 3.50)
+                if decimal_odds > max_odds_player:
+                    logger.debug(
+                        "Player leg rejected (odds={:.2f} > {:.2f}): {} fixture={}",
+                        decimal_odds, max_odds_player, selection, fixture_id,
+                    )
+                    continue
+
+                # ── Explanation ────────────────────────────────────────────
+                selection_label = _make_selection_label(selection, player_name=player_name)
+                vs_line = "above" if direction == "over" else "below"
+                role_note = (
+                    f"⚠ role transition detected" if role_transition
+                    else (f"role stable ({role_stability:.0%})" if role_stability < 0.9 else "")
+                )
+                sig_detail = "; ".join(
+                    f"{s.name}={s.probability:.1%}(×{s.reliability:.0%})"
+                    for s in sig_result.signals
+                )
+                explanation = (
+                    f"{player_name} ({team_name}) {direction} {line} disposals in "
+                    f"{match_label} (Rnd {round_no}). "
+                    f"EWMA: {roll_mean:.1f} ({vs_line} line), {trend_note}. "
+                    f"Consensus: {model_prob:.1%} | Market: {vig_adj_prob:.1%} | "
+                    f"Edge: {edge:+.1%} | EV: {ev:+.1%}. "
+                    f"Signal agreement: {sig_result.signal_agreement:.0%} "
+                    f"({sig_result.n_active_signals} signals). "
+                    f"Trust: {trust:.0f}/100 ({t_label}). "
+                    f"Signals: [{sig_detail}]. "
+                    f"n={n_games} games. {role_note}"
+                ).strip()
 
                 leg_id = "L_" + hashlib.md5(f"{fixture_id}_{selection}".encode()).hexdigest()[:8]
 
@@ -824,6 +946,12 @@ class PredictionPipeline:
                     ev=ev,
                     confidence_score=confidence,
                     explanation=explanation,
+                    signal_agreement=sig_result.signal_agreement,
+                    prediction_variance=sig_result.prediction_variance,
+                    data_completeness=sig_result.data_completeness,
+                    n_active_signals=sig_result.n_active_signals,
+                    prediction_low=sig_result.prediction_low,
+                    prediction_high=sig_result.prediction_high,
                 ))
                 meta[leg_id] = {
                     "selection_label": selection_label,
@@ -837,9 +965,16 @@ class PredictionPipeline:
                     "vig_adj_prob": vig_adj_prob,
                     "edge": edge,
                     "confidence_label": conf_label,
+                    "trust_score": trust,
+                    "trust_label_str": t_label,
+                    "signal_agreement": sig_result.signal_agreement,
+                    "signal_breakdown": {s.name: round(s.probability, 4) for s in sig_result.signals},
+                    "top_factors": sig_result.top_factors[:3],
                     "line": line,
                     "direction": direction,
                     "roll_mean_5": roll_mean,
+                    "role_stability": role_stability,
+                    "n_games": n_games,
                 }
 
         return legs, meta
