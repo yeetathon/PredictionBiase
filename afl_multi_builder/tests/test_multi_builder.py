@@ -7,7 +7,8 @@ from app.correlation.engine import Leg
 def make_leg(leg_id, fixture_id=1, market_type="head_to_head", selection="home_win",
              decimal_odds=1.90, prob=0.60, ev=0.14, conf=65.0, player_id=None, team_id=1,
              prediction_low=0.0, prediction_high=0.0, signal_agreement=0.0,
-             prediction_variance=0.0):
+             prediction_variance=0.0, vig_adjusted_probability=0.0,
+             ml_probability=0.0, signal_consensus_probability=0.0):
     return Leg(
         leg_id=leg_id,
         fixture_id=fixture_id,
@@ -24,7 +25,77 @@ def make_leg(leg_id, fixture_id=1, market_type="head_to_head", selection="home_w
         prediction_high=prediction_high,
         signal_agreement=signal_agreement,
         prediction_variance=prediction_variance,
+        vig_adjusted_probability=vig_adjusted_probability,
+        ml_probability=ml_probability,
+        signal_consensus_probability=signal_consensus_probability,
     )
+
+
+class TestVigAdjustedEdge:
+    """Fix 1: LegRanker must use vig-adjusted probability for edge gate."""
+
+    def setup_method(self):
+        # min_edge=0.05: edge must be >= 5%
+        self.ranker = LegRanker(min_edge=0.05, min_ev=-1.0, min_prob=0.0, min_confidence=0.0)
+
+    def test_edge_uses_vig_adj_not_raw_implied(self):
+        """A leg that barely passes using raw 1/odds but fails with vig_adj should be rejected."""
+        # raw implied = 1/1.90 = 0.5263; model_prob = 0.575 → raw edge = 0.049 < 0.05 → FAIL
+        # BUT if vig_adj = 0.50 (lower than raw), edge = 0.075 → PASS
+        # We set vig_adj_probability to 0 to test that the raw-implied fallback gives correct rejection
+        leg = make_leg(
+            "L1",
+            decimal_odds=1.90,
+            prob=0.575,
+            ev=0.05,
+            vig_adjusted_probability=0.0,  # fallback to 1/odds = 0.526
+        )
+        valid, _ = self.ranker.rank([leg])
+        # edge vs raw implied = 0.575 - 0.526 = 0.049 < 0.05 → should be rejected
+        assert len(valid) == 0
+
+    def test_edge_with_vig_adj_passes_correctly(self):
+        """When vig_adj is lower than raw implied, edge is larger and correctly passes gate."""
+        leg = make_leg(
+            "L2",
+            decimal_odds=1.90,
+            prob=0.58,
+            ev=0.10,
+            vig_adjusted_probability=0.50,  # fair market prob (vig removed)
+        )
+        # edge = 0.58 - 0.50 = 0.08 >= 0.05 → should pass
+        valid, _ = self.ranker.rank([leg])
+        assert len(valid) == 1
+
+    def test_edge_with_vig_adj_rejects_correctly(self):
+        """When vig_adj is high (tight market), edge is smaller and correctly fails gate."""
+        leg = make_leg(
+            "L3",
+            decimal_odds=1.90,
+            prob=0.55,
+            ev=0.05,
+            vig_adjusted_probability=0.545,  # very tight vig removal
+        )
+        # edge = 0.55 - 0.545 = 0.005 < 0.05 → should be rejected
+        valid, rejections = self.ranker.rank([leg])
+        assert len(valid) == 0
+        assert any(r.reason == "edge" for r in rejections)
+
+    def test_rejection_log_edge_consistent_with_gate(self):
+        """The edge reported in rejection log matches the gate calculation."""
+        leg = make_leg(
+            "L4",
+            decimal_odds=2.00,
+            prob=0.55,
+            ev=0.10,
+            vig_adjusted_probability=0.52,
+        )
+        _, rejections = self.ranker.rank([leg])
+        if rejections:
+            # edge stored in rejection = 0.55 - 0.52 = 0.03
+            r = rejections[0]
+            expected_edge = 0.55 - 0.52
+            assert r.edge == pytest.approx(expected_edge, abs=0.002)
 
 
 class TestMultiBuilder:

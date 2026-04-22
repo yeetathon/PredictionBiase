@@ -50,3 +50,54 @@ def init_db():
     """Create all tables."""
     from app.db import models  # noqa: F401 - ensure models are registered
     Base.metadata.create_all(bind=engine)
+    run_migrations()
+
+
+def run_migrations():
+    """
+    Apply additive ALTER TABLE migrations for columns added after initial schema.
+    Uses try/except per column so partial failures don't block startup.
+    """
+    _new_generated_leg_cols = [
+        ("ml_probability", "REAL"),
+        ("signal_consensus_probability", "REAL"),
+        ("signal_agreement", "REAL"),
+        ("prediction_variance", "REAL"),
+        ("data_completeness", "REAL"),
+        ("trust_score", "REAL"),
+        ("n_games", "INTEGER"),
+    ]
+    _new_leg_settlement_cols = [
+        ("vig_adjusted_probability", "REAL"),
+        ("edge_at_prediction", "REAL"),
+        ("ml_probability", "REAL"),
+        ("signal_consensus_probability", "REAL"),
+        ("signal_agreement", "REAL"),
+        ("prediction_variance", "REAL"),
+        ("data_completeness", "REAL"),
+        ("trust_score", "REAL"),
+        ("n_games", "INTEGER"),
+    ]
+
+    with engine.connect() as conn:
+        for col, typ in _new_generated_leg_cols:
+            try:
+                conn.execute(
+                    __import__("sqlalchemy").text(
+                        f"ALTER TABLE generated_legs ADD COLUMN {col} {typ}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+        for col, typ in _new_leg_settlement_cols:
+            try:
+                conn.execute(
+                    __import__("sqlalchemy").text(
+                        f"ALTER TABLE leg_settlements ADD COLUMN {col} {typ}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                pass  # column already exists

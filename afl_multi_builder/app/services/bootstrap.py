@@ -63,6 +63,9 @@ class BootstrapCycleService:
         # ── Step 3: Self-evaluation ────────────────────────────────────
         report["steps"]["evaluation"] = self._step_evaluate()
 
+        # ── Step 3.5: Retrain meta-blender on settlement data ─────────
+        report["steps"]["meta_blend_train"] = self._step_train_meta_blender()
+
         # ── Step 4: Retrain if criteria met ────────────────────────────
         retrain_result = self._step_maybe_retrain(
             eval_result=report["steps"]["evaluation"],
@@ -114,6 +117,53 @@ class BootstrapCycleService:
             return {"status": "ok", **result}
         except Exception as exc:
             logger.exception("sync_settle_recent failed: {}", exc)
+            return {"status": "error", "error": str(exc)}
+
+    def _step_train_meta_blender(self) -> Dict[str, Any]:
+        """Re-fit MetaBlender on all available settlement data (best-effort)."""
+        try:
+            from app.core.meta_blender import MetaBlender
+            from app.db.database import SessionLocal
+            from app.db.models import LegSettlement
+
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(LegSettlement)
+                    .filter(LegSettlement.actual_outcome.isnot(None))
+                    .all()
+                )
+            finally:
+                db.close()
+
+            if not rows:
+                return {"status": "skipped", "reason": "no_settled_legs"}
+
+            legs = [
+                {
+                    "ml_probability": r.ml_probability,
+                    "signal_consensus_probability": r.signal_consensus_probability,
+                    "signal_agreement": r.signal_agreement,
+                    "prediction_variance": r.prediction_variance,
+                    "data_completeness": r.data_completeness,
+                    "trust_score": r.trust_score,
+                    "outcome": int(r.actual_outcome),
+                    "market_type": r.market_type or "head_to_head",
+                }
+                for r in rows
+                if r.actual_outcome in (0, 1)
+            ]
+
+            blender = MetaBlender()
+            results: Dict[str, Any] = {}
+            for mt in ("head_to_head", "player_disposals"):
+                market_legs = [l for l in legs if l["market_type"] == mt]
+                updated = blender.train_from_settlements(market_legs, market_type=mt)
+                results[mt] = {"updated": updated, "n_samples": len(market_legs)}
+
+            return {"status": "ok", "markets": results}
+        except Exception as exc:
+            logger.warning("meta_blend_train failed (non-fatal): {}", exc)
             return {"status": "error", "error": str(exc)}
 
     def _step_evaluate(self) -> Dict[str, Any]:

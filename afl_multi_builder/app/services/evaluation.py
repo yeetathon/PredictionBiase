@@ -270,6 +270,16 @@ class EvaluationService:
                     "decimal_odds": r.decimal_odds or 2.0,
                     "model_probability": r.model_probability or 0.5,
                     "outcome": int(r.actual_outcome),
+                    # Rich metadata (None if not yet populated)
+                    "vig_adj_prob": r.vig_adjusted_probability,
+                    "edge_at_prediction": r.edge_at_prediction,
+                    "ml_probability": r.ml_probability,
+                    "signal_consensus_probability": r.signal_consensus_probability,
+                    "signal_agreement": r.signal_agreement,
+                    "prediction_variance": r.prediction_variance,
+                    "data_completeness": r.data_completeness,
+                    "trust_score": r.trust_score,
+                    "n_games": r.n_games,
                 }
                 for r in rows
             ]
@@ -383,8 +393,12 @@ class EvaluationService:
             return []
         predicted_edges = []
         for l in legs:
-            vig_adj = l.get("vig_adj_prob", 1.0 / max(l["decimal_odds"], 1.01))
-            predicted_edges.append(float(l["model_probability"]) - float(vig_adj))
+            # Prefer stored edge_at_prediction, then vig_adj_prob, then raw implied fallback
+            if l.get("edge_at_prediction") is not None:
+                predicted_edges.append(float(l["edge_at_prediction"]))
+            else:
+                vig_adj = l.get("vig_adj_prob") or (1.0 / max(l["decimal_odds"], 1.01))
+                predicted_edges.append(float(l["model_probability"]) - float(vig_adj))
 
         edges = np.array(predicted_edges)
         outcomes = np.array([l["outcome"] for l in legs], dtype=float)
@@ -439,7 +453,8 @@ class EvaluationService:
             yp = np.array([l["model_probability"] for l in subset], dtype=float)
             od = np.array([l["decimal_odds"] for l in subset], dtype=float)
             vig_adj = np.array([
-                l.get("vig_adj_prob", 1.0 / max(l["decimal_odds"], 1.01))
+                l.get("vig_adj_prob") if l.get("vig_adj_prob") is not None
+                else 1.0 / max(l["decimal_odds"], 1.01)
                 for l in subset
             ], dtype=float)
             pred_edge = yp - vig_adj

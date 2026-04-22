@@ -308,12 +308,26 @@ class SettlementService:
                 settlement = LegSettlement(
                     leg_id=leg.id,
                     fixture_id=leg.fixture_id,
+                    market_type=leg.market_type,
+                    selection=leg.selection,
+                    decimal_odds=leg.decimal_odds,
+                    model_probability=leg.model_probability,
                     settled_at=datetime.utcnow(),
                     actual_outcome=outcome,
                     actual_home_score=fixture.result_home_score,
                     actual_away_score=fixture.result_away_score,
                     settlement_source="auto",
                     notes=None,
+                    # Rich metadata — enables trust/edge/signal analysis in evaluation
+                    vig_adjusted_probability=leg.vig_adjusted_probability,
+                    edge_at_prediction=leg.edge,
+                    ml_probability=leg.ml_probability,
+                    signal_consensus_probability=leg.signal_consensus_probability,
+                    signal_agreement=leg.signal_agreement,
+                    prediction_variance=leg.prediction_variance,
+                    data_completeness=leg.data_completeness,
+                    trust_score=leg.trust_score,
+                    n_games=leg.n_games,
                 )
                 db.add(settlement)
 

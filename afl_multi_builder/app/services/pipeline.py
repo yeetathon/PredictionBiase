@@ -37,6 +37,7 @@ from app.core.trust import (
 )
 from app.core.adaptive_config import get_adaptive_config
 from app.services.preflight import PreflightService, PreflightError
+from app.core.meta_blender import MetaBlender
 
 
 def _confidence_label(score: float) -> str:
@@ -114,6 +115,7 @@ class PredictionPipeline:
         self.signal_engine = SignalEngine()
         self.adaptive_cfg = get_adaptive_config()
         self.run_id = str(uuid.uuid4())[:8]
+        self.meta_blender = MetaBlender()
 
         # Latest evaluation report for market calibration quality (best-effort)
         self._latest_eval_report: Dict = {}
@@ -252,6 +254,9 @@ class PredictionPipeline:
             f"[{self.run_id}] Built: {len(value_multis)} value multis, "
             f"{len(safe_multis)} safe multis, {len(same_game_multis)} SGMs."
         )
+
+        # ── Stage 6.5: Persist quality legs to DB (enables settlement + evaluation) ──
+        self._persist_generated_legs(quality_legs, legs_meta)
 
         # ── Stage 7: Serialise results ─────────────────────────────────────
         logger.info(f"[{self.run_id}] Stage 7/7: Serialising results...")
@@ -515,24 +520,22 @@ class PredictionPipeline:
             market_probs=market_vig_probs,
         )
 
-        # ── Step 4: Blend ML + signal consensus ───────────────────────────
-        # Weighted blend: 50-60% ML ensemble + 40-50% signal consensus.
-        # Lean toward ML when signals disagree OR data is thin.
-        # Both signal_agreement AND data_completeness must be high to trust the consensus.
-        agree_weight = float(np.clip(home_sig.signal_agreement, 0.0, 1.0))
-        data_quality = float(np.clip(home_sig.data_completeness, 0.0, 1.0))
-        signal_quality = agree_weight * data_quality    # requires both to be high
-        ml_weight = 0.60 - signal_quality * 0.20        # 0.40–0.60
-        sig_weight = 1.0 - ml_weight                    # 0.60–0.40
-
+        # ── Step 4: Learned meta-blend of ML + signal consensus ───────────
+        # MetaBlender learns optimal weights from settled history.
+        # Falls back to signal-quality-weighted fixed blend if untrained.
         ml_home_prob_clipped = float(np.clip(ml_home_prob, 0.02, 0.98))
         home_consensus = float(np.clip(home_sig.consensus_probability, 0.02, 0.98))
         away_consensus = float(np.clip(away_sig.consensus_probability, 0.02, 0.98))
 
-        final_home_prob = float(np.clip(
-            ml_weight * ml_home_prob_clipped + sig_weight * home_consensus,
-            0.02, 0.98
-        ))
+        final_home_prob = self.meta_blender.blend(
+            ml_prob=ml_home_prob_clipped,
+            sig_prob=home_consensus,
+            sig_agree=home_sig.signal_agreement,
+            pred_var=home_sig.prediction_variance,
+            data_complete=home_sig.data_completeness,
+            trust=0.5,  # filled in after trust computation — placeholder here
+            market_type="head_to_head",
+        )
         final_away_prob = float(np.clip(1.0 - final_home_prob, 0.02, 0.98))
 
         # ── Context ────────────────────────────────────────────────────────
@@ -654,6 +657,12 @@ class PredictionPipeline:
 
             leg_id = "L_" + hashlib.md5(f"{fixture_id}_{selection}".encode()).hexdigest()[:8]
 
+            # Per-selection raw ML prob (home or away)
+            raw_ml_prob = ml_home_prob_clipped if selection == "home_win" else (
+                float(np.clip(1.0 - ml_home_prob_clipped, 0.02, 0.98))
+            )
+            raw_sig_prob = home_consensus if selection == "home_win" else away_consensus
+
             legs.append(Leg(
                 leg_id=leg_id,
                 fixture_id=fixture_id,
@@ -672,6 +681,9 @@ class PredictionPipeline:
                 n_active_signals=sig_result.n_active_signals,
                 prediction_low=sig_result.prediction_low,
                 prediction_high=sig_result.prediction_high,
+                vig_adjusted_probability=vig_adj_prob,
+                ml_probability=raw_ml_prob,
+                signal_consensus_probability=raw_sig_prob,
             ))
             meta[leg_id] = {
                 "selection_label": _make_selection_label(selection, team_name=team_name),
@@ -852,13 +864,17 @@ class PredictionPipeline:
                 else:
                     vig_adj_prob = float(np.clip(1.0 / decimal_odds, 0.05, 0.95))
 
-                # Blended model probability: 60% signal consensus + 40% ML
-                # (signal consensus already incorporates ML as one signal)
-                model_prob = float(np.clip(
-                    0.60 * sig_result.consensus_probability + 0.40 * (
-                        cal_over_prob if direction == "over" else (1.0 - cal_over_prob)
-                    ), 0.05, 0.95
-                ))
+                # Learned meta-blend: signal consensus + ML; falls back to fixed if untrained
+                raw_ml_prob_leg = cal_over_prob if direction == "over" else (1.0 - cal_over_prob)
+                model_prob = self.meta_blender.blend(
+                    ml_prob=float(np.clip(raw_ml_prob_leg, 0.05, 0.95)),
+                    sig_prob=float(np.clip(sig_result.consensus_probability, 0.05, 0.95)),
+                    sig_agree=sig_result.signal_agreement,
+                    pred_var=sig_result.prediction_variance,
+                    data_complete=sig_result.data_completeness,
+                    trust=0.5,  # placeholder; trust computed below
+                    market_type="player_disposals",
+                )
 
                 edge = compute_edge(model_prob, vig_adj_prob)
                 ev = compute_ev(model_prob, decimal_odds)
@@ -934,6 +950,8 @@ class PredictionPipeline:
 
                 leg_id = "L_" + hashlib.md5(f"{fixture_id}_{selection}".encode()).hexdigest()[:8]
 
+                raw_ml_prob_leg = cal_over_prob if direction == "over" else (1.0 - cal_over_prob)
+
                 legs.append(Leg(
                     leg_id=leg_id,
                     fixture_id=fixture_id,
@@ -952,6 +970,11 @@ class PredictionPipeline:
                     n_active_signals=sig_result.n_active_signals,
                     prediction_low=sig_result.prediction_low,
                     prediction_high=sig_result.prediction_high,
+                    vig_adjusted_probability=vig_adj_prob,
+                    ml_probability=float(np.clip(raw_ml_prob_leg, 0.05, 0.95)),
+                    signal_consensus_probability=float(np.clip(
+                        sig_result.consensus_probability, 0.05, 0.95
+                    )),
                 ))
                 meta[leg_id] = {
                     "selection_label": selection_label,
@@ -978,6 +1001,75 @@ class PredictionPipeline:
                 }
 
         return legs, meta
+
+    # ------------------------------------------------------------------
+    # DB persistence
+    # ------------------------------------------------------------------
+
+    def _persist_generated_legs(self, legs: List[Leg], legs_meta: Dict[str, Dict]) -> None:
+        """
+        Write quality legs to the generated_legs table so the settlement
+        service can later match outcomes and the evaluation service can
+        analyse true edge quality.
+        """
+        try:
+            from app.db.database import SessionLocal
+            from app.db.models import GeneratedLeg
+        except Exception:
+            return  # DB unavailable — non-fatal
+
+        if not legs:
+            return
+
+        db = SessionLocal()
+        try:
+            existing_ids = {
+                row[0] for row in db.query(GeneratedLeg.run_id).filter(
+                    GeneratedLeg.run_id == self.run_id
+                ).all()
+            }
+            if existing_ids:
+                return  # already persisted for this run
+
+            for leg in legs:
+                m = legs_meta.get(leg.leg_id, {})
+                db.add(GeneratedLeg(
+                    fixture_id=leg.fixture_id,
+                    player_id=leg.player_id,
+                    market_type=leg.market_type,
+                    selection=leg.selection,
+                    bookmaker=m.get("bookmaker", ""),
+                    decimal_odds=leg.decimal_odds,
+                    model_probability=leg.calibrated_probability,
+                    calibrated_probability=leg.calibrated_probability,
+                    market_implied_probability=(
+                        1.0 / leg.decimal_odds if leg.decimal_odds > 0 else None
+                    ),
+                    vig_adjusted_probability=leg.vig_adjusted_probability or None,
+                    edge=m.get("edge"),
+                    ev=leg.ev,
+                    confidence_score=leg.confidence_score,
+                    explanation=leg.explanation,
+                    run_id=self.run_id,
+                    # Rich metadata for meta-blend training + deep evaluation
+                    ml_probability=leg.ml_probability or None,
+                    signal_consensus_probability=leg.signal_consensus_probability or None,
+                    signal_agreement=leg.signal_agreement or None,
+                    prediction_variance=leg.prediction_variance or None,
+                    data_completeness=leg.data_completeness or None,
+                    trust_score=m.get("trust_score"),
+                    n_games=m.get("n_games"),
+                ))
+            db.commit()
+            logger.info(
+                "[{}] Persisted {} generated legs to DB (run_id={})",
+                self.run_id, len(legs), self.run_id,
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[{}] Failed to persist generated legs: {}", self.run_id, exc)
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # Helpers

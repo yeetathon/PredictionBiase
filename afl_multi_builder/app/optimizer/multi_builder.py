@@ -551,8 +551,12 @@ class LegRanker:
             reason, detail = self._reject_reason(leg)
             if reason:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                implied_mkt = 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
-                edge = leg.calibrated_probability - implied_mkt
+                # Use vig-adjusted probability for consistent edge reporting
+                fair_mkt = (
+                    leg.vig_adjusted_probability if leg.vig_adjusted_probability > 0
+                    else 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
+                )
+                edge = leg.calibrated_probability - fair_mkt
                 rejections.append(RejectionDetail(
                     leg_id=leg.leg_id,
                     selection=leg.selection,
@@ -608,8 +612,11 @@ class LegRanker:
         if leg.confidence_score < self.min_confidence:
             return "confidence", f"{leg.confidence_score:.0f} < {self.min_confidence:.0f}"
 
-        implied_market = 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
-        edge = leg.calibrated_probability - implied_market
+        fair_market = (
+            leg.vig_adjusted_probability if leg.vig_adjusted_probability > 0
+            else 1.0 / leg.decimal_odds if leg.decimal_odds > 0 else 1.0
+        )
+        edge = leg.calibrated_probability - fair_market
         if edge < self.min_edge:
             return "edge", f"{edge:.1%} < {self.min_edge:.0%}"
 
