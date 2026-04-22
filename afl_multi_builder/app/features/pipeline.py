@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.data_ingestion.loader import DataLoader
+from app.core.stat_registry import get_team_stat_cols, get_player_secondary_stats
 
 
 # ── Module-level feature helpers ──────────────────────────────────────────────
@@ -60,6 +61,11 @@ def _iqr_spread(vals: np.ndarray) -> float:
     q75, q25 = float(np.percentile(vals, 75)), float(np.percentile(vals, 25))
     median = float(np.median(vals))
     return float((q75 - q25) / max(median, 1.0))
+
+
+def _sdiv(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safe division — returns default when denominator is zero or negative."""
+    return numerator / denominator if denominator > 0 else default
 
 
 # ── Elo system ────────────────────────────────────────────────────────────────
@@ -363,10 +369,7 @@ class TeamFeatureEngineer:
 
         ts = ts.sort_values(["season", "round", "fixture_id"])
 
-        stat_cols = ["score", "disposals", "marks", "tackles", "inside_50s",
-                     "rebound_50s", "clearances", "contested_possessions",
-                     "metres_gained", "turnovers"]
-        stat_cols = [c for c in stat_cols if c in ts.columns]
+        stat_cols = [c for c in get_team_stat_cols() if c in ts.columns]
 
         win_lookup: Dict[int, int] = {}
         if "home_win" in completed_fixtures.columns:
@@ -519,6 +522,62 @@ class TeamFeatureEngineer:
                         feat["rest_days"] = 7.0
                 else:
                     feat["rest_days"] = 7.0
+
+                # ── Derived efficiency / style features ────────────────────
+                # These are ratios / differences computed from rolling means of
+                # component stats.  Named with roll_ prefix so they are
+                # automatically included by the home_roll_* / away_roll_* /
+                # diff_roll_* feature selector in get_model_ready_match_data().
+
+                # Kick quality
+                feat["roll_eff_kick_rate"] = _sdiv(
+                    feat.get("roll_effective_kicks_mean", 0.0),
+                    feat.get("roll_kicks_mean", 0.0),
+                )
+                feat["roll_eff_disposal_rate"] = _sdiv(
+                    feat.get("roll_effective_disposals_mean", 0.0),
+                    feat.get("roll_disposals_mean", 0.0),
+                )
+                feat["roll_eff_handball_rate"] = _sdiv(
+                    feat.get("roll_effective_handballs_mean", 0.0),
+                    feat.get("roll_handballs_mean", 0.0),
+                )
+                # Discipline
+                feat["roll_clanger_rate"] = _sdiv(
+                    feat.get("roll_clangers_mean", 0.0),
+                    feat.get("roll_disposals_mean", 0.0),
+                )
+                feat["roll_free_kick_diff"] = (
+                    feat.get("roll_frees_for_mean", 0.0)
+                    - feat.get("roll_frees_against_mean", 0.0)
+                )
+                # Territorial / scoring
+                feat["roll_inside_50_conversion"] = _sdiv(
+                    feat.get("roll_marks_inside_50_mean", 0.0),
+                    feat.get("roll_inside_50s_mean", 0.0),
+                )
+                feat["roll_scoring_efficiency"] = _sdiv(
+                    feat.get("roll_goals_mean", 0.0),
+                    feat.get("roll_inside_50s_mean", 0.0),
+                )
+                # Stoppage / ruck
+                feat["roll_hitout_advantage_rate"] = _sdiv(
+                    feat.get("roll_hitouts_to_advantage_mean", 0.0),
+                    feat.get("roll_hitouts_mean", 0.0),
+                )
+                feat["roll_stoppage_clearance_share"] = _sdiv(
+                    feat.get("roll_stoppage_clearances_mean", 0.0),
+                    feat.get("roll_clearances_mean", 0.0),
+                )
+                # Scoring chain / possession quality
+                feat["roll_scoring_chain_rate"] = _sdiv(
+                    feat.get("roll_score_involvements_mean", 0.0),
+                    feat.get("roll_disposals_mean", 0.0),
+                )
+                feat["roll_contested_poss_rate"] = _sdiv(
+                    feat.get("roll_contested_possessions_mean", 0.0),
+                    feat.get("roll_disposals_mean", 0.0),
+                )
 
                 records.append(feat)
 
@@ -774,6 +833,17 @@ class PlayerFeatureEngineer:
                         "roll_ewma_venue": pop_mean, "home_away_split": 0.0,
                         "is_home_game": 0, "position_baseline_z": 0.0,
                         "position_mean_allowance": pop_mean,
+                        # Secondary stat defaults (population-level priors)
+                        "player_sec_eff_disp": 0.0,
+                        "player_sec_clang": 0.0,
+                        "player_sec_tog": 75.0,
+                        "player_sec_sci": 0.0,
+                        "player_sec_cont": 0.0,
+                        "player_eff_disposal_rate": 0.65,
+                        "player_clanger_rate": 0.08,
+                        "player_score_chain_rate": 0.25,
+                        "player_tog_pct": 0.75,
+                        "player_contested_rate": 0.45,
                     })
 
                 # Opponent defensive strength — position-specific (recency-weighted)
@@ -789,6 +859,30 @@ class PlayerFeatureEngineer:
                 feat["opp_pos_disposals_allowed"] = round(float(opp_allow_pos), 2)
                 # Matchup advantage: how much does this opponent allow vs population?
                 feat["matchup_advantage"] = round(float(opp_allow_pos) - pop_mean, 2)
+
+                # ── Secondary DSG stats (v3) ───────────────────────────────
+                # Rolling EWMA of quality/efficiency stats alongside primary.
+                # Used to derive per-disposal rates that capture how productive
+                # a player's touches are, not just how many he accumulates.
+                for sec_stat, sec_key in [
+                    ("effective_disposals", "player_sec_eff_disp"),
+                    ("clangers",            "player_sec_clang"),
+                    ("time_on_ground_pct",  "player_sec_tog"),
+                    ("score_involvements",  "player_sec_sci"),
+                    ("contested_possessions", "player_sec_cont"),
+                ]:
+                    if sec_stat in prior.columns:
+                        sv = prior[sec_stat].dropna().values
+                        feat[sec_key] = _ewma(sv[-self.window * 2:], halflife=3.0) if len(sv) >= 1 else 0.0
+                    else:
+                        feat[sec_key] = 0.0
+
+                disp_ewma = max(feat.get("roll_ewma", 1.0), 1.0)
+                feat["player_eff_disposal_rate"] = _sdiv(feat["player_sec_eff_disp"], disp_ewma)
+                feat["player_clanger_rate"] = _sdiv(feat["player_sec_clang"], disp_ewma)
+                feat["player_score_chain_rate"] = _sdiv(feat["player_sec_sci"], disp_ewma)
+                feat["player_tog_pct"] = float(np.clip(feat["player_sec_tog"] / 100.0, 0.0, 1.0))
+                feat["player_contested_rate"] = _sdiv(feat["player_sec_cont"], disp_ewma)
 
                 records.append(feat)
 
@@ -1062,11 +1156,17 @@ class FeaturePipeline:
             if c in [
                 "roll_mean_3", "roll_mean_5", "roll_mean_10", "roll_std_5",
                 "roll_max_5", "roll_min_5",
-                "roll_ewma", "roll_slope", "roll_iqr",   # v2 additions
+                "roll_ewma", "roll_slope", "roll_iqr",
                 "consistency_cv", "form_trend", "n_games",
                 "opp_disposals_allowed_mean", "opp_pos_disposals_allowed",
                 "pos_midfielder", "pos_forward", "pos_defender", "pos_ruckman",
-                "role_stability",                         # v2 addition
+                "role_stability",
+                # v3 DSG secondary stat derived rates
+                "player_eff_disposal_rate",
+                "player_clanger_rate",
+                "player_score_chain_rate",
+                "player_tog_pct",
+                "player_contested_rate",
             ]
         ]
 

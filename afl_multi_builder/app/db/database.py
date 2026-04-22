@@ -101,3 +101,62 @@ def run_migrations():
                 conn.commit()
             except Exception:
                 pass  # column already exists
+
+        _new_player_stat_cols = [
+            ("effective_kicks", "INTEGER"),
+            ("effective_handballs", "INTEGER"),
+            ("effective_disposals", "INTEGER"),
+            ("clangers", "INTEGER"),
+            ("contested_marks", "INTEGER"),
+            ("marks_inside_50", "INTEGER"),
+            ("inside_50s", "INTEGER"),
+            ("rebound_50s", "INTEGER"),
+            ("centre_clearances", "INTEGER"),
+            ("stoppage_clearances", "INTEGER"),
+            ("hitouts_to_advantage", "INTEGER"),
+            ("score_involvements", "INTEGER"),
+            ("goal_assists", "INTEGER"),
+            ("one_percenters", "INTEGER"),
+            ("bounces", "INTEGER"),
+            ("frees_for", "INTEGER"),
+            ("frees_against", "INTEGER"),
+            ("supercoach_score", "REAL"),
+            ("rating_points", "REAL"),
+        ]
+        _new_team_stat_cols = [
+            ("effective_kicks", "INTEGER"),
+            ("effective_handballs", "INTEGER"),
+            ("effective_disposals", "INTEGER"),
+            ("clangers", "INTEGER"),
+            ("contested_marks", "INTEGER"),
+            ("marks_inside_50", "INTEGER"),
+            ("centre_clearances", "INTEGER"),
+            ("stoppage_clearances", "INTEGER"),
+            ("hitouts_to_advantage", "INTEGER"),
+            ("score_involvements", "INTEGER"),
+            ("goal_assists", "INTEGER"),
+            ("one_percenters", "INTEGER"),
+            ("bounces", "INTEGER"),
+        ]
+
+        for col, typ in _new_player_stat_cols:
+            try:
+                conn.execute(
+                    __import__("sqlalchemy").text(
+                        f"ALTER TABLE player_stats ADD COLUMN {col} {typ}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+        for col, typ in _new_team_stat_cols:
+            try:
+                conn.execute(
+                    __import__("sqlalchemy").text(
+                        f"ALTER TABLE team_stats ADD COLUMN {col} {typ}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                pass
