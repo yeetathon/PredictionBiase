@@ -68,6 +68,20 @@ def _sdiv(numerator: float, denominator: float, default: float = 0.0) -> float:
     return numerator / denominator if denominator > 0 else default
 
 
+# Mapping from get_player_secondary_stats() stat name → feature key stored in feat dict
+_SEC_STAT_KEYS: Dict[str, str] = {
+    "effective_disposals":   "player_sec_eff_disp",
+    "contested_possessions": "player_sec_cont",
+    "score_involvements":    "player_sec_sci",
+    "clangers":              "player_sec_clang",
+    "tackles":               "player_sec_tackles",
+    "marks":                 "player_sec_marks",
+    "inside_50s":            "player_sec_i50",
+    "goal_assists":          "player_sec_assists",
+    "time_on_ground_pct":    "player_sec_tog",
+}
+
+
 # ── Elo system ────────────────────────────────────────────────────────────────
 
 class EloRatingSystem:
@@ -839,11 +853,19 @@ class PlayerFeatureEngineer:
                         "player_sec_tog": 75.0,
                         "player_sec_sci": 0.0,
                         "player_sec_cont": 0.0,
+                        "player_sec_tackles": 0.0,
+                        "player_sec_marks": 0.0,
+                        "player_sec_i50": 0.0,
+                        "player_sec_assists": 0.0,
                         "player_eff_disposal_rate": 0.65,
                         "player_clanger_rate": 0.08,
                         "player_score_chain_rate": 0.25,
                         "player_tog_pct": 0.75,
                         "player_contested_rate": 0.45,
+                        "player_tackle_rate": 0.0,
+                        "player_mark_rate": 0.0,
+                        "player_i50_rate": 0.0,
+                        "player_assist_rate": 0.0,
                     })
 
                 # Opponent defensive strength — position-specific (recency-weighted)
@@ -864,13 +886,8 @@ class PlayerFeatureEngineer:
                 # Rolling EWMA of quality/efficiency stats alongside primary.
                 # Used to derive per-disposal rates that capture how productive
                 # a player's touches are, not just how many he accumulates.
-                for sec_stat, sec_key in [
-                    ("effective_disposals", "player_sec_eff_disp"),
-                    ("clangers",            "player_sec_clang"),
-                    ("time_on_ground_pct",  "player_sec_tog"),
-                    ("score_involvements",  "player_sec_sci"),
-                    ("contested_possessions", "player_sec_cont"),
-                ]:
+                for sec_stat in get_player_secondary_stats():
+                    sec_key = _SEC_STAT_KEYS[sec_stat]
                     if sec_stat in prior.columns:
                         sv = prior[sec_stat].dropna().values
                         feat[sec_key] = _ewma(sv[-self.window * 2:], halflife=3.0) if len(sv) >= 1 else 0.0
@@ -883,6 +900,10 @@ class PlayerFeatureEngineer:
                 feat["player_score_chain_rate"] = _sdiv(feat["player_sec_sci"], disp_ewma)
                 feat["player_tog_pct"] = float(np.clip(feat["player_sec_tog"] / 100.0, 0.0, 1.0))
                 feat["player_contested_rate"] = _sdiv(feat["player_sec_cont"], disp_ewma)
+                feat["player_tackle_rate"] = _sdiv(feat["player_sec_tackles"], disp_ewma)
+                feat["player_mark_rate"] = _sdiv(feat["player_sec_marks"], disp_ewma)
+                feat["player_i50_rate"] = _sdiv(feat["player_sec_i50"], disp_ewma)
+                feat["player_assist_rate"] = _sdiv(feat["player_sec_assists"], disp_ewma)
 
                 records.append(feat)
 
@@ -1116,7 +1137,18 @@ class FeaturePipeline:
         if completed.empty:
             return pd.DataFrame(), pd.Series(dtype=float), []
 
-        # Exact-match columns to always include if present (new context-aware features)
+        # ── Feature selection ─────────────────────────────────────────────────
+        # Strategy (target ~120 features, avoids overfitting on small AFL datasets):
+        #   • ALL diff_roll_* except _std and _iqr variants (relative team strength)
+        #   • elo_*, h2h_*, rest/travel, weather (context / schedule)
+        #   • home_/away_ split only for win-rate, pace, and style signals
+        #     (home advantage is asymmetric — need both sides for those)
+        _PRUNE_SUFFIXES = {"_std", "_iqr"}
+        _HOME_AWAY_SPLIT_PATTERNS = (
+            "roll_win_rate", "roll_home_win_rate", "roll_away_win_rate",
+            "roll_n_games", "roll_blowout_rate", "roll_close_loss_rate",
+            "roll_pace_score", "score_cv", "form_trend_score",
+        )
         _extra_cols = {
             "rest_advantage", "turnaround_flag", "home_rest_days", "away_rest_days",
             "diff_rest_days", "data_freshness_score", "pace_mismatch",
@@ -1124,13 +1156,18 @@ class FeaturePipeline:
         feature_cols = [
             c for c in completed.columns
             if (
-                c.startswith((
-                    "elo_", "home_roll_", "away_roll_", "diff_roll_",
-                    "home_rest_days", "away_rest_days", "diff_rest_days",
-                    "h2h_",                  # H2H historical features
-                    "temperature_c", "wind_speed_kmh", "is_rain", "wind_category",
-                ))
+                (
+                    c.startswith("diff_roll_")
+                    and not any(c.endswith(sfx) for sfx in _PRUNE_SUFFIXES)
+                )
+                or c.startswith(("elo_", "h2h_",
+                                  "temperature_c", "wind_speed_kmh",
+                                  "is_rain", "wind_category"))
                 or c in _extra_cols
+                or (
+                    c.startswith(("home_", "away_"))
+                    and any(pat in c for pat in _HOME_AWAY_SPLIT_PATTERNS)
+                )
             )
             and completed[c].dtype in [np.float64, np.int64, float, int]
         ]
@@ -1167,6 +1204,10 @@ class FeaturePipeline:
                 "player_score_chain_rate",
                 "player_tog_pct",
                 "player_contested_rate",
+                "player_tackle_rate",
+                "player_mark_rate",
+                "player_i50_rate",
+                "player_assist_rate",
             ]
         ]
 

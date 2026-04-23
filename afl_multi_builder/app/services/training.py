@@ -34,6 +34,7 @@ from app.pricing.signal_engine import SignalEngine
 from app.pricing.signal_weights import get_signal_weight_store
 from app.core.metrics import compute_brier_score, compute_log_loss
 from app.core.config import settings
+from app.core.feature_importance import FeatureImportanceAnalyzer
 from app.data_ingestion.loader import DataLoader
 
 
@@ -186,6 +187,11 @@ class TrainingService:
         model_path = self.registry.save("match_win_ensemble", calibrated)
         fi = calibrated.feature_importance()
 
+        # Log correlation-based feature rankings (fast, no model needed)
+        _fi_analyzer = FeatureImportanceAnalyzer()
+        _corr_df = _fi_analyzer.correlation_ranking(X, y, top_n=20)
+        _fi_analyzer.log_top_features(_corr_df, market="head_to_head")
+
         # ── Step 6: Signal weight learning from OOF ───────────────────────
         features_df = self.pipeline.get_team_features()
         signal_weight_update = self._learn_signal_weights_from_oof(X, y, features_df)
@@ -269,6 +275,11 @@ class TrainingService:
         # Save both artifacts
         self.registry.save("player_disposals_model", regression_model)
         self.registry.save("player_disposals_calibrator", calibrator)
+
+        # Log correlation-based feature rankings for player model
+        _fi_analyzer = FeatureImportanceAnalyzer()
+        _corr_df = _fi_analyzer.correlation_ranking(X, y, top_n=15)
+        _fi_analyzer.log_top_features(_corr_df, market="player_disposals")
 
         metadata = {
             "run_id": self.run_id,

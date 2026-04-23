@@ -316,12 +316,20 @@ def get_team_stat_cols() -> list[str]:
     Ordered list of pre-match-safe team-level stats for the rolling feature loop.
     Ordered by feature family so related stats are computed together.
     Excludes evaluation-only and player-only stats.
+
+    Intentionally excluded (low predictive value or fully captured by derived ratios):
+      behinds          — redundant with scoring_efficiency derived feature
+      uncontested_possessions — redundant with contested_possessions + disposals
+      bounces          — near-zero for non-ruckmen, extreme noise for teams
+      one_percenters   — highly variable, weak team-outcome signal
+      goal_assists     — largely captured by score_involvements
+      effective_handballs — captured by eff_handball_rate derived feature
     """
     return [
         # Ball-winning / possession
         "kicks", "handballs", "disposals",
-        "effective_kicks", "effective_handballs", "effective_disposals",
-        "contested_possessions", "uncontested_possessions", "clangers",
+        "effective_kicks", "effective_disposals",
+        "contested_possessions", "clangers",
         # Kick quality / style
         "marks", "contested_marks",
         # Territory / forward pressure
@@ -330,9 +338,9 @@ def get_team_stat_cols() -> list[str]:
         "clearances", "centre_clearances", "stoppage_clearances",
         "hitouts", "hitouts_to_advantage",
         # Scoring / finishing
-        "score", "goals", "behinds", "score_involvements", "goal_assists",
+        "score", "goals", "score_involvements",
         # Discipline / mistakes
-        "frees_for", "frees_against", "one_percenters", "bounces",
+        "frees_for", "frees_against",
         # Effort / physical
         "tackles", "metres_gained", "turnovers",
     ]
@@ -340,13 +348,28 @@ def get_team_stat_cols() -> list[str]:
 
 def get_player_secondary_stats() -> list[str]:
     """
-    Secondary stats to compute rolling averages for alongside the primary
-    player prop stat (disposals). Used to build derived rate features.
+    Secondary stats to compute rolling EWMA alongside the primary player prop
+    stat (disposals). Each feeds into a derived per-disposal rate feature.
+
+    Ordered by signal priority for disposals prediction:
+      effective_disposals  — disposal efficiency (quality, not just volume)
+      contested_possessions — contested workload / midfield hardness
+      score_involvements   — scoring chain involvement (impact proxy)
+      clangers             — error rate (discipline)
+      tackles              — defensive work rate (role clarity)
+      marks                — marking craft / field position
+      inside_50s           — forward pressure / role type
+      goal_assists         — creative output
+      time_on_ground_pct   — usage / opportunity (pre-match rolling avg only)
     """
     return [
         "effective_disposals",
-        "clangers",
-        "time_on_ground_pct",
-        "score_involvements",
         "contested_possessions",
+        "score_involvements",
+        "clangers",
+        "tackles",
+        "marks",
+        "inside_50s",
+        "goal_assists",
+        "time_on_ground_pct",
     ]

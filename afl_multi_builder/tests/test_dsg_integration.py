@@ -76,8 +76,11 @@ class TestStatRegistry:
         from app.core.stat_registry import get_team_stat_cols, DSG_STAT_REGISTRY
         cols = set(get_team_stat_cols())
         families = {DSG_STAT_REGISTRY[c]["feature_family"] for c in cols}
+        # "opportunity" family intentionally excluded: the only team-level
+        # opportunity stat (bounces) has near-zero signal for teams and is
+        # omitted from the curated list (see get_team_stat_cols docstring).
         expected_families = {"ball_winning", "kick_quality", "territorial",
-                             "stoppage", "scoring", "discipline", "opportunity"}
+                             "stoppage", "scoring", "discipline"}
         assert expected_families <= families
 
     def test_get_player_secondary_stats(self):
@@ -181,9 +184,10 @@ class TestExpandedTeamFeatures:
 
     def test_new_raw_stat_rolling_features_present(self):
         """New stat groups should produce roll_*_mean columns."""
+        # one_percenters intentionally excluded from get_team_stat_cols() (low signal)
         for stat in ("effective_kicks", "clangers", "marks_inside_50",
                      "centre_clearances", "hitouts_to_advantage",
-                     "score_involvements", "frees_for", "one_percenters"):
+                     "score_involvements", "frees_for"):
             col = f"roll_{stat}_mean"
             assert col in self.feats.columns, f"Missing {col}"
 
@@ -352,6 +356,120 @@ class TestExpandedPlayerFeatures:
                 assert rows_with_history[col].notna().all(), (
                     f"NaN in {col} for player with history"
                 )
+
+    def test_new_v31_player_rates_present(self):
+        """v3.1 expanded secondary rates must be present in player features."""
+        for col in ("player_tackle_rate", "player_mark_rate",
+                    "player_i50_rate", "player_assist_rate"):
+            assert col in self.feats.columns, f"Missing v3.1 player feature: {col}"
+
+    def test_new_v31_player_rates_non_negative(self):
+        """Tackle/mark/i50/assist rates must be >= 0."""
+        for col in ("player_tackle_rate", "player_mark_rate",
+                    "player_i50_rate", "player_assist_rate"):
+            vals = self.feats[col].dropna()
+            assert (vals >= 0.0).all(), f"Negative values in {col}"
+
+    def test_model_ready_player_includes_v31_rates(self):
+        """get_model_ready_player_data feature list must include v3.1 rates."""
+        from app.features.pipeline import FeaturePipeline
+        loader = _make_rich_player_loader(12)
+        pipeline = FeaturePipeline(loader=loader)
+        _, _, feat_names = pipeline.get_model_ready_player_data(line=22.5)
+        for rate in ("player_tackle_rate", "player_mark_rate",
+                     "player_i50_rate", "player_assist_rate"):
+            assert rate in feat_names, f"Missing {rate} from model-ready features"
+
+
+# ── Feature importance ────────────────────────────────────────────────────────
+
+class TestFeatureImportanceAnalyzer:
+    def test_correlation_ranking_returns_dataframe(self):
+        from app.core.feature_importance import FeatureImportanceAnalyzer
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame({"a": rng.normal(size=50), "b": rng.normal(size=50)})
+        y = pd.Series((X["a"] > 0).astype(int))
+        ana = FeatureImportanceAnalyzer()
+        df = ana.correlation_ranking(X, y, top_n=2)
+        assert list(df.columns) == ["feature", "abs_corr", "corr"]
+        assert len(df) == 2
+        assert df.iloc[0]["feature"] == "a"  # "a" is perfectly correlated
+
+    def test_correlation_ranking_empty_x(self):
+        from app.core.feature_importance import FeatureImportanceAnalyzer
+        df = FeatureImportanceAnalyzer().correlation_ranking(
+            pd.DataFrame(), pd.Series(dtype=float)
+        )
+        assert df.empty
+
+    def test_permutation_importance_returns_dataframe(self):
+        from app.core.feature_importance import FeatureImportanceAnalyzer
+        from sklearn.linear_model import LogisticRegression
+        rng = np.random.default_rng(1)
+        X = pd.DataFrame({"x1": rng.normal(size=60), "x2": rng.normal(size=60)})
+        y = pd.Series((X["x1"] > 0).astype(int))
+        model = LogisticRegression().fit(X, y)
+        ana = FeatureImportanceAnalyzer(n_repeats=3)
+        df = ana.permutation_importance(model, X, y)
+        assert "feature" in df.columns
+        assert "importance_mean" in df.columns
+        assert len(df) == 2
+
+    def test_log_top_features_does_not_raise(self):
+        from app.core.feature_importance import FeatureImportanceAnalyzer
+        rng = np.random.default_rng(2)
+        X = pd.DataFrame({"f1": rng.normal(size=30), "f2": rng.normal(size=30)})
+        y = pd.Series(rng.integers(0, 2, size=30))
+        ana = FeatureImportanceAnalyzer()
+        df = ana.correlation_ranking(X, y)
+        ana.log_top_features(df, market="test_market", top_n=5)  # should not raise
+
+
+# ── Feature pruning in get_model_ready_match_data ────────────────────────────
+
+class TestMatchDataPruning:
+    """get_model_ready_match_data should return diff_roll_* features but
+    exclude raw home_/away_ roll features for non-whitelisted stats."""
+
+    def setup_method(self):
+        from app.features.pipeline import FeaturePipeline
+        loader = _make_rich_loader(n_fixtures=18)
+        self.pipeline = FeaturePipeline(loader=loader)
+
+    def test_diff_roll_features_present(self):
+        X, y, feat_names = self.pipeline.get_model_ready_match_data()
+        if not feat_names:
+            pytest.skip("No completed fixtures for pruning test")
+        diff_feats = [f for f in feat_names if f.startswith("diff_roll_")]
+        assert len(diff_feats) > 0, "Expected diff_roll_* features in pruned set"
+
+    def test_raw_home_roll_score_excluded(self):
+        """home_roll_score_mean should NOT be in the pruned feature set."""
+        X, y, feat_names = self.pipeline.get_model_ready_match_data()
+        if not feat_names:
+            pytest.skip("No completed fixtures")
+        assert "home_roll_score_mean" not in feat_names, (
+            "home_roll_score_mean should be excluded (use diff_roll_score_mean instead)"
+        )
+
+    def test_home_win_rate_split_present(self):
+        """home_roll_win_rate must be kept for home-advantage split signal."""
+        X, y, feat_names = self.pipeline.get_model_ready_match_data()
+        if not feat_names:
+            pytest.skip("No completed fixtures")
+        # win-rate features are in the home/away whitelist
+        win_rate_feats = [f for f in feat_names if "win_rate" in f]
+        assert len(win_rate_feats) > 0, "Expected win-rate split features in pruned set"
+
+    def test_no_std_iqr_diff_roll_features(self):
+        """diff_roll_*_std and diff_roll_*_iqr must be pruned out."""
+        X, y, feat_names = self.pipeline.get_model_ready_match_data()
+        if not feat_names:
+            pytest.skip("No completed fixtures")
+        pruned_variants = [f for f in feat_names
+                           if f.startswith("diff_roll_") and
+                           (f.endswith("_std") or f.endswith("_iqr"))]
+        assert pruned_variants == [], f"Pruned variants still present: {pruned_variants}"
 
 
 # ── _sdiv helper ──────────────────────────────────────────────────────────────

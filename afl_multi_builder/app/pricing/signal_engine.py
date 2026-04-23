@@ -404,7 +404,34 @@ class SignalEngine:
                 f"P(over)={baseline_prob:.1%}",
             ))
 
-        # ── Signal 7: ML model ────────────────────────────────────────────
+        # ── Signal 7: Disposal quality / efficiency ───────────────────────
+        # Uses DSG secondary stat rates to adjust projected disposal output.
+        # High eff_disposal_rate + low clanger_rate + high contested_rate → upside.
+        _AVG_EFF_RATE = 0.65
+        _AVG_CLANGER_RATE = 0.08
+        _AVG_CONTESTED_RATE = 0.45
+        eff_rate = float(player_features.get("player_eff_disposal_rate") or 0.0)
+        clanger_rate_val = float(player_features.get("player_clanger_rate") or 0.0)
+        contested_rate_val = float(player_features.get("player_contested_rate") or 0.0)
+        if eff_rate > 0 and n_games >= 5 and mean_5 > 0:
+            eff_adj = (eff_rate - _AVG_EFF_RATE) / 0.15
+            clang_adj = -((clanger_rate_val - _AVG_CLANGER_RATE) / 0.05)
+            cont_adj = (contested_rate_val - _AVG_CONTESTED_RATE) / 0.15
+            quality_score = float(np.clip(eff_adj * 0.5 + clang_adj * 0.3 + cont_adj * 0.2, -1.0, 1.0))
+            quality_adjusted_mean = mean_5 + quality_score * 2.0
+            quality_prob = float(np.clip(_norm.sf(line, loc=quality_adjusted_mean, scale=eff_std), 0.05, 0.95))
+            s7_rel = float(np.clip(n_games / 10.0, 0.2, 0.65)) * role_stability * transition_penalty
+            direction = "quality↑" if quality_score > 0.2 else ("quality↓" if quality_score < -0.2 else "neutral")
+            over_sigs.append(Signal(
+                "disposal_quality", quality_prob,
+                self._get_signal_weight("player_disposals", "quality", 0.08),
+                s7_rel,
+                f"Quality: eff={eff_rate:.2f}, clang={clanger_rate_val:.2f}, "
+                f"cont={contested_rate_val:.2f} → {direction} proj={quality_adjusted_mean:.1f}; "
+                f"P(over)={quality_prob:.1%}",
+            ))
+
+        # ── Signal 8: ML model ────────────────────────────────────────────
         if model_over_prob is not None:
             ml_prob = float(np.clip(model_over_prob, 0.05, 0.95))
             ml_rel = float(np.clip(n_games / 15.0, 0.1, 0.9)) * role_stability * transition_penalty
@@ -588,20 +615,31 @@ class SignalEngine:
         """
         score = float(np.clip(n_games / 10.0, 0.0, 0.4))
 
-        key_feats = [
+        # Check presence of key predictive features; fall back through three tiers:
+        #   1. diff_roll_* (pruned feature set used since v3.1)
+        #   2. home_/away_ ewma versions
+        #   3. home_/away_ mean versions (legacy fallback)
+        key_feats_diff = [
+            "elo_win_prob_home",
+            "diff_roll_score_ewma", "diff_roll_inside_50s_mean",
+            "diff_roll_clearances_mean", "diff_roll_win_rate_ewma",
+        ]
+        key_feats_ha_ewma = [
             "elo_win_prob_home",
             "home_roll_score_ewma", "away_roll_score_ewma",
             "home_roll_win_rate_ewma", "away_roll_win_rate_ewma",
         ]
-        # Fall back to non-ewma versions if ewma not yet computed
         fallback_feats = [
             "elo_win_prob_home",
             "home_roll_score_mean", "away_roll_score_mean",
             "home_roll_win_rate", "away_roll_win_rate",
         ]
-        check_feats = key_feats if any(
-            features.get(f) for f in key_feats
-        ) else fallback_feats
+        if any(features.get(f) for f in key_feats_diff):
+            check_feats = key_feats_diff
+        elif any(features.get(f) for f in key_feats_ha_ewma):
+            check_feats = key_feats_ha_ewma
+        else:
+            check_feats = fallback_feats
 
         n_present = sum(
             1 for f in check_feats
