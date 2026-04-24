@@ -654,7 +654,7 @@ class OddsAPIClient:
             Away team name from The Odds API.
         fixtures_df :
             DataFrame of known fixtures, typically produced by
-            :py:meth:`APISportsClient.normalize_fixtures`.
+            :py:meth:`AFLDataLoader.fixtures_df`.
 
         Returns
         -------

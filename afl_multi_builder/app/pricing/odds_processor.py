@@ -69,8 +69,17 @@ class OddsProcessor:
     def _process_market(
         self, market_type: str, market_df: pd.DataFrame
     ) -> List[ProcessedOdds]:
-        """Process odds for a single market type."""
-        # Group by selection to find best odds per selection
+        """
+        Process odds for a single market type.
+
+        Player disposals markets use independent over/under vig calculation:
+        each side is priced independently by bookmakers and should NOT be
+        force-normalised as a binary pair when only one side is present.
+        """
+        if market_type == "player_disposals":
+            return self._process_player_market(market_df)
+
+        # Standard binary-pair processing for H2H, line, total
         best_per_selection: Dict[str, Dict] = {}
         for _, row in market_df.iterrows():
             sel = str(row["selection"])
@@ -81,12 +90,8 @@ class OddsProcessor:
         if not best_per_selection:
             return []
 
-        # Compute raw implied probs for vig calculation
-        # For binary markets (H2H, line, total), compute overround from the pair
         all_raw_probs = [implied_probability(v["decimal_odds"]) for v in best_per_selection.values()]
         overround = sum(all_raw_probs) - 1.0
-
-        # Vig-adjusted probabilities
         vig_adj = remove_vig(all_raw_probs)
 
         processed = []
@@ -94,7 +99,6 @@ class OddsProcessor:
             d_odds = float(data["decimal_odds"])
             raw_prob = implied_probability(d_odds)
             vig_prob = vig_adj[i] if i < len(vig_adj) else raw_prob
-
             po = ProcessedOdds(
                 fixture_id=int(data["fixture_id"]),
                 market_type=market_type,
@@ -108,6 +112,105 @@ class OddsProcessor:
                 status=str(data.get("status", "active")),
             )
             processed.append(po)
+
+        return processed
+
+    def _process_player_market(self, market_df: pd.DataFrame) -> List[ProcessedOdds]:
+        """
+        Player disposals: treat over/under as independent bets (each has its own vig).
+
+        When both sides are available, normalise the pair to remove vig.
+        When only one side is available, use raw implied as best estimate.
+        This prevents the common bug of normalising a 3-selection market as binary.
+        """
+        # Group by (player_id, line) selection pairs
+        # Typical selections: "player_{pid}_over_{line}", "player_{pid}_under_{line}"
+        pair_map: Dict[str, Dict[str, Dict]] = {}   # "pid_line" -> {"over"/"under" -> best_row}
+        other: Dict[str, Dict] = {}  # selections that don't match the pattern
+
+        for _, row in market_df.iterrows():
+            sel = str(row["selection"])
+            d_odds = float(row["decimal_odds"])
+            parts = sel.split("_")
+            # Expected: player_{pid}_{over|under}_{line}
+            if len(parts) >= 4 and parts[0] == "player":
+                try:
+                    pid = parts[1]
+                    direction = parts[2]  # "over" or "under"
+                    line = parts[3]
+                    key = f"{pid}_{line}"
+                    if key not in pair_map:
+                        pair_map[key] = {}
+                    if direction not in pair_map[key] or d_odds > pair_map[key][direction]["decimal_odds"]:
+                        pair_map[key][direction] = row.to_dict()
+                except (IndexError, ValueError):
+                    other[sel] = row.to_dict() if sel not in other or d_odds > other[sel]["decimal_odds"] else other[sel]
+            else:
+                if sel not in other or d_odds > other[sel]["decimal_odds"]:
+                    other[sel] = row.to_dict()
+
+        processed = []
+        for key, dirs in pair_map.items():
+            if "over" in dirs and "under" in dirs:
+                # Both sides present: normalise to remove vig
+                over_row = dirs["over"]
+                under_row = dirs["under"]
+                raw_over = implied_probability(float(over_row["decimal_odds"]))
+                raw_under = implied_probability(float(under_row["decimal_odds"]))
+                total_raw = raw_over + raw_under
+                overround = total_raw - 1.0
+                vig_over = raw_over / total_raw if total_raw > 0 else raw_over
+                vig_under = raw_under / total_raw if total_raw > 0 else raw_under
+                for direction, row_data, vig_prob, raw_prob in [
+                    ("over", over_row, vig_over, raw_over),
+                    ("under", under_row, vig_under, raw_under),
+                ]:
+                    processed.append(ProcessedOdds(
+                        fixture_id=int(row_data["fixture_id"]),
+                        market_type="player_disposals",
+                        selection=str(row_data.get("selection", "")),
+                        bookmaker=str(row_data.get("bookmaker", "")),
+                        decimal_odds=float(row_data["decimal_odds"]),
+                        raw_implied_prob=round(raw_prob, 5),
+                        vig_adjusted_prob=round(vig_prob, 5),
+                        overround=round(overround, 5),
+                        timestamp=str(row_data.get("timestamp", "")),
+                        status=str(row_data.get("status", "active")),
+                    ))
+            else:
+                # Only one side available: use raw implied (no normalisation possible)
+                direction = "over" if "over" in dirs else "under"
+                row_data = dirs[direction]
+                raw_prob = implied_probability(float(row_data["decimal_odds"]))
+                processed.append(ProcessedOdds(
+                    fixture_id=int(row_data["fixture_id"]),
+                    market_type="player_disposals",
+                    selection=str(row_data.get("selection", "")),
+                    bookmaker=str(row_data.get("bookmaker", "")),
+                    decimal_odds=float(row_data["decimal_odds"]),
+                    raw_implied_prob=round(raw_prob, 5),
+                    vig_adjusted_prob=round(raw_prob, 5),  # best we can do with one side
+                    overround=0.0,
+                    timestamp=str(row_data.get("timestamp", "")),
+                    status=str(row_data.get("status", "active")),
+                ))
+
+        # Process any non-standard selections
+        for sel, data in other.items():
+            d_odds = float(data["decimal_odds"])
+            raw_prob = implied_probability(d_odds)
+            processed.append(ProcessedOdds(
+                fixture_id=int(data["fixture_id"]),
+                market_type="player_disposals",
+                selection=sel,
+                bookmaker=str(data.get("bookmaker", "")),
+                decimal_odds=d_odds,
+                raw_implied_prob=round(raw_prob, 5),
+                vig_adjusted_prob=round(raw_prob, 5),
+                overround=0.0,
+                timestamp=str(data.get("timestamp", "")),
+                status=str(data.get("status", "active")),
+            ))
 
         return processed
 

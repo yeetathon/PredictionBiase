@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
-"""Seed the database from demo CSV files."""
+"""
+REMOVED — seed_demo_data.py has been deprecated.
+
+This script previously seeded the database with local demo CSV files.
+The system now requires live data from real APIs only.
+
+There is no demo seeding, no CSV seeding, and no offline fallback.
+
+Setup instructions:
+  1. Configure your API keys in .env:
+       AFL_DATA_AUTHKEY=<your_key>
+       ODDS_API_KEY=<your_key>  (optional)
+
+  2. Verify your setup:
+       python -c "from app.services.preflight import PreflightService; PreflightService().run()"
+
+  3. Sync live data:
+       python scripts/sync_afl_data.py --mode upcoming
+
+  4. Train models on live data:
+       python scripts/run_training.py
+
+  5. Run the pipeline:
+       python scripts/run_pipeline.py
+
+See README.md for full setup instructions.
+"""
+
 import sys
-from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from app.core.logging import setup_logging
-from app.db.database import init_db, SessionLocal
-from app.db.seed import seed_from_csv
-from app.core.config import settings
-
-
-def main():
-    import os
-    os.makedirs("data/models", exist_ok=True)
-    os.makedirs("data/logs", exist_ok=True)
-
-    print("Initialising database...")
-    init_db()
-
-    print(f"Seeding from {settings.demo_data_dir}...")
-    db = SessionLocal()
-    try:
-        seed_from_csv(db, settings.demo_data_dir)
-        print("Done. Database seeded successfully.")
-    finally:
-        db.close()
-
-
-if __name__ == "__main__":
-    main()
+print(
+    "\n[ERROR] seed_demo_data.py is no longer available.\n"
+    "\n"
+    "This system uses live data from real APIs only. There is no demo mode.\n"
+    "\n"
+    "Setup steps:\n"
+    "  1. Add AFL_DATA_AUTHKEY to your .env file\n"
+    "  2. Optionally add ODDS_API_KEY for bookmaker edge calculations\n"
+    "  3. Run: python scripts/sync_afl_data.py --mode upcoming\n"
+    "  4. Run: python scripts/run_training.py\n"
+    "\n"
+    "See README.md for full setup instructions.\n",
+    file=sys.stderr
+)
+sys.exit(1)

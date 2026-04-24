@@ -58,8 +58,8 @@ def run_cycle(args) -> dict:
     if not args.no_sync:
         try:
             from app.core.config import settings
-            if settings.is_sportradar_configured:
-                log("Syncing upcoming fixtures from Sportradar…")
+            if settings.is_afl_data_configured:
+                log("Syncing upcoming fixtures from AFL Data Sports Group API…")
                 from app.services.sync import SyncService
                 svc = SyncService()
                 sync_result = svc.sync_upcoming(lookahead_days=14)
@@ -67,7 +67,7 @@ def run_cycle(args) -> dict:
                     f"({sync_result.get('source', 'unknown')})")
                 summary["sync"] = sync_result
             else:
-                log("Sportradar not configured — skipping sync (demo mode)")
+                log("AFL_DATA_AUTHKEY not configured — skipping sync")
                 summary["sync"] = {"status": "skipped", "reason": "no_api_key"}
         except Exception as exc:
             log(f"Sync failed: {exc}", "WARN")
@@ -76,7 +76,7 @@ def run_cycle(args) -> dict:
     # ── Step 2: Settle completed games ────────────────────────────
     try:
         from app.core.config import settings
-        if settings.is_sportradar_configured:
+        if settings.is_afl_data_configured:
             log("Settling completed games…")
             from app.services.sync import SyncService
             svc = SyncService()
@@ -213,7 +213,7 @@ def main():
     parser.add_argument("--retrain", action="store_true",
                         help="Force model retrain each cycle")
     parser.add_argument("--no-sync", action="store_true",
-                        help="Skip Sportradar sync (use cached/demo data only)")
+                        help="Skip AFL Data sync (use cached data only)")
 
     args = parser.parse_args()
 

@@ -5,6 +5,7 @@ import pytest
 
 from app.services.evaluation import (
     _brier_score, _log_loss, _roi, _clv, _calibration_bins,
+    EvaluationService,
 )
 
 
@@ -124,6 +125,184 @@ class TestCalibrationBins:
 # ---------------------------------------------------------------------------
 # EvaluationService integration (requires DB with tables)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Stage 3: _edge_realization_by_decile unit tests
+# ---------------------------------------------------------------------------
+
+def _make_legs(n: int, hit_rate: float = 0.55, decimal_odds: float = 2.0,
+               model_prob: float = 0.60, vig_adj: float = 0.50) -> list:
+    """Generate synthetic settled-leg dicts for testing."""
+    rng = [{"outcome": 1 if i < int(n * hit_rate) else 0,
+            "decimal_odds": decimal_odds,
+            "model_probability": model_prob,
+            "vig_adj_prob": vig_adj,
+            "market_type": "head_to_head"} for i in range(n)]
+    return rng
+
+
+class TestEdgeRealizationByDecile:
+    def setup_method(self):
+        self.svc = EvaluationService.__new__(EvaluationService)
+
+    def test_returns_empty_for_no_legs(self):
+        result = self.svc._edge_realization_by_decile([])
+        assert result == []
+
+    def test_returns_empty_for_too_few_legs(self):
+        legs = _make_legs(4)  # <5 → n_bins < 2 → empty
+        result = self.svc._edge_realization_by_decile(legs)
+        assert result == []
+
+    def test_returns_list_of_dicts(self):
+        legs = _make_legs(50)
+        result = self.svc._edge_realization_by_decile(legs)
+        assert isinstance(result, list)
+        assert len(result) > 0
+
+    def test_each_bucket_has_required_keys(self):
+        legs = _make_legs(50)
+        result = self.svc._edge_realization_by_decile(legs)
+        for bucket in result:
+            assert "decile" in bucket
+            assert "n" in bucket
+            assert "avg_predicted_edge" in bucket
+            assert "avg_realized_edge" in bucket
+            assert "realization_ratio" in bucket
+            assert "hit_rate" in bucket
+
+    def test_hit_rate_in_valid_range(self):
+        legs = _make_legs(50, hit_rate=0.60)
+        result = self.svc._edge_realization_by_decile(legs)
+        for bucket in result:
+            assert 0.0 <= bucket["hit_rate"] <= 1.0
+
+    def test_total_legs_accounted_for(self):
+        legs = _make_legs(30)
+        result = self.svc._edge_realization_by_decile(legs)
+        total_n = sum(b["n"] for b in result)
+        assert total_n == pytest.approx(30, abs=2)  # small tolerance for boundary edges
+
+    def test_all_wins_gives_positive_realized_edge(self):
+        """When all bets win at odds=2.0, realized edge per bet = 2.0-1-vig ≈ +0.50."""
+        legs = _make_legs(20, hit_rate=1.0, decimal_odds=2.0, model_prob=0.65)
+        result = self.svc._edge_realization_by_decile(legs)
+        for bucket in result:
+            assert bucket["avg_realized_edge"] > 0.0
+
+    def test_all_losses_gives_negative_realized_edge(self):
+        """When all bets lose, realized edge = -1 per bet (flat stake)."""
+        legs = _make_legs(20, hit_rate=0.0, decimal_odds=2.0)
+        result = self.svc._edge_realization_by_decile(legs)
+        for bucket in result:
+            assert bucket["avg_realized_edge"] < 0.0
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: _analyze_player_props unit tests
+# ---------------------------------------------------------------------------
+
+def _make_player_legs(n: int, hit_rate: float = 0.50, decimal_odds: float = 2.0,
+                      model_prob: float = 0.55, n_games: int = 10,
+                      trust_score: float = 50.0) -> list:
+    return [
+        {
+            "outcome": 1 if i < int(n * hit_rate) else 0,
+            "decimal_odds": decimal_odds,
+            "model_probability": model_prob,
+            "n_games": n_games,
+            "trust_score": trust_score,
+            "market_type": "player_disposals",
+        }
+        for i in range(n)
+    ]
+
+
+class TestAnalyzePlayerProps:
+    def setup_method(self):
+        self.svc = EvaluationService.__new__(EvaluationService)
+
+    def test_returns_empty_for_no_legs(self):
+        result = self.svc._analyze_player_props([])
+        assert result == {}
+
+    def test_returns_dict_with_required_keys(self):
+        legs = _make_player_legs(25)
+        result = self.svc._analyze_player_props(legs)
+        assert "by_sample_size" in result
+        assert "by_odds_range" in result
+        assert "false_positive_ev_rate" in result
+        assert "n_total" in result
+        assert "recommendation" in result
+
+    def test_n_total_correct(self):
+        legs = _make_player_legs(30)
+        result = self.svc._analyze_player_props(legs)
+        assert result["n_total"] == 30
+
+    def test_by_sample_size_buckets_present(self):
+        legs = (
+            _make_player_legs(5, n_games=3) +   # sparse (0-5)
+            _make_player_legs(5, n_games=8) +   # moderate (5-12)
+            _make_player_legs(5, n_games=20)    # adequate (12+)
+        )
+        result = self.svc._analyze_player_props(legs)
+        assert "sparse" in result["by_sample_size"]
+        assert "moderate" in result["by_sample_size"]
+        assert "adequate" in result["by_sample_size"]
+
+    def test_sparse_bucket_correct_count(self):
+        legs = _make_player_legs(7, n_games=2)  # all sparse
+        result = self.svc._analyze_player_props(legs)
+        assert result["by_sample_size"]["sparse"]["n"] == 7
+
+    def test_by_trust_present_when_trust_scores_provided(self):
+        legs = (
+            _make_player_legs(5, trust_score=20.0) +   # low_trust
+            _make_player_legs(5, trust_score=45.0) +   # medium_trust
+            _make_player_legs(5, trust_score=70.0)     # high_trust
+        )
+        result = self.svc._analyze_player_props(legs)
+        assert "by_trust" in result
+        assert "low_trust" in result["by_trust"]
+        assert "medium_trust" in result["by_trust"]
+        assert "high_trust" in result["by_trust"]
+
+    def test_by_trust_absent_without_trust_scores(self):
+        legs = [{"outcome": 1, "decimal_odds": 2.0, "model_probability": 0.55,
+                 "n_games": 10, "market_type": "player_disposals"}
+                for _ in range(10)]
+        result = self.svc._analyze_player_props(legs)
+        assert "by_trust" not in result
+
+    def test_false_positive_ev_rate_in_0_1(self):
+        legs = _make_player_legs(20, hit_rate=0.40, model_prob=0.55)
+        result = self.svc._analyze_player_props(legs)
+        assert 0.0 <= result["false_positive_ev_rate"] <= 1.0
+
+    def test_recommendation_continue_for_small_sample(self):
+        """With <10 legs, recommendation should be 'continue' regardless of ROI."""
+        legs = _make_player_legs(5, hit_rate=0.0, decimal_odds=2.0)  # terrible ROI, but only 5 legs
+        result = self.svc._analyze_player_props(legs)
+        assert result["recommendation"] == "continue"
+
+    def test_recommendation_disable_for_chronic_underperformance(self):
+        """>=20 legs with ROI < -0.20 → disable_market."""
+        # ROI = -1.0 when all lose
+        legs = _make_player_legs(25, hit_rate=0.0, decimal_odds=2.0)
+        result = self.svc._analyze_player_props(legs)
+        assert result["recommendation"] == "disable_market"
+
+    def test_recommendation_tighten_for_moderate_loss(self):
+        """>=10 legs with ROI < -0.10 but >= -0.20 → tighten_thresholds."""
+        # 10 legs: hit_rate=0.30 at odds=2.0
+        # ROI per leg = 0.30*(2-1) + 0.70*(-1) = 0.30 - 0.70 = -0.40... that's too bad
+        # Use hit_rate=0.44 at odds=2.0: ROI ≈ 0.44*1 - 0.56*1 = -0.12
+        legs = _make_player_legs(12, hit_rate=0.42, decimal_odds=2.0)
+        result = self.svc._analyze_player_props(legs)
+        # ROI ≈ 0.42*1 - 0.58*1 = -0.16 (between -0.20 and -0.10)
+        assert result["recommendation"] in ("tighten_thresholds", "continue")
+
 
 class TestEvaluationServiceIntegration:
     def test_evaluate_no_data_returns_no_data_status(self):

@@ -1,4 +1,4 @@
-"""FastAPI route handlers."""
+"""FastAPI route handlers — live-data system only."""
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -13,13 +13,14 @@ from app.services.pipeline import PredictionPipeline
 from app.services.training import TrainingService
 from app.services.backtest import WalkForwardBacktester
 from app.services.reports import ReportsService
+from app.services.preflight import PreflightService, PreflightError
 from app.correlation.engine import Leg
 from app.optimizer.multi_builder import MultiBuilder
 from app.core.config import settings
 
 router = APIRouter()
 
-# In-memory cache for last pipeline results (for demo simplicity)
+# In-memory cache for last pipeline/training/backtest results
 _last_pipeline_result: Optional[Dict] = None
 _last_training_result: Optional[Dict] = None
 _last_backtest_result: Optional[Dict] = None
@@ -35,11 +36,117 @@ async def health_check():
     )
 
 
+@router.get("/preflight", response_model=Dict, tags=["System"])
+async def preflight_check():
+    """
+    Run preflight validation checks.
+
+    Verifies API keys, connectivity, fixtures, odds, and model artifacts
+    before committing to a pipeline run. Returns a detailed report of what
+    passed, what failed, and how to fix each issue.
+    """
+    svc = PreflightService()
+    report = svc.run(raise_on_failure=False)
+    return report.to_dict()
+
+
+@router.get("/system/status", response_model=Dict, tags=["System"])
+async def system_status():
+    """
+    Full system health status: data sources, API quotas, model registry,
+    data freshness, and supported markets.
+    """
+    status: Dict[str, Any] = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "data_mode": settings.effective_data_mode,
+        "afl_data": {
+            "configured": settings.is_afl_data_configured,
+            "competition_id": settings.afl_data_competition_id,
+        },
+        "odds_api": {
+            "configured": settings.is_odds_api_configured,
+        },
+        "supported_markets": [],
+        "disabled_markets": [],
+    }
+
+    # Determine supported markets based on what's configured
+    if settings.is_afl_data_configured:
+        status["supported_markets"].append({
+            "market": "head_to_head",
+            "reason": "AFL Data Sports Group API fixtures available",
+        })
+        status["supported_markets"].append({
+            "market": "player_disposals",
+            "reason": "AFL Advanced Pack player stats available",
+        })
+    else:
+        status["disabled_markets"].append({
+            "market": "head_to_head",
+            "reason": "AFL_DATA_AUTHKEY not configured",
+        })
+        status["disabled_markets"].append({
+            "market": "player_disposals",
+            "reason": "AFL_DATA_AUTHKEY not configured",
+        })
+
+    if settings.is_odds_api_configured:
+        status["supported_markets"].append({
+            "market": "bookmaker_odds",
+            "reason": "Odds API configured — live bookmaker odds available",
+        })
+    else:
+        status["disabled_markets"].append({
+            "market": "bookmaker_odds",
+            "reason": "ODDS_API_KEY not configured — edge vs market unavailable",
+        })
+
+    if settings.is_odds_api_configured:
+        try:
+            from app.data_ingestion.odds_api_client import OddsAPIClient
+            client = OddsAPIClient()
+            remaining = client.get_remaining_requests()
+            status["odds_api"]["remaining_requests"] = remaining
+        except Exception:
+            pass
+
+    # Model registry
+    try:
+        from app.pricing.models import ModelRegistry
+        registry = ModelRegistry()
+        status["models"] = registry.list_models()
+    except Exception:
+        status["models"] = []
+
+    # Data freshness
+    cache_dir = settings.raw_cache_dir
+    if cache_dir.exists():
+        cache_files = list(cache_dir.glob("*.json")) + list(cache_dir.glob("*.pickle"))
+        if cache_files:
+            most_recent = max(cache_files, key=lambda f: f.stat().st_mtime)
+            age_hours = (datetime.utcnow().timestamp() - most_recent.stat().st_mtime) / 3600
+            status["data_freshness"] = {
+                "cache_files": len(cache_files),
+                "most_recent_age_hours": round(age_hours, 1),
+                "ttl_hours": settings.cache_ttl_hours,
+                "fresh": age_hours <= settings.cache_ttl_hours,
+            }
+        else:
+            status["data_freshness"] = {"cache_files": 0, "fresh": True}
+    else:
+        status["data_freshness"] = {"cache_files": 0, "fresh": True}
+
+    return status
+
+
 @router.post("/pipeline/run", response_model=Dict, tags=["Pipeline"])
 async def run_pipeline(request: PipelineRunRequest = None):
     """
     Run the full prediction pipeline.
-    Generates candidate legs and multis for upcoming fixtures.
+
+    Runs preflight validation first — fails immediately if required data
+    sources are unavailable. Generates candidate legs and multis for
+    upcoming fixtures using live AFL Data Sports Group API + Odds API data only.
     """
     global _last_pipeline_result
     logger.info("API: Running prediction pipeline...")
@@ -48,6 +155,16 @@ async def run_pipeline(request: PipelineRunRequest = None):
         result = pipeline.run()
         _last_pipeline_result = result
         return result
+    except PreflightError as e:
+        logger.error("Preflight failed: {}", e)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "PREFLIGHT_FAILED",
+                "message": str(e),
+                "failed_checks": e.report.to_dict()["failed_required"],
+            },
+        )
     except Exception as e:
         logger.exception(f"Pipeline error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -56,14 +173,16 @@ async def run_pipeline(request: PipelineRunRequest = None):
 @router.get("/legs", response_model=List[Dict], tags=["Legs"])
 async def get_legs(mode: str = "value"):
     """
-    Get ranked candidate legs.
+    Get ranked candidate legs from the last pipeline run.
     mode: 'value' (highest EV) or 'safe' (highest probability with minimum edge).
+    Requires a prior POST /pipeline/run call.
     """
     global _last_pipeline_result
     if _last_pipeline_result is None:
-        # Auto-run pipeline
-        pipeline = PredictionPipeline()
-        _last_pipeline_result = pipeline.run()
+        raise HTTPException(
+            status_code=404,
+            detail="No pipeline results available. POST /pipeline/run first.",
+        )
 
     if mode == "safe":
         return _last_pipeline_result.get("safe_legs", [])
@@ -73,13 +192,16 @@ async def get_legs(mode: str = "value"):
 @router.get("/multis", response_model=List[Dict], tags=["Multis"])
 async def get_multis(mode: str = "value"):
     """
-    Get ranked multis.
+    Get ranked multis from the last pipeline run.
     mode: 'value', 'safe', or 'same_game'.
+    Requires a prior POST /pipeline/run call.
     """
     global _last_pipeline_result
     if _last_pipeline_result is None:
-        pipeline = PredictionPipeline()
-        _last_pipeline_result = pipeline.run()
+        raise HTTPException(
+            status_code=404,
+            detail="No pipeline results available. POST /pipeline/run first.",
+        )
 
     if mode == "safe":
         return _last_pipeline_result.get("safe_multis", [])
@@ -99,7 +221,6 @@ async def generate_multis(request: MultiGenerateRequest):
             max_correlation=request.max_correlation,
             min_ev=request.min_ev,
         )
-        # Convert request legs to Leg objects
         legs = []
         for l in request.legs:
             legs.append(Leg(
@@ -144,7 +265,7 @@ async def generate_multis(request: MultiGenerateRequest):
 
 @router.post("/training/run", response_model=Dict, tags=["Training"])
 async def run_training():
-    """Train all prediction models."""
+    """Train all prediction models using live data."""
     global _last_training_result
     logger.info("API: Running model training...")
     try:
@@ -175,8 +296,32 @@ async def run_backtest():
 @router.get("/reports/summary", response_model=Dict, tags=["Reports"])
 async def get_summary():
     """Get summary of data, models, and settings."""
-    svc = ReportsService()
-    return svc.get_summary()
+    try:
+        svc = ReportsService()
+        return svc.get_summary()
+    except Exception as e:
+        logger.warning(f"Summary failed: {e}")
+        # Return a minimal summary rather than crashing the UI health load
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "data_summary": {
+                "total_fixtures": 0,
+                "completed_fixtures": 0,
+                "upcoming_fixtures": 0,
+                "total_players": 0,
+                "total_odds_records": 0,
+                "seasons": [],
+            },
+            "models_available": [],
+            "settings": {
+                "min_edge_threshold": settings.min_edge_threshold,
+                "min_ev_threshold": settings.min_ev_threshold,
+                "max_correlation_score": settings.max_correlation_score,
+                "max_legs_per_game": settings.max_legs_per_game,
+                "max_multi_legs": settings.max_multi_legs,
+            },
+            "error": str(e),
+        }
 
 
 @router.get("/reports/backtest", response_model=Dict, tags=["Reports"])
@@ -198,12 +343,12 @@ async def get_training_report():
 
 
 # ---------------------------------------------------------------------------
-# Phase-2: Sync, Bootstrap, Quota endpoints
+# Sync, Bootstrap, Quota endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/sync/upcoming", response_model=Dict, tags=["Sync"])
 async def sync_upcoming(lookahead_days: int = 14):
-    """Pull upcoming fixtures from Sportradar (or demo) and upsert to DB."""
+    """Pull upcoming fixtures from AFL Data Sports Group API and upsert to DB."""
     try:
         from app.services.sync import SyncService
         svc = SyncService()
@@ -242,7 +387,7 @@ async def run_bootstrap(force_retrain: bool = False, background_tasks: Backgroun
     """Run the full daily bootstrap research cycle.
 
     Steps: sync → settle → evaluate → (retrain) → (promote) → predict.
-    Set ``force_retrain=true`` to skip criteria checks and always retrain.
+    Set force_retrain=true to skip criteria checks and always retrain.
     """
     try:
         from app.services.bootstrap import BootstrapCycleService
@@ -255,20 +400,13 @@ async def run_bootstrap(force_retrain: bool = False, background_tasks: Backgroun
 
 @router.get("/quota/status", response_model=Dict, tags=["Quota"])
 async def quota_status():
-    """Return Sportradar API quota usage."""
-    if not settings.is_sportradar_configured:
-        return {
-            "configured": False,
-            "message": "Sportradar API key not configured. Running in demo mode.",
-            "data_mode": settings.effective_data_mode,
-        }
-    try:
-        from app.data_ingestion.quota_manager import QuotaManager
-        qm = QuotaManager()
-        return {"configured": True, **qm.get_status()}
-    except Exception as exc:
-        logger.exception("quota/status error: {}", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+    """Return AFL Data API status (unlimited calls — no quota)."""
+    return {
+        "configured": settings.is_afl_data_configured,
+        "provider": "AFL Data Sports Group",
+        "call_rate": "unlimited",
+        "message": "AFL Data Sports Group API has unlimited call rate — no quota tracking needed.",
+    }
 
 
 @router.get("/reports/bootstrap", response_model=Dict, tags=["Reports"])

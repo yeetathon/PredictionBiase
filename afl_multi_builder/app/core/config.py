@@ -1,6 +1,9 @@
 """
 Extended application configuration.
 All secrets read from environment variables / .env file only.
+
+Live-data only — no demo mode, no fallback to CSV files.
+Data source: AFL Data Sports Group API + The Odds API.
 """
 from pathlib import Path
 from typing import List, Literal
@@ -24,20 +27,16 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/afl_multi_builder.db"
 
     # ── Data paths ─────────────────────────────────────────────────────────
-    demo_data_dir: Path = Path("./data/demo")
     artifacts_dir: Path = Path("./data/models")
     raw_cache_dir: Path = Path("./data/cache")
 
-    # ── Sportradar API ─────────────────────────────────────────────────────
-    sportradar_api_key: str = ""
-    sportradar_base_url: str = "https://api.sportradar.com/australianrules/trial/v3/en"
-    sportradar_afl_competition_id: str = "sr:competition:656"
-    sportradar_afl_season_id: str = ""
-
-    # ── API-Sports AFL ─────────────────────────────────────────────────────
-    api_sports_key: str = ""
-    api_sports_base_url: str = "https://v1.afl.api-sports.io"
-    api_sports_afl_league_id: int = 1
+    # ── AFL Data Sports Group API ──────────────────────────────────────────
+    afl_data_username: str = ""
+    afl_data_password: str = ""
+    afl_data_authkey: str = ""
+    afl_data_base_url: str = "https://dsg-api.com"
+    afl_data_season_id: str = ""   # auto-discovered if blank
+    afl_data_competition_id: int = 1  # 1 = AFL Men's
 
     # ── The Odds API ───────────────────────────────────────────────────────
     odds_api_key: str = ""
@@ -45,9 +44,10 @@ class Settings(BaseSettings):
     odds_api_sport: str = "aussierules_afl"
     odds_api_bookmakers: str = "tab,sportsbet,bet365,unibet,pointsbet,betfair,williamhill,neds"
 
-    # ── Data Mode ─────────────────────────────────────────────────────────
-    data_mode: Literal["live", "cache", "demo"] = "live"
-    enable_demo_fallback: bool = False
+    # ── Data Mode (live | cache only — no demo) ───────────────────────────
+    # live  = fetch from AFL Data Sports Group API (uses cache, respects TTL)
+    # cache = only use cached responses (no new API calls)
+    data_mode: Literal["live", "cache"] = "live"
 
     # ── Rate Limiting & Quota ─────────────────────────────────────────────
     api_rate_limit_qps: float = 1.0
@@ -70,13 +70,66 @@ class Settings(BaseSettings):
     recent_settlement_lookback_days: int = 7
 
     # ── Model Settings ────────────────────────────────────────────────────
-    min_edge_threshold: float = 0.03
-    max_correlation_score: float = 0.7
-    min_ev_threshold: float = 0.02
-    max_legs_per_game: int = 3
-    max_legs_per_player: int = 2
-    max_multi_legs: int = 4
+    # Precision-first thresholds — conservative defaults.
+    # The system should produce FEWER, BETTER bets rather than many weak ones.
+
+    # Minimum real edge over bookmaker vig-adjusted probability
+    # 5% = meaningful edge; below this is noise given model uncertainty
+    min_edge_threshold: float = 0.05
+
+    # Maximum allowed correlation between legs in a multi.
+    # 0.45 rejects most same-game H2H+Line combos (0.85 correlation)
+    max_correlation_score: float = 0.45
+
+    # Minimum expected value per bet (5% = meaningful positive EV)
+    min_ev_threshold: float = 0.04
+
+    # Maximum legs per game in one multi (2 = enough same-game exposure)
+    max_legs_per_game: int = 2
+
+    # Maximum legs per player in one multi
+    max_legs_per_player: int = 1
+
+    # Maximum total legs in a multi (shorter = more reliable)
+    max_multi_legs: int = 3
+
+    # Minimum legs in a multi
     min_multi_legs: int = 2
+
+    # Minimum calibrated win probability for a leg to enter the pool.
+    # A leg at 51% is barely better than a coin flip — requires real conviction.
+    min_calibrated_probability: float = 0.54
+
+    # Minimum confidence score (0-100) for a leg to enter the pool.
+    min_confidence_score: float = 40.0
+
+    # Maximum decimal odds for any leg.
+    # High odds = high uncertainty; reject longshots regardless of edge.
+    max_leg_odds: float = 4.00
+
+    # Minimum legs in the quality pool before any multi is built.
+    # If fewer than this pass all gates, return no-bet instead of forcing output.
+    min_pool_size_for_multi: int = 3
+
+    # Require real bookmaker odds for a leg to qualify.
+    # If True, legs synthesised from model probability alone are rejected.
+    odds_required: bool = True
+
+    # Minimum signal agreement (0–1) across independent prediction signals.
+    # Legs where signals strongly disagree are rejected regardless of EV.
+    # 0.30 rejects when signal std ≥ 0.105 (≈10.5 pp spread between signals).
+    # Set to 0.0 to disable (not recommended).
+    min_signal_agreement: float = 0.30
+
+    # ── Betting profile (controls adaptive threshold adjustments) ─────────
+    # conservative: 50% stricter edge/EV, +3pp prob, +10pt trust — fewer, stronger bets
+    # balanced    : defaults — standard precision/recall tradeoff
+    # research    : looser gates — for data collection and signal calibration
+    betting_profile: Literal["conservative", "balanced", "research"] = "balanced"
+
+    # ── Trust scoring (min trust_score 0-100 before a leg is accepted) ───
+    # Overrides the adaptive per-market setting if set higher
+    min_trust_score: float = 30.0
 
     # ── Training / Retraining ─────────────────────────────────────────────
     retrain_min_new_games: int = 10
@@ -104,12 +157,8 @@ class Settings(BaseSettings):
         return self.artifacts_dir
 
     @property
-    def is_sportradar_configured(self) -> bool:
-        return bool(self.sportradar_api_key and self.sportradar_api_key.strip())
-
-    @property
-    def is_api_sports_configured(self) -> bool:
-        return bool(self.api_sports_key and self.api_sports_key.strip())
+    def is_afl_data_configured(self) -> bool:
+        return bool(self.afl_data_authkey and self.afl_data_authkey.strip())
 
     @property
     def is_odds_api_configured(self) -> bool:
@@ -121,12 +170,12 @@ class Settings(BaseSettings):
 
     @property
     def effective_data_mode(self) -> str:
-        """Return the effective data mode. Never silently falls back to demo."""
+        """Return the effective data mode. Only 'live' or 'cache' — never demo."""
         return self.data_mode
 
     @property
     def any_api_configured(self) -> bool:
-        return self.is_sportradar_configured or self.is_api_sports_configured
+        return self.is_afl_data_configured
 
 
 settings = Settings()

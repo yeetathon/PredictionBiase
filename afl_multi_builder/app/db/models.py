@@ -115,6 +115,26 @@ class PlayerStat(Base):
     metres_gained = Column(Integer)
     time_on_ground_pct = Column(Float)
     fantasy_score = Column(Float)
+    # DSG extended stats (v3)
+    effective_kicks = Column(Integer)
+    effective_handballs = Column(Integer)
+    effective_disposals = Column(Integer)
+    clangers = Column(Integer)
+    contested_marks = Column(Integer)
+    marks_inside_50 = Column(Integer)
+    inside_50s = Column(Integer)
+    rebound_50s = Column(Integer)
+    centre_clearances = Column(Integer)
+    stoppage_clearances = Column(Integer)
+    hitouts_to_advantage = Column(Integer)
+    score_involvements = Column(Integer)
+    goal_assists = Column(Integer)
+    one_percenters = Column(Integer)
+    bounces = Column(Integer)
+    frees_for = Column(Integer)
+    frees_against = Column(Integer)
+    supercoach_score = Column(Float)
+    rating_points = Column(Float)
 
     fixture = relationship("Fixture", back_populates="player_stats")
     player = relationship("Player", back_populates="stats")
@@ -151,6 +171,20 @@ class TeamStat(Base):
     turnovers = Column(Integer)
     free_kicks_for = Column(Integer)
     free_kicks_against = Column(Integer)
+    # DSG extended stats (v3)
+    effective_kicks = Column(Integer)
+    effective_handballs = Column(Integer)
+    effective_disposals = Column(Integer)
+    clangers = Column(Integer)
+    contested_marks = Column(Integer)
+    marks_inside_50 = Column(Integer)
+    centre_clearances = Column(Integer)
+    stoppage_clearances = Column(Integer)
+    hitouts_to_advantage = Column(Integer)
+    score_involvements = Column(Integer)
+    goal_assists = Column(Integer)
+    one_percenters = Column(Integer)
+    bounces = Column(Integer)
 
     fixture = relationship("Fixture", back_populates="team_stats")
 
@@ -188,16 +222,24 @@ class GeneratedLeg(Base):
     selection = Column(String(100), nullable=False)
     bookmaker = Column(String(50))
     decimal_odds = Column(Float)
-    model_probability = Column(Float)
-    calibrated_probability = Column(Float)
-    market_implied_probability = Column(Float)
-    vig_adjusted_probability = Column(Float)
-    edge = Column(Float)
+    model_probability = Column(Float)          # final blended probability
+    calibrated_probability = Column(Float)     # alias for model_probability (kept for compat)
+    market_implied_probability = Column(Float) # raw 1/odds
+    vig_adjusted_probability = Column(Float)   # fair market prob (vig removed)
+    edge = Column(Float)                       # model_prob - vig_adj_prob
     ev = Column(Float)
     confidence_score = Column(Float)
     explanation = Column(Text)
     run_id = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Rich metadata for meta-blend training and deep evaluation
+    ml_probability = Column(Float, nullable=True)               # raw ML model output
+    signal_consensus_probability = Column(Float, nullable=True) # signal engine consensus
+    signal_agreement = Column(Float, nullable=True)
+    prediction_variance = Column(Float, nullable=True)
+    data_completeness = Column(Float, nullable=True)
+    trust_score = Column(Float, nullable=True)
+    n_games = Column(Integer, nullable=True)
 
 
 class GeneratedMulti(Base):
@@ -287,6 +329,16 @@ class LegSettlement(Base):
     notes = Column(Text, nullable=True)
     settled_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Rich metadata (copied from GeneratedLeg at settlement time)
+    vig_adjusted_probability = Column(Float, nullable=True)     # fair market prob
+    edge_at_prediction = Column(Float, nullable=True)           # edge when leg was created
+    ml_probability = Column(Float, nullable=True)               # raw ML output
+    signal_consensus_probability = Column(Float, nullable=True) # signal engine consensus
+    signal_agreement = Column(Float, nullable=True)
+    prediction_variance = Column(Float, nullable=True)
+    data_completeness = Column(Float, nullable=True)
+    trust_score = Column(Float, nullable=True)
+    n_games = Column(Integer, nullable=True)
 
     # Convenience alias used by evaluation service
     @property

@@ -13,6 +13,7 @@ import numpy as np
 from loguru import logger
 from sqlalchemy.orm import Session
 
+from app.core.adaptive_config import get_adaptive_config
 from app.db.database import SessionLocal
 from app.db.models import LegSettlement, MultiSettlement, ResearchCycleLog
 
@@ -140,11 +141,22 @@ class EvaluationService:
             yt = np.array([l["outcome"] for l in sub], dtype=float)
             yp = np.array([l["model_probability"] for l in sub], dtype=float)
             od = np.array([l["decimal_odds"] for l in sub], dtype=float)
+            raw_imp = np.where(od > 0, 1.0 / od, np.nan)
+            vig_adj = np.array([l.get("vig_adj_prob", 1.0 / l["decimal_odds"]) for l in sub], dtype=float)
+            predicted_edge = yp - vig_adj
+            realized_edge = np.where(yt == 1, od - 1 - vig_adj, -vig_adj)
             report["by_market_type"][mt] = {
                 "n": len(sub),
                 "brier_score": _brier_score(yt, yp),
                 "roi": _roi(yt, od),
                 "hit_rate": float(yt.mean()) if len(yt) > 0 else float("nan"),
+                "log_loss": _log_loss(yt, yp),
+                "clv": _clv(yp, od),
+                "avg_predicted_edge": round(float(np.nanmean(predicted_edge)), 4),
+                "avg_realized_edge": round(float(np.nanmean(realized_edge)), 4),
+                "edge_realization_ratio": round(
+                    float(np.nanmean(realized_edge) / max(abs(np.nanmean(predicted_edge)), 0.001)), 3
+                ),
             }
 
         # Calibration
@@ -152,6 +164,14 @@ class EvaluationService:
 
         # Bias analysis by odds bucket
         report["bias_by_odds_range"] = self._bias_by_odds_range(legs)
+
+        # Edge realization by decile
+        report["edge_realization_by_decile"] = self._edge_realization_by_decile(legs)
+
+        # Player prop deep analysis
+        player_legs = [l for l in legs if l["market_type"] == "player_disposals"]
+        if player_legs:
+            report["player_prop_analysis"] = self._analyze_player_props(player_legs)
 
         # Correlation effectiveness: multis
         with SessionLocal() as db:
@@ -168,7 +188,59 @@ class EvaluationService:
             report["overall"]["roi"],
             len(legs),
         )
+
+        # Update adaptive thresholds based on this evaluation
+        try:
+            adaptive_cfg = get_adaptive_config()
+            adaptive_cfg.update_from_evaluation(report)
+            report["adaptive_thresholds_updated"] = True
+        except Exception as e:
+            logger.warning("Could not update adaptive thresholds: {}", e)
+            report["adaptive_thresholds_updated"] = False
+
+        # Attach market health summary
+        report["market_health"] = self.generate_market_health_report(report)
+
         return report
+
+    def generate_market_health_report(self, eval_report: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Structured market health report: healthy / watch / degraded / insufficient_data.
+        Fed into adaptive threshold updates and the nightly report email.
+        """
+        by_market = eval_report.get("by_market_type", {})
+        health: Dict[str, Any] = {}
+        for market, metrics in by_market.items():
+            n = metrics.get("n", 0)
+            brier = metrics.get("brier_score", 0.25)
+            roi = metrics.get("roi", 0.0)
+            hit_rate = metrics.get("hit_rate", 0.5)
+
+            if n < 5:
+                status = "insufficient_data"
+            elif brier > 0.25:
+                status = "degraded_worse_than_baseline"
+            elif roi < -0.15:
+                status = "degraded_negative_roi"
+            elif brier < 0.20 and roi >= 0.0:
+                status = "healthy"
+            else:
+                status = "watch"
+
+            health[market] = {
+                "status": status,
+                "n_bets": n,
+                "brier_score": round(brier, 4),
+                "roi": round(roi, 4),
+                "hit_rate": round(hit_rate, 4),
+                "recommendation": (
+                    "Continue" if status == "healthy" else
+                    "Tighten thresholds" if status == "watch" else
+                    "Review urgently" if "degraded" in status else
+                    "Collect more data"
+                ),
+            }
+        return health
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -198,6 +270,16 @@ class EvaluationService:
                     "decimal_odds": r.decimal_odds or 2.0,
                     "model_probability": r.model_probability or 0.5,
                     "outcome": int(r.actual_outcome),
+                    # Rich metadata (None if not yet populated)
+                    "vig_adj_prob": r.vig_adjusted_probability,
+                    "edge_at_prediction": r.edge_at_prediction,
+                    "ml_probability": r.ml_probability,
+                    "signal_consensus_probability": r.signal_consensus_probability,
+                    "signal_agreement": r.signal_agreement,
+                    "prediction_variance": r.prediction_variance,
+                    "data_completeness": r.data_completeness,
+                    "trust_score": r.trust_score,
+                    "n_games": r.n_games,
                 }
                 for r in rows
             ]
@@ -301,3 +383,134 @@ class EvaluationService:
             patterns[f"{mt}_bias"] = round(float(exp_hit - hit), 4)
 
         return patterns
+
+    def _edge_realization_by_decile(self, legs: List[Dict]) -> List[Dict[str, Any]]:
+        """
+        Group legs by predicted-edge decile and report realized vs predicted edge.
+        High realization ratio → model edge is real.
+        """
+        if not legs:
+            return []
+        predicted_edges = []
+        for l in legs:
+            # Prefer stored edge_at_prediction, then vig_adj_prob, then raw implied fallback
+            if l.get("edge_at_prediction") is not None:
+                predicted_edges.append(float(l["edge_at_prediction"]))
+            else:
+                vig_adj = l.get("vig_adj_prob") or (1.0 / max(l["decimal_odds"], 1.01))
+                predicted_edges.append(float(l["model_probability"]) - float(vig_adj))
+
+        edges = np.array(predicted_edges)
+        outcomes = np.array([l["outcome"] for l in legs], dtype=float)
+        odds = np.array([l["decimal_odds"] for l in legs], dtype=float)
+        realized = np.where(outcomes == 1, odds - 1, -1.0)
+
+        n_bins = min(10, len(legs) // 5)
+        if n_bins < 2:
+            return []
+
+        percentiles = np.linspace(0, 100, n_bins + 1)
+        result = []
+        for lo_pct, hi_pct in zip(percentiles[:-1], percentiles[1:]):
+            lo = float(np.percentile(edges, lo_pct))
+            hi = float(np.percentile(edges, hi_pct))
+            mask = (edges >= lo) & (edges < hi) if hi_pct < 100 else (edges >= lo) & (edges <= hi)
+            if mask.sum() == 0:
+                continue
+            mean_pred = float(np.mean(edges[mask]))
+            mean_real = float(np.mean(realized[mask]))
+            n = int(mask.sum())
+            result.append({
+                "decile": f"{lo_pct:.0f}-{hi_pct:.0f}%",
+                "n": n,
+                "avg_predicted_edge": round(mean_pred, 4),
+                "avg_realized_edge": round(mean_real, 4),
+                "realization_ratio": round(
+                    mean_real / max(abs(mean_pred), 0.001), 3
+                ),
+                "hit_rate": round(float(np.mean(outcomes[mask])), 4),
+            })
+        return result
+
+    def _analyze_player_props(self, player_legs: List[Dict]) -> Dict[str, Any]:
+        """
+        Deep analysis of player prop performance stratified by:
+          - n_games bucket (sample size)
+          - consistency bucket (high/medium/low CV)
+          - line range
+          - trust bucket (if available)
+        """
+        result: Dict[str, Any] = {}
+        total = len(player_legs)
+        if total == 0:
+            return result
+
+        # Helper: compute metrics for a subset
+        def _metrics(subset: List[Dict]) -> Dict:
+            if not subset:
+                return {"n": 0}
+            yt = np.array([l["outcome"] for l in subset], dtype=float)
+            yp = np.array([l["model_probability"] for l in subset], dtype=float)
+            od = np.array([l["decimal_odds"] for l in subset], dtype=float)
+            vig_adj = np.array([
+                l.get("vig_adj_prob") if l.get("vig_adj_prob") is not None
+                else 1.0 / max(l["decimal_odds"], 1.01)
+                for l in subset
+            ], dtype=float)
+            pred_edge = yp - vig_adj
+            real_edge = np.where(yt == 1, od - 1 - vig_adj, -vig_adj)
+            return {
+                "n": len(subset),
+                "brier_score": round(_brier_score(yt, yp), 4),
+                "roi": round(_roi(yt, od), 4),
+                "hit_rate": round(float(yt.mean()), 4),
+                "avg_predicted_edge": round(float(np.nanmean(pred_edge)), 4),
+                "avg_realized_edge": round(float(np.nanmean(real_edge)), 4),
+            }
+
+        # By n_games bucket
+        result["by_sample_size"] = {}
+        for label, lo, hi in [("sparse", 0, 5), ("moderate", 5, 12), ("adequate", 12, 100)]:
+            subset = [
+                l for l in player_legs
+                if lo <= int(l.get("n_games", l.get("metadata_n_games", 0))) < hi
+            ]
+            result["by_sample_size"][label] = _metrics(subset)
+
+        # By odds range (line difficulty)
+        result["by_odds_range"] = {}
+        for label, lo, hi in [("favourite", 1.0, 1.8), ("evens", 1.8, 2.3), ("outsider", 2.3, 4.0)]:
+            subset = [l for l in player_legs if lo <= l["decimal_odds"] < hi]
+            result["by_odds_range"][label] = _metrics(subset)
+
+        # By trust bucket (if trust stored)
+        trust_vals = [l.get("trust_score") for l in player_legs if l.get("trust_score") is not None]
+        if trust_vals:
+            trust_arr = np.array(trust_vals)
+            thresholds = [(0, 35, "low_trust"), (35, 55, "medium_trust"), (55, 100, "high_trust")]
+            result["by_trust"] = {}
+            for lo, hi, label in thresholds:
+                subset = [l for l in player_legs
+                          if l.get("trust_score") is not None and lo <= l["trust_score"] < hi]
+                result["by_trust"][label] = _metrics(subset)
+
+        # Overall false-positive EV rate (predicted +EV but lost)
+        ev_pos = [l for l in player_legs if l.get("model_probability", 0.5) > (
+            1.0 / max(l["decimal_odds"], 1.01)
+        )]
+        false_pos = [l for l in ev_pos if l["outcome"] == 0]
+        result["false_positive_ev_rate"] = round(len(false_pos) / max(len(ev_pos), 1), 4)
+        result["n_total"] = total
+
+        # Recommend disable if chronic underperformance
+        all_yt = np.array([l["outcome"] for l in player_legs], dtype=float)
+        all_od = np.array([l["decimal_odds"] for l in player_legs], dtype=float)
+        overall_roi = _roi(all_yt, all_od)
+        if total >= 20 and overall_roi < -0.20:
+            result["recommendation"] = "disable_market"
+        elif total >= 10 and overall_roi < -0.10:
+            result["recommendation"] = "tighten_thresholds"
+        else:
+            result["recommendation"] = "continue"
+
+        return result

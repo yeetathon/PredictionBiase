@@ -1,14 +1,13 @@
 """
 Main data loader: aggregates provider data into DataFrames for modelling.
 
-Data source hierarchy (all configured sources used, not just first):
-  1. Sportradar AFL API     → fixtures, schedule, historical scores (primary)
-  2. API-Sports AFL         → supplementary fixtures/teams/injuries (when configured)
-  3. The Odds API           → real bookmaker odds for edge calculation (when configured)
-  4. Edge Intelligence      → scraped news/injury signals (when scraping enabled)
+Data source hierarchy:
+  1. AFL Data Sports Group API  → fixtures, schedule, scores, full AFL stats (primary)
+  2. The Odds API               → real bookmaker odds for edge calculation (when configured)
+  3. Edge Intelligence          → scraped news/injury signals (when scraping enabled)
 
 Tests inject providers explicitly:
-    DataLoader(afl_provider=DemoAFLDataProvider(demo_data_path))
+    DataLoader(afl_provider=MockAFLDataProvider(...))
 """
 from __future__ import annotations
 
@@ -60,19 +59,17 @@ class _NullInjuryProvider:
 def _make_afl_provider():
     """
     Build the primary AFL data provider.
-    Sportradar is required; raises RuntimeError if not configured.
+    AFL Data Sports Group API is required; raises RuntimeError if not configured.
     """
-    mode = settings.effective_data_mode
-    if mode in ("live", "cache"):
-        from app.data_ingestion.sportradar_loader import SportradarLoader
-        provider = SportradarLoader()
-        logger.info("DataLoader: using SportradarLoader (mode=%s)", mode)
-        return provider
-
-    raise RuntimeError(
-        f"Data mode is '{mode}' but SPORTRADAR_API_KEY is not configured. "
-        "Set SPORTRADAR_API_KEY in your .env file."
-    )
+    if not settings.is_afl_data_configured:
+        raise RuntimeError(
+            "AFL_DATA_AUTHKEY is not configured. "
+            "Add AFL_DATA_AUTHKEY=<your_key> to your .env file."
+        )
+    from app.data_ingestion.afl_data_loader import AFLDataLoader
+    provider = AFLDataLoader()
+    logger.info("DataLoader: using AFLDataLoader (mode=%s)", settings.effective_data_mode)
+    return provider
 
 
 def _make_odds_provider(fixtures_df: Optional[pd.DataFrame] = None):
@@ -114,7 +111,7 @@ class DataLoader:
     """
     Aggregates data from all providers into analysis-ready DataFrames.
 
-    In production: uses SportradarLoader (primary) + OddsAPIProvider + EdgeIntelligence.
+    In production: uses AFLDataLoader (primary) + OddsAPIProvider + EdgeIntelligence.
     In tests: inject providers explicitly.
     """
 
@@ -230,7 +227,7 @@ class DataLoader:
     def get_source_status(self) -> dict:
         """Return a dict summarising which data sources are active."""
         status = {
-            "sportradar": {
+            "afl_data": {
                 "active": isinstance(self.afl, object) and hasattr(self.afl, "_client"),
                 "type": type(self.afl).__name__,
             },
@@ -244,7 +241,6 @@ class DataLoader:
                 "type": type(self.edge).__name__ if self.edge else "disabled",
             },
         }
-        # Quota info from Odds API if available
         if hasattr(self.odds, "quota_status"):
             status["odds_api"]["quota"] = self.odds.quota_status
         return status

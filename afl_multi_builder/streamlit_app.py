@@ -245,21 +245,21 @@ with st.sidebar:
     # ── Data source status ──────────────────────────────────────
     from app.core.config import settings
 
-    if not settings.is_sportradar_configured:
+    if not settings.is_afl_data_configured:
         st.error(
-            "**SPORTRADAR_API_KEY not configured.**\n\n"
-            "Add it to your `.env` file:\n```\nSPORTRADAR_API_KEY=your_key_here\n```\n"
+            "**AFL_DATA_AUTHKEY not configured.**\n\n"
+            "Add it to your `.env` file:\n```\nAFL_DATA_AUTHKEY=your_key_here\n```\n"
             "Then restart the app. Live API data is required — demo mode has been removed."
         )
         st.stop()
 
     mode = settings.effective_data_mode
     if mode == "live":
-        ds_label = "Sportradar API (Live)"
+        ds_label = "AFL Data Sports Group API (Live)"
     elif mode == "cache":
-        ds_label = "Sportradar API (Cached)"
+        ds_label = "AFL Data Sports Group API (Cached)"
     else:
-        ds_label = "Sportradar API"
+        ds_label = "AFL Data Sports Group API"
 
     pr = st.session_state.get("pipeline_result")
     if pr:
@@ -746,29 +746,22 @@ with tab_system:
     def _status_dot(ok: bool) -> str:
         return "🟢" if ok else "🔴"
 
-    # Sportradar
-    with st.expander(f"{_status_dot(settings.is_sportradar_configured)} Sportradar AFL API (Primary)", expanded=True):
+    # AFL Data Sports Group
+    with st.expander(f"{_status_dot(settings.is_afl_data_configured)} AFL Data Sports Group API (Primary)", expanded=True):
         col1, col2, col3 = st.columns(3)
-        col1.metric("Status", "Configured" if settings.is_sportradar_configured else "Not configured")
+        col1.metric("Status", "Configured" if settings.is_afl_data_configured else "Not configured")
         col2.metric("Mode", settings.effective_data_mode.title())
-        col3.metric("Sport", "AFL")
-        if settings.is_sportradar_configured:
-            try:
-                from app.data_ingestion.quota_manager import QuotaManager
-                qm = QuotaManager()
-                q = qm.get_status()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Calls Used", q.get("used", 0))
-                c2.metric("Remaining", q.get("remaining", 0))
-                c3.metric("Total Quota", q.get("total_quota", 1000))
-                pct = q.get("used", 0) / max(q.get("total_quota", 1000), 1)
-                c4.metric("% Used", f"{pct:.1%}")
-                if q.get("warn_triggered"):
-                    st.warning("⚠ Sportradar quota above 80%. Use cache mode to conserve calls.")
-            except Exception as e:
-                st.caption(f"Quota info unavailable: {e}")
+        col3.metric("Call Rate", "Unlimited")
+        if settings.is_afl_data_configured:
+            key_preview = settings.afl_data_authkey[:6] + "..." if settings.afl_data_authkey else ""
+            st.caption(
+                f"Auth key: {key_preview} · "
+                f"Competition ID: {settings.afl_data_competition_id} · "
+                f"Base URL: {settings.afl_data_base_url}"
+            )
+            st.success("AFL Advanced Pack active: fixtures, live scores, player stats, box scores, advanced stats")
         else:
-            st.error("SPORTRADAR_API_KEY not set in .env")
+            st.error("AFL_DATA_AUTHKEY not set in .env")
 
     # Odds API
     with st.expander(f"{_status_dot(settings.is_odds_api_configured)} The Odds API (Real bookmaker odds)"):
@@ -811,15 +804,7 @@ with tab_system:
         else:
             st.info("Set ENABLE_SCRAPING=true in .env to activate edge intelligence.")
 
-    # API-Sports (supplementary)
-    with st.expander(f"{_status_dot(settings.is_api_sports_configured)} API-Sports AFL (Supplementary)"):
-        col1, col2 = st.columns(2)
-        col1.metric("Status", "Configured" if settings.is_api_sports_configured else "Not configured")
-        col2.metric("Limit", "100 req/day (free tier)")
-        if settings.is_api_sports_configured:
-            st.caption(f"Base URL: {settings.api_sports_base_url} · League ID: {settings.api_sports_afl_league_id}")
-        else:
-            st.caption("API_SPORTS_KEY not set — Sportradar is primary, API-Sports is optional.")
+    # No secondary data source — AFL Data Sports Group API is the sole AFL provider
 
     st.divider()
 
@@ -828,9 +813,8 @@ with tab_system:
     st.code(f"""
 DATA_MODE={settings.data_mode}
 EFFECTIVE_MODE={settings.effective_data_mode}
-SPORTRADAR_CONFIGURED={settings.is_sportradar_configured}
+AFL_DATA_CONFIGURED={settings.is_afl_data_configured}
 ODDS_API_CONFIGURED={settings.is_odds_api_configured}
-API_SPORTS_CONFIGURED={settings.is_api_sports_configured}
 EDGE_SCRAPING_ENABLED={settings.enable_scraping}
 ARTIFACTS_DIR={settings.artifacts_dir}
     """, language="ini")
